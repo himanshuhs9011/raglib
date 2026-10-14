@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.0 - 2026-10-14
+
+- **Major Release (v1.0.0):**
+  - Added selectable chunking strategies (`fixed`, `recursive`, and `llm` semantic chunking) in `ChunkSplitter` and `RAG(..., chunking_strategy=...)`.
+  - Added standalone Graph-Based Context Window engine (`GraphContextWindow`, `GraphNode`, `ConnectedNodeRef`, `GraphContextResult`) supporting hierarchical document graphs (`Document -> Section -> Chunk`), neighbor summary signposts (`NEXT_CHUNK`, `PREV_CHUNK`, `SHARED_ENTITY`), and multi-turn conversational chat graphs (`PREV_TURN`, `SAME_TOPIC_TURN`, `CITED_CHUNK`).
+  - Upgraded `Retriever` to perform incremental document indexing and reconstruct documents directly from pre-populated persistent vector stores (`ChromaVectorStore`, `InMemoryVectorStore`).
+  - Replaced non-deterministic `hash()` IDs with deterministic SHA-256 document IDs across all loaders, providers, and retrievers.
+  - Hardened `SelfRAG`, `RoutingRAG`, `MultiQueryRAG`, `MultiHopRAG`, `Generator`, `WebLoader`, and `DuckDuckGoProvider` for production reliability.
+  - Exported all 12 RAG strategy classes, core components, and graph context classes from top-level `raglib`.
+  - Updated repository URLs to `https://github.com/himanshuhs9011/raglib`.
+
 ## 0.1.10 - 2026-04-06
 
 - Added additional interactive chat kill-switch commands: `bye` and `stop`

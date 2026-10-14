@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.error
@@ -79,9 +80,10 @@ class BraveProvider(BaseSearchProvider):
             title = str(row.get("title", ""))
             description = str(row.get("description", ""))
             link = str(row.get("url", ""))
+            digest = hashlib.sha256((link or description).encode("utf-8")).hexdigest()[:16]
             docs.append(
                 Document(
-                    id=f"brave-{idx}-{abs(hash(link or description))}",
+                    id=f"brave-{idx}-{digest}",
                     content=f"{title}\n{description}".strip(),
                     metadata={"title": title, "url": link, "provider": self.name},
                     source=self.name,

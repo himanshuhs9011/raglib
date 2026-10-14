@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import replace
 from typing import Dict, List, Optional
@@ -43,7 +44,8 @@ class MultiQueryRetriever:
         for variant in variants:
             docs = self.retriever.retrieve(variant)
             for doc in docs:
-                key = doc.id or f"doc-{abs(hash(doc.content.lower().strip()))}"
+                digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
+                key = doc.id or f"doc-{digest}"
                 if key in merged:
                     previous = merged[key]
                     merged[key] = replace(previous, score=max(previous.score, doc.score))

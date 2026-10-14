@@ -22,6 +22,8 @@ class MockLLMClient(BaseLLMClient):
 
         if "rewrite" in text or "refine" in text:
             return self._rewrite_query(prompt)
+        if "chunk:" in text or "semantic chunks" in text or "chunking" in text:
+            return self._chunk_response(prompt)
         if "plan" in text or "sub-quer" in text or "decompose" in text:
             return self._plan_response(prompt)
         if "expand" in text or "variants" in text:
@@ -44,6 +46,26 @@ class MockLLMClient(BaseLLMClient):
         combined = "\n".join(message.get("content", "") for message in messages)
         logger.debug("Mock chat invoked with %d messages", len(messages))
         return self.complete(prompt=combined)
+
+    def _chunk_response(self, prompt: str) -> str:
+        """Return deterministic CHUNK ranges for semantic chunking tests."""
+
+        sentence_indexes = [
+            int(match.group(1))
+            for match in re.finditer(r"(?m)^\s*(\d+)\.\s+", prompt)
+        ]
+        if not sentence_indexes:
+            return "CHUNK: 1-1"
+
+        group_size = 3
+        lines: List[str] = []
+        start = sentence_indexes[0]
+        last = sentence_indexes[-1]
+        while start <= last:
+            end = min(start + group_size - 1, last)
+            lines.append(f"CHUNK: {start}-{end}")
+            start = end + 1
+        return "\n".join(lines)
 
     def _rewrite_query(self, prompt: str) -> str:
         """Return an improved query based on extracted keywords."""

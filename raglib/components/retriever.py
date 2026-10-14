@@ -1,4 +1,4 @@
-"""In-memory vector retriever with optional FAISS acceleration."""
+"""In-memory vector retriever with optional FAISS acceleration and incremental vector indexing."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class Retriever:
-    """Retrieves relevant documents from an in-memory corpus."""
+    """Retrieves relevant documents from a vector store or in-memory corpus."""
 
     def __init__(
         self,
@@ -55,22 +55,19 @@ class Retriever:
         self.add_documents(documents)
 
     def add_documents(self, documents: List[Document]) -> None:
-        """Add documents to the corpus and refresh vector indices."""
+        """Add documents to the corpus and incrementally upsert new vectors."""
 
         if not documents:
             return
+        start_index = len(self._documents)
         self._documents.extend(documents)
         logger.info("Retriever added %d documents (total=%d)", len(documents), len(self._documents))
-        self._reindex()
+        self._reindex(new_documents=documents, start_index=start_index)
 
     def retrieve(self, query: str) -> List[Document]:
         """Retrieve top-k documents ranked by query similarity."""
 
         logger.debug("Retriever received query=%s", query)
-        if not self._documents:
-            logger.warning("Retriever called with empty corpus")
-            return []
-
         if not query or not query.strip():
             logger.info("Retriever returning empty result for empty query")
             return []
@@ -85,6 +82,10 @@ class Retriever:
                 logger.info("Retriever returned %d documents via embedding search", len(embedding_docs))
                 return embedding_docs
             logger.warning("Embedding retrieval produced no results; falling back to sparse search")
+
+        if not self._documents:
+            logger.warning("Retriever called with empty corpus")
+            return []
 
         if self._faiss_ready:
             faiss_docs = self._retrieve_with_faiss(query)
@@ -108,8 +109,12 @@ class Retriever:
             self._faiss_import_error = exc
             logger.info("FAISS backend unavailable; using pure Python retriever")
 
-    def _reindex(self) -> None:
-        """Recompute sparse vectors and optional FAISS index."""
+    def _reindex(
+        self,
+        new_documents: Optional[List[Document]] = None,
+        start_index: int = 0,
+    ) -> None:
+        """Recompute sparse vectors and incrementally index new dense vectors."""
 
         self._doc_tokens = [self._tokenize(doc.content) for doc in self._documents]
         self._document_frequency = Counter()
@@ -123,18 +128,20 @@ class Retriever:
             tf = Counter(tokens)
             self._doc_tfidf.append(self._counter_to_tfidf(tf, len(tokens)))
 
-        if self._embedding is not None and self._vector_store is not None and self._documents:
+        docs_to_embed = new_documents if new_documents is not None else self._documents
+        offset = start_index if new_documents is not None else 0
+
+        if self._embedding is not None and self._vector_store is not None and docs_to_embed:
             try:
-                texts = [document.content for document in self._documents]
+                texts = [document.content for document in docs_to_embed]
                 vectors = self._embedding.embed_documents(texts)
                 records: List[VectorRecord] = []
-                self._vector_document_lookup = {}
 
-                limit = min(len(self._documents), len(vectors))
+                limit = min(len(docs_to_embed), len(vectors))
                 for index in range(limit):
-                    document = self._documents[index]
+                    document = docs_to_embed[index]
                     vector = vectors[index]
-                    vector_id = self._build_vector_id(document=document, index=index)
+                    vector_id = self._build_vector_id(document=document, index=offset + index)
                     records.append(
                         VectorRecord(
                             document_id=vector_id,
@@ -149,7 +156,6 @@ class Retriever:
                     )
                     self._vector_document_lookup[vector_id] = document
 
-                self._vector_store.clear()
                 self._vector_store.upsert(records)
                 logger.info(
                     "Retriever indexed %d embedding vectors in %s (dim=%d)",
@@ -159,7 +165,6 @@ class Retriever:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Embedding indexing failed; using sparse fallback only: %s", exc)
-                self._vector_document_lookup = {}
 
         self._build_faiss_index()
 
@@ -252,11 +257,9 @@ class Retriever:
         return self._to_scored_documents(top)
 
     def _retrieve_with_embedding(self, query: str) -> List[Document]:
-        """Retrieve documents using dense embedding cosine similarity."""
+        """Retrieve documents using dense embedding similarity."""
 
         if self._embedding is None or self._vector_store is None:
-            return []
-        if not self._vector_document_lookup:
             return []
 
         try:
@@ -265,28 +268,45 @@ class Retriever:
             logger.warning("Embedding query failed; using sparse fallback: %s", exc)
             return []
 
+        limit = min(self.top_k, len(self._vector_document_lookup)) if self._vector_document_lookup else self.top_k
         hits = self._vector_store.query(
             query_embedding=query_vector,
-            top_k=min(self.top_k, len(self._vector_document_lookup)),
+            top_k=max(1, limit),
         )
         documents: List[Document] = []
         for hit in hits:
             base_document = self._vector_document_lookup.get(hit.document_id)
-            if base_document is None:
-                continue
-            logger.debug("Embedding score doc_id=%s score=%.4f", base_document.id, hit.score)
-            documents.append(
-                replace(
-                    base_document,
-                    score=float(hit.score),
-                    source=base_document.source or "vector",
-                    metadata={
-                        **base_document.metadata,
-                        "retriever": "vector_store",
-                        "vector_db": type(self._vector_store).__name__,
-                    },
+            if base_document is not None:
+                logger.debug("Embedding score doc_id=%s score=%.4f", base_document.id, hit.score)
+                documents.append(
+                    replace(
+                        base_document,
+                        score=float(hit.score),
+                        source=base_document.source or "vector",
+                        metadata={
+                            **base_document.metadata,
+                            "retriever": "vector_store",
+                            "vector_db": type(self._vector_store).__name__,
+                        },
+                    )
                 )
-            )
+            elif hit.document_text:
+                meta = dict(hit.metadata or {})
+                doc_id = str(meta.pop("doc_id", hit.document_id))
+                source = str(meta.pop("source", "vector"))
+                documents.append(
+                    Document(
+                        id=doc_id,
+                        content=hit.document_text,
+                        score=float(hit.score),
+                        source=source,
+                        metadata={
+                            **meta,
+                            "retriever": "vector_store",
+                            "vector_db": type(self._vector_store).__name__,
+                        },
+                    )
+                )
         return documents
 
     def _to_scored_documents(self, scored_indices: Sequence[Tuple[float, int]]) -> List[Document]:

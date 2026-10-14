@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -106,7 +107,10 @@ class SelfRAG(BaseRAG):
             rel_verdict = self._node_is_relevant(state)
 
             if rel_verdict == ISREL_NOT:
-                if state.retrieve_count < self.max_retrieve:
+                if state.retrieve_count < self.max_retrieve and state.rewrite_count < self.max_rewrite:
+                    state = self._node_rewrite_question(state)
+                    if state.terminal == "no_answer":
+                        return self._finalize(state)
                     state = self._node_retrieve(state)
                     continue
 
@@ -286,9 +290,10 @@ class SelfRAG(BaseRAG):
         )
         try:
             response = llm_client.complete(prompt).strip().upper()
-            if any(token in response for token in ("NO", "NONE", "DIRECT", "SKIP")):
+            words = set(re.findall(r"[A-Z_]+", response))
+            if words & {"NO", "NONE", "DIRECT", "SKIP"} and not (words & {"YES", "RETRIEVE"}):
                 return RETRIEVE_NO
-            if any(token in response for token in ("YES", "VECTOR", "WEB", "HYBRID", "MIXED", "RETRIEVE")):
+            if words & {"YES", "VECTOR", "WEB", "HYBRID", "MIXED", "RETRIEVE"}:
                 return RETRIEVE_YES
 
             lowered = query.strip().lower()
@@ -337,9 +342,10 @@ class SelfRAG(BaseRAG):
         )
         try:
             response = llm_client.complete(prompt).strip().upper()
-            if "REWRITE" in response:
+            words = set(re.findall(r"[A-Z_]+", response))
+            if "REWRITE" in words:
                 return ISREL_REWRITE
-            if "NOT" in response:
+            if "NOT_RELEVANT" in words or "IRRELEVANT" in words or "NOT" in words:
                 return ISREL_NOT
             return ISREL_RELEVANT
         except Exception as exc:  # noqa: BLE001
@@ -373,9 +379,10 @@ class SelfRAG(BaseRAG):
         )
         try:
             response = llm_client.complete(prompt).strip().upper()
-            if "CONFLICT" in response:
+            words = set(re.findall(r"[A-Z_]+", response))
+            if "CONFLICTING" in words or "CONFLICT" in words:
                 return ISSUP_CONFLICT
-            if "NOT" in response:
+            if "NOT_SUPPORTED" in words or "UNSUPPORTED" in words or "NOT" in words:
                 return ISSUP_NOT
             return ISSUP_SUPPORTED
         except Exception as exc:  # noqa: BLE001
@@ -427,9 +434,10 @@ class SelfRAG(BaseRAG):
         )
         try:
             response = llm_client.complete(prompt).strip().upper()
-            if "NEEDS" in response or "MORE" in response:
+            words = set(re.findall(r"[A-Z_]+", response))
+            if "NEEDS_MORE" in words or "NEEDS" in words or "MORE" in words:
                 return ISUSE_MORE
-            if "NOT" in response:
+            if "NOT_USEFUL" in words or "USELESS" in words or "NOT" in words:
                 return ISUSE_NOT
             return ISUSE_USEFUL
         except Exception as exc:  # noqa: BLE001

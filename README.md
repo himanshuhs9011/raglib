@@ -101,6 +101,7 @@ RAG(
     top_k=5,
     chunk_size=400,
     chunk_overlap=50,
+    chunking_strategy="fixed",  # "fixed" | "recursive" | "llm"
     output_dir=None,
     chat_model=None,
     chat_base_url=None,
@@ -282,6 +283,26 @@ Interactive session kill-switch commands:
 - q
 - bye
 - stop
+
+## Chunking Strategies & Graph-Based Context Window (v1.0.0)
+
+Select a chunking strategy directly in `RAG(...)` or `ChunkSplitter(...)`:
+
+- `"fixed"` (default): Sentence-aware token window with overlap
+- `"recursive"`: Hierarchical separator splitting (`\n\n`, `\n`, `. `, etc.)
+- `"llm"`: LLM-guided semantic boundary detection with automatic fallback to `"recursive"`
+
+Standalone Graph-Based Context Window (`GraphContextWindow`):
+
+```python
+from raglib import Document, GraphContextWindow
+
+graph = GraphContextWindow(chunking_strategy="recursive", chunk_size=180, chunk_overlap=25)
+graph.add_documents([Document(id="doc1", content="# Overview\nCorrectiveRAG uses an Evaluator threshold.")])
+
+ctx = graph.build_context_window("How does CorrectiveRAG use the Evaluator threshold?")
+print(ctx.formatted_context)
+```
 
 ## License
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ class VectorHit:
 
     document_id: str
     score: float
+    document_text: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class BaseVectorStore(ABC):

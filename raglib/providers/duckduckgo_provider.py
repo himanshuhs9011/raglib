@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import List, Optional
@@ -46,15 +47,17 @@ class DuckDuckGoProvider(BaseSearchProvider):
         top_k = max(1, int(num_results))
         logger.info("Running DuckDuckGo search for query=%s", query)
 
-        raw_result = self._run_langchain_search(query=query, num_results=top_k)
         documents = self._search_langchain_structured(query=query, num_results=top_k)
         if documents:
             return documents
 
-        # Structured output can be empty depending on upstream behavior.
-        documents = self._parse_run_output(raw_result=raw_result, num_results=top_k)
-        if documents:
-            return documents
+        try:
+            raw_result = self._run_langchain_search(query=query, num_results=top_k)
+            documents = self._parse_run_output(raw_result=raw_result, num_results=top_k)
+            if documents:
+                return documents
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DuckDuckGoSearchRun failed, falling back to ddgs client: %s", exc)
 
         return self._search_ddgs_fallback(query=query, num_results=top_k)
 
@@ -143,7 +146,8 @@ class DuckDuckGoProvider(BaseSearchProvider):
                 continue
 
             score = max(0.0, 1.0 - (idx / max(num_results, 1)))
-            doc_id = f"ddg-lc-{idx}-{abs(hash(url or content))}"
+            digest = hashlib.sha256((url or content).encode("utf-8")).hexdigest()[:16]
+            doc_id = f"ddg-lc-{idx}-{digest}"
             documents.append(
                 Document(
                     id=doc_id,
@@ -180,7 +184,8 @@ class DuckDuckGoProvider(BaseSearchProvider):
         for idx, snippet in enumerate(parts[:num_results]):
             title = self._derive_title(snippet)
             score = max(0.0, 1.0 - (idx / max(num_results, 1)))
-            doc_id = f"ddg-run-{idx}-{abs(hash(snippet))}"
+            digest = hashlib.sha256(snippet.encode("utf-8")).hexdigest()[:16]
+            doc_id = f"ddg-run-{idx}-{digest}"
             documents.append(
                 Document(
                     id=doc_id,
@@ -242,7 +247,8 @@ class DuckDuckGoProvider(BaseSearchProvider):
                     snippet = str(row.get("body", ""))
                     url = str(row.get("href", ""))
                     content = snippet or title
-                    doc_id = f"ddg-{idx}-{abs(hash(url or content))}"
+                    digest = hashlib.sha256((url or content).encode("utf-8")).hexdigest()[:16]
+                    doc_id = f"ddg-{idx}-{digest}"
                     documents.append(
                         Document(
                             id=doc_id,

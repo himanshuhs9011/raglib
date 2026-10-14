@@ -81,6 +81,60 @@ def test_facade_rag_add_ingests_additional_source() -> None:
     assert after > before
 
 
+def test_facade_supports_recursive_chunking_strategy() -> None:
+    """Verify facade accepts recursive chunking and tags chunk metadata."""
+
+    source = (
+        "First paragraph explains retrieval basics with several useful words.\n\n"
+        "Second paragraph covers ranking and filtering for better answers.\n\n"
+        "Third paragraph closes with generation grounded in context."
+    )
+    rag = RAG(
+        source,
+        chunking_strategy="recursive",
+        chunk_size=18,
+        chunk_overlap=2,
+        top_k=3,
+    )
+
+    assert rag._splitter.strategy == "recursive"
+    assert len(rag.retriever._documents) >= 2
+    assert all(
+        doc.metadata.get("chunking_strategy") == "recursive"
+        for doc in rag.retriever._documents
+    )
+
+
+def test_facade_supports_llm_chunking_strategy() -> None:
+    """Verify facade wires chat LLM into semantic chunking strategy."""
+
+    sentences = " ".join(
+        f"Facade sentence {index} describes modular RAG pipeline design."
+        for index in range(1, 12)
+    )
+    rag = RAG(
+        sentences,
+        chunking_strategy="llm",
+        chunk_size=35,
+        chunk_overlap=5,
+        top_k=3,
+    )
+
+    assert rag._splitter.strategy == "llm"
+    assert rag._splitter._llm_client is rag._llm
+    assert len(rag.retriever._documents) >= 1
+    result = rag.query("What does the text describe?")
+    assert isinstance(result, GenerationResult)
+    assert result.answer.strip() != ""
+
+
+def test_facade_rejects_unknown_chunking_strategy() -> None:
+    """Verify invalid chunking_strategy values fail fast."""
+
+    with pytest.raises(ValueError, match="Unknown chunking strategy"):
+        RAG("text", chunking_strategy="not-a-real-strategy")
+
+
 def test_facade_rag_supports_rag_type_override() -> None:
     """Verify RAG facade supports selecting a non-default rag_type."""
 

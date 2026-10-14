@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
+import re
 from typing import List
 
 from raglib.embedding.base_embedding import BaseEmbedding
@@ -12,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class MockEmbedding(BaseEmbedding):
-    """Generate deterministic vectors without external dependencies or API keys."""
+    """Generate deterministic lexical-hash vectors without external dependencies or API keys."""
 
     DIMENSION = 64
 
@@ -40,12 +42,28 @@ class MockEmbedding(BaseEmbedding):
         return self.DIMENSION
 
     def _hash_to_vector(self, text: str) -> List[float]:
-        """Map text to a normalized vector using character-frequency hashing."""
+        """Map text to a normalized vector using token and character-trigram feature hashing."""
 
         vector = [0.0] * self.DIMENSION
-        for index, character in enumerate(text.lower()):
-            bucket = (ord(character) + index) % self.DIMENSION
-            vector[bucket] += 1.0
+        tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
+
+        for token in tokens:
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:4], "little") % self.DIMENSION
+            sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+            vector[bucket] += 2.0 * sign
+
+            if len(token) >= 4:
+                for idx in range(len(token) - 2):
+                    trigram = token[idx : idx + 3]
+                    tri_digest = hashlib.md5(trigram.encode("utf-8")).digest()
+                    tri_bucket = int.from_bytes(tri_digest[:4], "little") % self.DIMENSION
+                    vector[tri_bucket] += 0.5
+
+        if not tokens:
+            for index, character in enumerate(text.lower()):
+                bucket = (ord(character) + index) % self.DIMENSION
+                vector[bucket] += 1.0
 
         norm = math.sqrt(sum(value * value for value in vector)) or 1.0
         return [value / norm for value in vector]

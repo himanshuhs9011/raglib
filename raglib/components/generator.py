@@ -39,15 +39,15 @@ class Generator:
         query: str,
         documents: List[Document],
         memory_context: str = "",
-        reasoning_trace: List[str] = [],
+        reasoning_trace: Optional[List[str]] = None,
     ) -> GenerationResult:
         """Generate an answer from query, documents, and optional memory context."""
 
-        trace = list(reasoning_trace)
+        trace = list(reasoning_trace) if reasoning_trace is not None else []
         context_docs = self._truncate_documents(documents)
         context_block = self._build_context(context_docs)
 
-        prompt = self.prompt_template.format(
+        prompt = self._render_prompt(
             query=query,
             memory_context=memory_context,
             context=context_block,
@@ -63,6 +63,22 @@ class Generator:
         trace.append(f"generated_with_docs={len(context_docs)}")
 
         return GenerationResult(answer=answer, sources=context_docs, reasoning_trace=trace)
+
+    def _render_prompt(self, query: str, memory_context: str, context: str) -> str:
+        """Safely render prompt template without failing on stray braces."""
+
+        try:
+            return self.prompt_template.format(
+                query=query,
+                memory_context=memory_context,
+                context=context,
+            )
+        except (KeyError, ValueError, IndexError):
+            rendered = self.prompt_template
+            rendered = rendered.replace("{query}", query)
+            rendered = rendered.replace("{memory_context}", memory_context)
+            rendered = rendered.replace("{context}", context)
+            return rendered
 
     def _truncate_documents(self, documents: List[Document]) -> List[Document]:
         """Trim document set to fit max context token budget."""

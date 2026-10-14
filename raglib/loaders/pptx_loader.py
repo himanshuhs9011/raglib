@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import List
@@ -25,7 +26,7 @@ class PPTXLoader:
             ) from exc
 
         presentation = Presentation(path)
-        base_hash = abs(hash(os.path.abspath(path)))
+        base_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
         documents: List[Document] = []
 
         for slide_index, slide in enumerate(presentation.slides, start=1):

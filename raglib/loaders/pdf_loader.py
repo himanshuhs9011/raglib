@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
@@ -30,7 +31,7 @@ class PDFLoader:
             raise ImportError("PDF loading requires PyMuPDF. Install with: pip install raglib-py[pdf]") from exc
 
         documents: List[Document] = []
-        base_hash = abs(hash(os.path.abspath(path)))
+        base_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
         pdf = fitz.open(path)
 
         try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import List
@@ -29,8 +30,9 @@ class TextLoader:
             logger.warning("TextLoader found no text in file=%s", path)
             return []
 
+        base_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
         document = Document(
-            id=f"text-{abs(hash(os.path.abspath(path)))}",
+            id=f"text-{base_hash}",
             content=content,
             metadata={"file": path, "loader": "text"},
             source="text",

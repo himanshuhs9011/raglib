@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import List
@@ -38,8 +39,9 @@ class WordLoader:
             logger.warning("WordLoader found no extractable text in file=%s", path)
             return []
 
+        base_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
         document = Document(
-            id=f"docx-{abs(hash(os.path.abspath(path)))}",
+            id=f"docx-{base_hash}",
             content=content,
             metadata={"file": path, "loader": "word"},
             source="docx",

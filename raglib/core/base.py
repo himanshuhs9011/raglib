@@ -99,8 +99,8 @@ class BaseRAG:
         should_retrieve = True
         retrieval_mode = RETRIEVAL_VECTOR
         if self.decision_engine is not None:
-            should_retrieve = self.decision_engine.should_retrieve(working_query)
             retrieval_mode = self.decision_engine.retrieval_type(working_query)
+            should_retrieve = retrieval_mode != RETRIEVAL_NONE
             reasoning_trace.append(f"decision:{retrieval_mode}")
 
         documents: List[Document] = []

@@ -40,7 +40,14 @@ class InMemoryVectorStore(BaseVectorStore):
         hits: List[VectorHit] = []
         for record in self._records.values():
             score = self._cosine_similarity(query_embedding, record.embedding)
-            hits.append(VectorHit(document_id=record.document_id, score=score))
+            hits.append(
+                VectorHit(
+                    document_id=record.document_id,
+                    score=score,
+                    document_text=record.document_text,
+                    metadata=dict(record.metadata),
+                )
+            )
 
         hits.sort(key=lambda item: item.score, reverse=True)
         return hits[:top_k]

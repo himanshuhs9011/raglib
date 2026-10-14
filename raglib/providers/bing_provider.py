@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.error
@@ -71,9 +72,10 @@ class BingProvider(BaseSearchProvider):
             title = str(row.get("name", ""))
             snippet = str(row.get("snippet", ""))
             link = str(row.get("url", ""))
+            digest = hashlib.sha256((link or snippet).encode("utf-8")).hexdigest()[:16]
             docs.append(
                 Document(
-                    id=f"bing-{idx}-{abs(hash(link or snippet))}",
+                    id=f"bing-{idx}-{digest}",
                     content=f"{title}\n{snippet}".strip(),
                     metadata={"title": title, "url": link, "provider": self.name},
                     source=self.name,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -55,7 +56,8 @@ class DocumentLoader:
             logger.info("DocumentLoader loaded %d documents from iterable source", len(documents))
             return documents
 
-        if isinstance(source, os.PathLike):
+        is_explicit_path = isinstance(source, os.PathLike)
+        if is_explicit_path:
             source = os.fspath(source)
 
         if not isinstance(source, str):
@@ -80,17 +82,29 @@ class DocumentLoader:
             logger.info("DocumentLoader loaded %d documents from file=%s", len(documents), normalized)
             return documents
 
+        if is_explicit_path or self._looks_like_missing_file_path(normalized):
+            raise FileNotFoundError(f"Source file or directory not found: '{normalized}'")
+
         logger.info("DocumentLoader treating source as raw text input")
+        stable_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
         raw_document = Document(
-            f"raw-{abs(hash(normalized))}",
+            f"raw-{stable_id}",
             normalized,
             {"loader": "raw_text"},
             0.0,
             "text",
         )
-        return [
-            raw_document,
-        ]
+        return [raw_document]
+
+    def _looks_like_missing_file_path(self, value: str) -> bool:
+        """Detect single-line strings that clearly refer to a missing file path."""
+
+        if "\n" in value or "\r" in value or len(value) > 260:
+            return False
+        if " " in value and not any(sep in value for sep in ("/", "\\")):
+            return False
+        suffix = Path(value).suffix.lower()
+        return suffix in self.SUPPORTED_EXTENSIONS
 
     def _load_folder(self, folder_path: str) -> List[Document]:
         """Load all supported files recursively from a folder path."""

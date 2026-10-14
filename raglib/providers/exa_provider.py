@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.error
@@ -76,9 +77,10 @@ class ExaProvider(BaseSearchProvider):
             title = str(row.get("title", ""))
             text = str(row.get("text", ""))
             url = str(row.get("url", ""))
+            digest = hashlib.sha256((url or text).encode("utf-8")).hexdigest()[:16]
             docs.append(
                 Document(
-                    id=f"exa-{idx}-{abs(hash(url or text))}",
+                    id=f"exa-{idx}-{digest}",
                     content=f"{title}\n{text}".strip(),
                     metadata={"title": title, "url": url, "provider": self.name},
                     source=self.name,

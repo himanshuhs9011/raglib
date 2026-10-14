@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.error
@@ -81,9 +82,10 @@ class SearxNGProvider(BaseSearchProvider):
             title = str(row.get("title", ""))
             content = str(row.get("content", ""))
             url = str(row.get("url", ""))
+            digest = hashlib.sha256((url or content).encode("utf-8")).hexdigest()[:16]
             docs.append(
                 Document(
-                    id=f"searxng-{idx}-{abs(hash(url or content))}",
+                    id=f"searxng-{idx}-{digest}",
                     content=f"{title}\n{content}".strip(),
                     metadata={"title": title, "url": url, "provider": self.name},
                     source=self.name,

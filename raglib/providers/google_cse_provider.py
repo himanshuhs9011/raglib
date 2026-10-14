@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.error
@@ -76,9 +77,10 @@ class GoogleCSEProvider(BaseSearchProvider):
             title = str(row.get("title", ""))
             snippet = str(row.get("snippet", ""))
             link = str(row.get("link", ""))
+            digest = hashlib.sha256((link or snippet).encode("utf-8")).hexdigest()[:16]
             docs.append(
                 Document(
-                    id=f"google-cse-{idx}-{abs(hash(link or snippet))}",
+                    id=f"google-cse-{idx}-{digest}",
                     content=f"{title}\n{snippet}".strip(),
                     metadata={"title": title, "url": link, "provider": self.name},
                     source=self.name,

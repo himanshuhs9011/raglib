@@ -31,6 +31,7 @@ from raglib.components.web_retriever import WebRetriever
 from raglib.constants import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_CHUNKING_STRATEGY,
     DEFAULT_RAG_TYPE,
     DEFAULT_TOP_K,
     SUPPORTED_CHAT_PROVIDERS,
@@ -195,6 +196,7 @@ class RAG:
         top_k: int = DEFAULT_TOP_K,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        chunking_strategy: str = DEFAULT_CHUNKING_STRATEGY,
         output_dir: Optional[str] = None,
         chat_model: Optional[str] = None,
         chat_base_url: Optional[str] = None,
@@ -278,7 +280,19 @@ class RAG:
                 )
 
         self._loader = DocumentLoader(vision_client=self._vision)
-        self._splitter = ChunkSplitter(chunk_size=chunk_size, overlap=chunk_overlap)
+        self._chunking_strategy = chunking_strategy
+        normalized_chunk_strategy = str(chunking_strategy).strip().lower()
+        llm_for_chunking = (
+            self._llm
+            if normalized_chunk_strategy in {"llm", "semantic", "llm_semantic"}
+            else None
+        )
+        self._splitter = ChunkSplitter(
+            chunk_size=chunk_size,
+            overlap=chunk_overlap,
+            strategy=chunking_strategy,
+            llm_client=llm_for_chunking,
+        )
         self._documents: List[Document] = []
         if source is not None:
             self._documents.extend(self._ingest(source, return_only=True))

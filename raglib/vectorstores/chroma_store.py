@@ -74,23 +74,45 @@ class ChromaVectorStore(BaseVectorStore):
         if not query_embedding or top_k <= 0:
             return []
 
+        try:
+            total_count = self._collection.count()
+        except Exception:  # noqa: BLE001
+            total_count = top_k
+
+        if total_count <= 0:
+            return []
+
+        n_results = min(top_k, total_count)
         result = self._collection.query(
             query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["distances"],
+            n_results=n_results,
+            include=["distances", "documents", "metadatas"],
         )
 
         ids_rows = result.get("ids") or [[]]
         distances_rows = result.get("distances") or [[]]
+        docs_rows = result.get("documents") or [[]]
+        metas_rows = result.get("metadatas") or [[]]
 
         ids = ids_rows[0] if ids_rows else []
         distances = distances_rows[0] if distances_rows else []
+        documents = docs_rows[0] if docs_rows else []
+        metadatas = metas_rows[0] if metas_rows else []
 
         hits: List[VectorHit] = []
         for index, document_id in enumerate(ids):
             distance = float(distances[index]) if index < len(distances) else 1.0
             score = 1.0 / (1.0 + max(distance, 0.0))
-            hits.append(VectorHit(document_id=document_id, score=score))
+            doc_text = str(documents[index]) if index < len(documents) and documents[index] is not None else ""
+            raw_meta = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+            hits.append(
+                VectorHit(
+                    document_id=document_id,
+                    score=score,
+                    document_text=doc_text,
+                    metadata=dict(raw_meta),
+                )
+            )
 
         return hits
 

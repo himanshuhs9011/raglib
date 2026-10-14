@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Dict, Optional
 
@@ -66,7 +67,8 @@ class AgenticRAG(BaseRAG):
             docs = self.retriever.retrieve(sub_query)
             trace.append(f"step_{index}:{sub_query[:50]}->{len(docs)}_docs")
             for doc in docs:
-                key = doc.id or f"doc-{abs(hash(doc.content.lower().strip()))}"
+                digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
+                key = doc.id or f"doc-{digest}"
                 if key not in merged or doc.score > merged[key].score:
                     merged[key] = doc
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Dict
 
@@ -32,7 +33,8 @@ class MultiHopRetriever:
         for hop_index, sub_query in enumerate(sub_queries, start=1):
             logger.info("MultiHopRetriever hop=%d query=%s", hop_index, sub_query)
             for doc in self.retriever.retrieve(sub_query):
-                key = doc.id or f"doc-{abs(hash(doc.content.lower().strip()))}"
+                digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
+                key = doc.id or f"doc-{digest}"
                 if key not in merged or doc.score > merged[key].score:
                     merged[key] = doc
 

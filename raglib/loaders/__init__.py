@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import logging
 
-from raglib.loaders.chunk_splitter import ChunkSplitter
+from raglib.loaders.chunk_splitter import (
+    CHUNKING_STRATEGY_ALIASES,
+    DEFAULT_RECURSIVE_SEPARATORS,
+    SUPPORTED_CHUNKING_STRATEGIES,
+    ChunkSplitter,
+)
 from raglib.loaders.document_loader import DocumentLoader, SourceInput
 from raglib.loaders.pdf_loader import PDFLoader
 from raglib.loaders.pptx_loader import PPTXLoader
@@ -18,6 +23,9 @@ __all__ = [
     "SourceInput",
     "DocumentLoader",
     "ChunkSplitter",
+    "SUPPORTED_CHUNKING_STRATEGIES",
+    "CHUNKING_STRATEGY_ALIASES",
+    "DEFAULT_RECURSIVE_SEPARATORS",
     "TextLoader",
     "WordLoader",
     "PPTXLoader",

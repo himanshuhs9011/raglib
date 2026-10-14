@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import replace
 from typing import Dict, List
@@ -96,4 +97,7 @@ class HybridRetriever:
     def _doc_key(self, doc: Document) -> str:
         """Build a stable merge key for duplicate detection."""
 
-        return doc.id or f"doc-{abs(hash(doc.content.lower().strip()))}"
+        if doc.id:
+            return doc.id
+        digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
+        return f"doc-{digest}"
