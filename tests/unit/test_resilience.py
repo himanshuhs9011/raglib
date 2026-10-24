@@ -254,3 +254,17 @@ def test_parallel_map_runs_without_threads(monkeypatch):
     monkeypatch.setattr(concurrency, "THREADS_AVAILABLE", True)
     monkeypatch.setattr(concurrency, "ThreadPoolExecutor", NoThreads)
     assert concurrency.parallel_map(lambda x: x + 1, [1, 2], max_workers=4) == [2, 3]
+
+
+def test_pipeline_diagnostics_reach_result_metadata():
+    import json
+
+    docs = "## Billing\nBilling runs on Postgres.\n\n## Auth\nAuth depends on billing."
+    crag = RAG(docs, rag_type="corrective", offline=True).query("What does billing run on?")
+    assert "crag_verdict" in crag.metadata
+    agent = RAG(docs, rag_type="agentic", offline=True).query("What does auth depend on?")
+    assert "agent_steps" in agent.metadata
+    graph = RAG(docs, rag_type="graph", offline=True).query("How is auth related to billing?")
+    assert graph.metadata.get("graph_mode") in {"local", "global"}
+    assert "graph_context_docs" not in graph.metadata
+    json.dumps(graph.metadata)  # JSON-serializable for APIs

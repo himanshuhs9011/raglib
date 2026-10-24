@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.4 - 2026-10-24
+
+- **`result.metadata` now carries pipeline diagnostics:** `crag_verdict`, `agent_steps`, `hop_queries`, `graph_mode`, `self_rag_llm_calls` were computed but dropped before the result was returned. Internal Document lists stay out, so metadata is JSON-serializable.
+- **Examples:** `examples/rag_types_tour.py` (every rag_type, its options, and how to read each result field) and `examples/fastapi_app.py` (ask, stream, upload, delete, sessions, health; tested).
+
 ## 2.0.3 - 2026-10-24
 
 - **Graph viewer layout:** nodes that started almost on top of each other were flung thousands of pixels away (repulsion had no minimum distance), so "Fit" zoomed out until the graph was a speck. Repulsion now has a minimum distance and node speed is capped.

@@ -53,6 +53,8 @@ from raglib.vectorstores.base_store import MetadataFilter
 
 logger = logging.getLogger(__name__)
 
+_INTERNAL_METADATA = {"graph_context_docs"}
+
 
 @dataclass
 class PipelineContext:
@@ -370,7 +372,11 @@ class BaseRAG:
                 memory.add(query=ctx.query, answer=result.answer, documents=result.sources)
         result.trace_events = list(ctx.tracer.events)
         result.usage = {**result.usage, "latency_ms": ctx.tracer.total_latency_ms()}
+        # Pipeline diagnostics (crag_verdict, agent_steps, hop_queries, graph_mode, ...) are part of the
+        # result; internal Document lists stay out so metadata remains JSON-serializable.
+        diagnostics = {key: value for key, value in ctx.metadata.items() if key not in _INTERNAL_METADATA}
         result.metadata = {
+            **diagnostics,
             **result.metadata,
             "pipeline": self.pipeline_name,
             "search_query": ctx.search_query,
