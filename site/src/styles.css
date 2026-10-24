@@ -189,3 +189,6 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--i
 .site-footer { border-top: 1px solid var(--line); padding-block: 32px calc(32px + env(safe-area-inset-bottom, 0px)); color: var(--muted); font: .82rem var(--mono); }
 .site-footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .site-footer nav { display: flex; gap: 16px; flex-wrap: wrap; }
+
+/* keep anchored headings clear of the sticky header */
+section[id] { scroll-margin-top: 72px; }

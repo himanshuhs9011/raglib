@@ -5,6 +5,7 @@ import type { Route } from "../App";
 
 const NAV: { route: Route; label: string }[] = [
   { route: "home", label: "Home" },
+  { route: "reference", label: "API" },
   { route: "docs", label: "Docs" },
   { route: "playground", label: "Playground" },
 ];

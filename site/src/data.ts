@@ -72,7 +72,7 @@ rag.reset_memory("user-1")` },
           web_search_provider="duckduckgo", enable_graph=True)
 print(rag.query("hello!").reasoning_trace)              # no retrieval
 print(rag.query("refund window?").reasoning_trace)      # route:vector` },
-  { id: "web", name: "Web", what: "Answers from live web search (9 providers, DuckDuckGo is free).", when: "Fresh information.", calls: "1 + search", code: `rag = RAG(llm="openai", rag_type="web",
+  { id: "web", name: "Web", what: "Answers from live web search (8 providers, DuckDuckGo is free).", when: "Fresh information.", calls: "1 + search", code: `rag = RAG(llm="openai", rag_type="web",
           web_search_provider="duckduckgo")   # free; also tavily, serpapi, searxng, ...
 result = rag.query("Latest stable Python release")
 for doc in result.sources:

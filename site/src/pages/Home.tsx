@@ -131,6 +131,7 @@ export function Home() {
           <div className="actions">
             <a className="btn" href="#/playground">Try it in your browser</a>
             <a className="btn ghost" href="#/docs">Read the docs</a>
+            <a className="btn ghost" href="#/reference">API reference</a>
             <a className="btn ghost" href={LINKS.github} target="_blank" rel="noreferrer">GitHub</a>
           </div>
         </div>
@@ -173,7 +174,10 @@ export function Home() {
       </Section>
 
       <Section num="04" title="14 RAG architectures, one argument" id="rag-types">
-        <p className="lede">Pick a type to see what it does. Switching is one keyword: <code>RAG(..., rag_type="{type.id}")</code>.</p>
+        <p className="lede">
+          Pick a type to see what it does. Switching is one keyword: <code>RAG(..., rag_type="{type.id}")</code>. The snippets show
+          only the arguments that matter for each type; <a href="#/reference">all 56 arguments</a> work with every type.
+        </p>
         <div className="tabs" role="tablist" aria-label="RAG types">
           {RAG_TYPES.map((item) => (
             <button
