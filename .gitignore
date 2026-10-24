@@ -33,6 +33,10 @@ Desktop.ini
 # Secrets/env files
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 *.token
+
+# Generated run reports (contain local paths and document content)
+examples/reports/

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
+from raglib.components.query_rewriter import clean_llm_query
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -20,18 +21,21 @@ class Refiner:
         self.llm_client = llm_client
         self.max_retries = max_retries
 
-    def refine(self, query: str, failed_docs: List[Document]) -> str:
+    def refine(self, query: str, failed_docs: Optional[List[Document]] = None) -> str:
         """Generate a refined query from failed retrieval context."""
 
-        snippets = "\n".join(doc.content[:180] for doc in failed_docs[:3])
+        snippets = "\n".join(f"- {doc.content[:180]}" for doc in (failed_docs or [])[:3]) or "(no results)"
         prompt = (
-            "Rewrite the query to improve retrieval quality.\n"
+            "The search below returned poor results. Rewrite it as a better search query "
+            "(different wording, key entities, synonyms) that keeps the original intent.\n"
             f"Original query: {query}\n"
-            f"Low-quality snippets:\n{snippets}\n"
-            "Return only the refined query."
+            f"Poor results:\n{snippets}\n"
+            "Return only the improved search query."
         )
-        refined = self.llm_client.complete(prompt=prompt).strip()
-        if refined.lower().startswith("refined query:"):
-            refined = refined.split(":", 1)[1].strip()
-        logger.info("Refiner transformed query from '%s' to '%s'", query, refined)
-        return refined or query
+        try:
+            refined = clean_llm_query(self.llm_client.complete(prompt=prompt), fallback=query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Refiner failed: %s", exc)
+            return query
+        logger.debug("Refiner produced a refined query (changed=%s)", refined != query)
+        return refined

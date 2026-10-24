@@ -6,6 +6,7 @@ import logging
 from dataclasses import replace
 from typing import List, Optional
 
+from raglib.core.text import count_tokens, truncate_to_tokens
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -53,13 +54,11 @@ class ContextReducer:
         return reduced
 
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count from whitespace-separated words."""
+        """Count tokens with the shared tokenizer."""
 
-        return max(1, int(len(text.split()) * 1.2))
+        return count_tokens(text)
 
     def _truncate_to_tokens(self, text: str, max_tokens: int) -> str:
-        """Truncate text to an approximate token count."""
+        """Truncate text to a token budget."""
 
-        words = text.split()
-        max_words = max(1, int(max_tokens / 1.2))
-        return " ".join(words[:max_words])
+        return truncate_to_tokens(text, max_tokens)

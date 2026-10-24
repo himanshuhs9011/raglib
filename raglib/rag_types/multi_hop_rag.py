@@ -1,82 +1,39 @@
-"""Multi-hop RAG orchestration with sequential sub-query retrieval."""
+"""Multi-hop RAG: iterative retrieval where each hop is planned from evidence so far."""
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from typing import Dict, Optional
+from typing import Any, List
 
-from raglib.components.deduplicator import Deduplicator
-from raglib.components.generator import Generator
 from raglib.components.multi_hop_retriever import MultiHopRetriever
-from raglib.components.planner import Planner
-from raglib.components.retriever import Retriever
-from raglib.core.base import BaseRAG
-from raglib.schemas import Document, GenerationResult
+from raglib.core.base import BaseRAG, PipelineContext
+from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
 
 class MultiHopRAG(BaseRAG):
-    """Executes sequential retrieval hops planned from the user query."""
+    """For questions whose answer needs a bridge fact (A -> B -> answer)."""
 
-    def __init__(
-        self,
-        planner: Optional[Planner] = None,
-        retriever: Optional[Retriever] = None,
-        deduplicator: Optional[Deduplicator] = None,
-        generator: Optional[Generator] = None,
-        multi_hop_retriever: Optional[MultiHopRetriever] = None,
-        max_hops: int = 3,
-        **kwargs,
-    ):
-        """Initialize MultiHopRAG with planning and retrieval dependencies."""
+    pipeline_name = "multi_hop"
 
-        super().__init__(
-            planner=planner,
-            retriever=retriever,
-            deduplicator=deduplicator,
-            generator=generator,
-            multi_hop_retriever=multi_hop_retriever,
-            **kwargs,
-        )
+    def __init__(self, max_hops: int = 3, **kwargs: Any):
+        """Initialize MultiHopRAG."""
+
+        super().__init__(**kwargs)
         self.max_hops = max_hops
 
-    def run(self, query: str) -> GenerationResult:
-        """Plan hops, retrieve sequentially, accumulate context, and generate."""
+    def retrieve(self, ctx: PipelineContext) -> List[Document]:
+        """Run dependent retrieval hops."""
 
-        if self.generator is None or (
-            self.multi_hop_retriever is None and (self.planner is None or self.retriever is None)
-        ):
-            raise ValueError("MultiHopRAG requires planner, retriever, and generator")
-
-        active_query = self.pre_retrieve(query)
-
-        if self.multi_hop_retriever is not None:
-            query_result = self.multi_hop_retriever.retrieve(active_query)
-            documents = query_result.documents
-            trace = [f"hops:{query_result.hop_count}"]
-        else:
-            assert self.planner is not None and self.retriever is not None
-            hops = self.planner.plan(active_query)[: max(1, self.max_hops)]
-            trace = [f"hops:{len(hops)}"]
-
-            merged: Dict[str, Document] = {}
-            for hop_index, hop_query in enumerate(hops, start=1):
-                logger.info("MultiHopRAG hop=%d query=%s", hop_index, hop_query)
-                hop_docs = self.retriever.retrieve(hop_query)
-                for doc in hop_docs:
-                    digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
-                    key = doc.id or f"doc-{digest}"
-                    if key not in merged or doc.score > merged[key].score:
-                        merged[key] = doc
-
-            documents = sorted(merged.values(), key=lambda d: d.score, reverse=True)
-
-        if self.deduplicator is not None:
-            documents = self.deduplicator.deduplicate(documents)
-
-        documents = self.post_retrieve(active_query, documents)
-        documents = self.pre_generate(active_query, documents)
-        result = self.generator.generate(query=active_query, documents=documents, reasoning_trace=trace)
-        return self.post_generate(result)
+        retriever = self.multi_hop_retriever
+        if retriever is None:
+            if self.planner is None or self.retriever is None:
+                raise ValueError("MultiHopRAG requires planner and retriever")
+            retriever = MultiHopRetriever(retriever=self.retriever, planner=self.planner, max_hops=self.max_hops)
+            self.multi_hop_retriever = retriever
+        result = retriever.retrieve(ctx.search_query, filters=ctx.filters)
+        ctx.trace.append(f"hops:{result.hop_count}")
+        if result.rewritten_query:
+            ctx.metadata["hop_queries"] = result.rewritten_query.split(" | ")
+        return result.documents

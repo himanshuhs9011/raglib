@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import re
 from typing import List
 
+from raglib.core.text import tokenize
 from raglib.embedding.base_embedding import BaseEmbedding
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class MockEmbedding(BaseEmbedding):
         """Map text to a normalized vector using token and character-trigram feature hashing."""
 
         vector = [0.0] * self.DIMENSION
-        tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
+        tokens = tokenize(text)
 
         for token in tokens:
             digest = hashlib.md5(token.encode("utf-8")).digest()

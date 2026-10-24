@@ -15,7 +15,7 @@ class ProviderError(Exception):
     """Represents an operational provider error."""
 
 
-class ProviderNotConfiguredError(ProviderError):
+class ProviderNotConfiguredError(ProviderError, ValueError):
     """Raised when a provider is missing required credentials."""
 
 

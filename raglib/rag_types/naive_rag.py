@@ -1,46 +1,28 @@
-"""Naive RAG orchestration: retrieve then generate."""
+"""Naive RAG: retrieve top-k chunks, then generate."""
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import List
 
-from raglib.components.generator import Generator
-from raglib.components.retriever import Retriever
-from raglib.core.base import BaseRAG
-from raglib.schemas import GenerationResult
+from raglib.core.base import BaseRAG, PipelineContext
+from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
 
 class NaiveRAG(BaseRAG):
-    """Runs the simplest retrieval-then-generation workflow."""
+    """The simplest pipeline: retrieval then generation, no reranking or filtering."""
 
-    def __init__(
-        self,
-        retriever: Optional[Retriever] = None,
-        generator: Optional[Generator] = None,
-        **kwargs,
-    ):
-        """Initialize NaiveRAG with injected retriever and generator."""
+    pipeline_name = "naive"
 
-        super().__init__(retriever=retriever, generator=generator, **kwargs)
+    def retrieve(self, ctx: PipelineContext) -> List[Document]:
+        """Retrieve top-k chunks for the query."""
 
-    def run(self, query: str) -> GenerationResult:
-        """Run retrieve then generate without post-processing stages."""
+        ctx.trace.append("naive_retrieve_generate")
+        return self.retrieve_corpus(ctx, ctx.search_query)
 
-        active_query = self.pre_retrieve(query)
-        documents = self.retriever.retrieve(active_query) if self.retriever is not None else []
-        documents = self.post_retrieve(active_query, documents)
-        documents = self.pre_generate(active_query, documents)
+    def process_documents(self, ctx: PipelineContext, documents: List[Document]) -> List[Document]:
+        """Naive RAG does no post-processing."""
 
-        if self.generator is None:
-            raise ValueError("NaiveRAG requires a generator")
-
-        result = self.generator.generate(
-            query=active_query,
-            documents=documents,
-            memory_context="",
-            reasoning_trace=["naive_retrieve_generate"],
-        )
-        return self.post_generate(result)
+        return documents

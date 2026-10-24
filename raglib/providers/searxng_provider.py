@@ -13,7 +13,6 @@ from typing import List, Optional
 from raglib.providers.base_provider import (
     BaseSearchProvider,
     ProviderError,
-    ProviderNotConfiguredError,
 )
 from raglib.schemas import Document
 
@@ -27,8 +26,8 @@ class SearxNGProvider(BaseSearchProvider):
 
     def __init__(
         self,
-        api_key: Optional[str],
-        base_url: str,
+        api_key: Optional[str] = None,
+        base_url: str = "http://localhost:8080",
         categories: str = "general",
         language: str = "en",
         timeout: int = 10,
@@ -50,9 +49,6 @@ class SearxNGProvider(BaseSearchProvider):
     def search(self, query: str, num_results: int = 5) -> List[Document]:
         """Execute SearxNG search and map native results into Documents."""
 
-        if not self.api_key:
-            raise ProviderNotConfiguredError("SearxNGProvider requires a valid api_key")
-
         params = urllib.parse.urlencode(
             {
                 "q": query,
@@ -62,13 +58,10 @@ class SearxNGProvider(BaseSearchProvider):
             }
         )
         url = f"{self.base_url}/search?{params}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(url, headers=headers)
 
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:

@@ -1,339 +1,219 @@
-"""Faithful Corrective RAG orchestration with three-path routing."""
+"""Corrective RAG (CRAG, Yan et al. 2024): grade retrieval, then refine, search, or both."""
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+import re
+from typing import Any, List, Tuple
 
-from raglib.components.evaluator import Evaluator
-from raglib.components.generator import Generator
-from raglib.components.refiner import Refiner
-from raglib.components.retriever import Retriever
-from raglib.components.web_retriever import WebRetriever
-from raglib.core.base import BaseRAG
-from raglib.llm.base_client import BaseLLMClient
-from raglib.schemas import Document, GenerationResult
+from raglib.components.grader import LABEL_CORRECT, LABEL_INCORRECT, RelevanceGrader
+from raglib.components.query_rewriter import clean_llm_query
+from raglib.core.base import BaseRAG, PipelineContext
+from raglib.core.text import token_set
+from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
-# CRAG retrieval evaluator verdicts
 VERDICT_CORRECT = "correct"
 VERDICT_AMBIGUOUS = "ambiguous"
 VERDICT_INCORRECT = "incorrect"
 
 
 class CorrectiveRAG(BaseRAG):
-    """Three-path CRAG pipeline with LLM evaluation and selective context building."""
+    """Three-path CRAG pipeline.
 
-    def __init__(
-        self,
-        retriever: Optional[Retriever] = None,
-        evaluator: Optional[Evaluator] = None,
-        refiner: Optional[Refiner] = None,
-        generator: Optional[Generator] = None,
-        web_retriever: Optional[WebRetriever] = None,
-        llm_client: Optional[BaseLLMClient] = None,
-        max_retries: int = 2,
-        **kwargs,
-    ):
-        """Initialize CRAG dependencies used across the three routing paths."""
+    * CORRECT   (at least one document graded correct)  -> knowledge refinement of internal docs.
+    * INCORRECT (every document graded incorrect)       -> knowledge search (web, or corpus retry).
+    * AMBIGUOUS (otherwise)                             -> refinement + search, combined.
 
-        super().__init__(
-            retriever=retriever,
-            evaluator=evaluator,
-            refiner=refiner,
-            generator=generator,
-            web_retriever=web_retriever,
-            llm_client=llm_client,
-            max_retries=max_retries,
-            **kwargs,
+    Cost: one batched grading call, one batched strip-filter call, plus a query rewrite
+    and web search only on the INCORRECT/AMBIGUOUS paths. Web search runs only when a
+    ``web_retriever`` is configured, so private queries are never sent out by default.
+    """
+
+    pipeline_name = "corrective"
+    uses_decision_engine = False
+
+    def __init__(self, refine_strips: bool = True, max_strips: int = 40, **kwargs: Any):
+        """Initialize CRAG."""
+
+        super().__init__(**kwargs)
+        self.refine_strips = refine_strips
+        self.max_strips = max_strips
+
+    # ------------------------------------------------------------------ pipeline
+    def retrieve(self, ctx: PipelineContext) -> List[Document]:
+        """Retrieve, grade, and route through the CRAG action paths."""
+
+        if self.retriever is None:
+            raise ValueError("CorrectiveRAG requires a retriever")
+        ctx.trace.append("corrective_started")
+        documents = self.retrieve_corpus(ctx, ctx.search_query)
+
+        with ctx.tracer.stage("grade") as meta:
+            verdict, relevant = self._evaluate(ctx.search_query, documents)
+            meta.update({"verdict": verdict, "kept": len(relevant), "total": len(documents)})
+        ctx.trace.append(f"evaluation:{verdict}")
+        ctx.metadata["crag_verdict"] = verdict
+
+        internal: List[Document] = []
+        external: List[Document] = []
+        if verdict in {VERDICT_CORRECT, VERDICT_AMBIGUOUS}:
+            internal = self._knowledge_refinement(ctx.search_query, relevant)
+        if verdict in {VERDICT_AMBIGUOUS, VERDICT_INCORRECT}:
+            external = self._knowledge_search(ctx, documents)
+        ctx.trace.append(
+            {
+                VERDICT_CORRECT: "path:knowledge_refinement_only",
+                VERDICT_AMBIGUOUS: "path:refinement_plus_search",
+                VERDICT_INCORRECT: "path:search_only",
+            }[verdict]
         )
 
-    def run(self, query: str) -> GenerationResult:
-        """Execute CRAG: retrieve, evaluate, route, refine/search, then generate."""
+        merged: List[Document] = []
+        seen = set()
+        for doc in internal + external:
+            if doc.id not in seen:
+                seen.add(doc.id)
+                merged.append(doc)
+        return merged
 
-        if self.generator is None or self.retriever is None:
-            raise ValueError("CorrectiveRAG requires at least retriever and generator.")
+    # ------------------------------------------------------------------ evaluator
+    def _grader(self) -> RelevanceGrader:
+        """Return the configured grader, building a default one lazily."""
 
-        trace: List[str] = ["corrective_started"]
-        active_query = self.pre_retrieve(query)
-        documents = self.retriever.retrieve(active_query)
-        documents = self.post_retrieve(active_query, documents)
-        logger.info("CRAG retrieved %d documents.", len(documents))
+        if self.grader is None:
+            self.grader = RelevanceGrader(llm_client=self.llm_client, evaluator=self.evaluator)
+        return self.grader
 
-        verdict, scored_docs = self._evaluate_with_llm(active_query, documents)
-        trace.append(f"evaluation:{verdict}")
-        logger.info("CRAG verdict=%s for query='%s'", verdict, active_query)
-
-        k_in: List[Document] = []
-        k_ex: List[Document] = []
-
-        if verdict == VERDICT_CORRECT:
-            k_in = self._knowledge_refinement(active_query, scored_docs)
-            trace.append("path:knowledge_refinement_only")
-        elif verdict == VERDICT_AMBIGUOUS:
-            k_in = self._knowledge_refinement(active_query, scored_docs)
-            k_ex = self._knowledge_searching(active_query, trace)
-            trace.append("path:refinement_plus_web")
-        else:
-            k_ex = self._knowledge_searching(active_query, trace)
-            trace.append("path:web_only")
-
-        final_docs = self._merge_context(k_in, k_ex, verdict)
-        logger.info("CRAG generating with k_in=%d k_ex=%d docs.", len(k_in), len(k_ex))
-
-        final_docs = self.pre_generate(active_query, final_docs)
-        result = self.generator.generate(
-            query=query,
-            documents=final_docs,
-            reasoning_trace=trace,
-        )
-        return self.post_generate(result)
-
-    def _evaluate_with_llm(self, query: str, documents: List[Document]) -> Tuple[str, List[Document]]:
-        """Evaluate retrieval quality using LLM labels with keyword fallback."""
+    def _evaluate(self, query: str, documents: List[Document]) -> Tuple[str, List[Document]]:
+        """Grade documents and compute the CRAG verdict; returns (verdict, non-incorrect docs)."""
 
         if not documents:
-            logger.warning("CRAG received empty document list - verdict: incorrect.")
             return VERDICT_INCORRECT, []
-
-        if self.llm_client is None:
-            logger.warning(
-                "CRAG: no llm_client provided. Falling back to keyword evaluation. "
-                "Pass llm_client from the main chat model for full CRAG behavior."
-            )
-            return self._fallback_keyword_verdict(query, documents)
-
-        scores: List[Tuple[Document, str]] = []
-        for doc in documents:
-            score = self._score_single_document(query, doc)
-            scores.append((doc, score))
-            logger.debug("CRAG doc=%s score=%s", doc.id, score)
-
-        correct_docs = [doc for doc, label in scores if label == VERDICT_CORRECT]
-        ambiguous_docs = [doc for doc, label in scores if label == VERDICT_AMBIGUOUS]
-        incorrect_docs = [doc for doc, label in scores if label == VERDICT_INCORRECT]
-
-        if correct_docs and not incorrect_docs:
-            return VERDICT_CORRECT, correct_docs + ambiguous_docs
-        if correct_docs or ambiguous_docs:
-            return VERDICT_AMBIGUOUS, correct_docs + ambiguous_docs
+        labels = self._grader().grade(query, documents)
+        correct = [doc for doc, label in zip(documents, labels) if label == LABEL_CORRECT]
+        ambiguous = [doc for doc, label in zip(documents, labels) if label not in {LABEL_CORRECT, LABEL_INCORRECT}]
+        if correct:
+            return VERDICT_CORRECT, correct + ambiguous
+        if ambiguous:
+            return VERDICT_AMBIGUOUS, ambiguous
         return VERDICT_INCORRECT, []
 
-    def _score_single_document(self, query: str, document: Document) -> str:
-        """Label one document as correct, ambiguous, or incorrect for the query."""
-
-        llm_client = self.llm_client
-        if llm_client is None:
-            return VERDICT_AMBIGUOUS
-
-        snippet = document.content[:600].strip()
-        prompt = (
-            "You are a retrieval quality evaluator.\n\n"
-            f"Query: {query}\n\n"
-            f"Retrieved document:\n{snippet}\n\n"
-            "Is this document relevant and accurate for answering the query?\n"
-            "Reply with exactly one word:\n"
-            "  CORRECT - the document directly and accurately answers the query.\n"
-            "  AMBIGUOUS - the document is partially relevant or uncertain.\n"
-            "  INCORRECT - the document is irrelevant or misleading for this query.\n\n"
-            "Your answer (one word only):"
-        )
-
-        try:
-            response = llm_client.complete(prompt).strip().upper()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("CRAG LLM evaluator call failed: %s - defaulting to AMBIGUOUS.", exc)
-            return VERDICT_AMBIGUOUS
-
-        if "CORRECT" in response and "INCORRECT" not in response:
-            return VERDICT_CORRECT
-        if "INCORRECT" in response:
-            return VERDICT_INCORRECT
-        return VERDICT_AMBIGUOUS
-
+    # ------------------------------------------------------------------ refinement
     def _knowledge_refinement(self, query: str, documents: List[Document]) -> List[Document]:
-        """Decompose, filter, and recompose retrieved context into refined k_in."""
+        """Decompose documents into sentence strips and keep only the relevant ones."""
 
-        if not documents:
-            return []
+        if not documents or not self.refine_strips:
+            return documents
+        strips: List[Tuple[int, str]] = []
+        for doc_index, document in enumerate(documents):
+            for strip in self._decompose_into_strips(document.content):
+                strips.append((doc_index, strip))
+        if not strips or len(strips) > self.max_strips:
+            return documents
 
+        keep = self._select_strips(query, [text for _, text in strips])
         refined: List[Document] = []
-        for document in documents:
-            strips = self._decompose_into_strips(document.content)
-
-            if self.llm_client is not None:
-                kept_strips = self._filter_strips_with_llm(query, strips)
-            else:
-                query_words = set(query.lower().split())
-                kept_strips = [
-                    strip for strip in strips if query_words & set(strip.lower().split())
-                ] or strips
-
-            if not kept_strips:
+        for doc_index, document in enumerate(documents):
+            kept = [text for (owner, text), flag in zip(strips, keep) if owner == doc_index and flag]
+            if not kept:
                 continue
-
-            refined_content = " ".join(kept_strips)
             refined.append(
                 Document(
                     id=f"{document.id}_refined",
-                    content=refined_content,
-                    metadata={**document.metadata, "refined": True},
+                    content=" ".join(kept),
+                    metadata={**document.metadata, "refined": True, "refined_from": document.id},
                     score=document.score,
                     source=document.source,
                 )
             )
-            logger.debug(
-                "CRAG refined doc=%s: %d/%d strips kept.",
-                document.id,
-                len(kept_strips),
-                len(strips),
-            )
+        return refined or documents
 
-        logger.info("CRAG knowledge refinement: %d -> %d docs.", len(documents), len(refined))
-        return refined
+    @staticmethod
+    def _decompose_into_strips(text: str) -> List[str]:
+        """Split text into sentence strips."""
 
-    def _decompose_into_strips(self, text: str) -> List[str]:
-        """Split text into sentence strips without extra heavy dependencies."""
-
-        import re
-
-        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        sentences = re.split(r"(?<=[.!?।])\s+", text.strip())
         return [sentence.strip() for sentence in sentences if len(sentence.strip()) >= 10]
 
-    def _filter_strips_with_llm(self, query: str, strips: List[str]) -> List[str]:
-        """Batch filter sentence strips by relevance using the LLM."""
+    def _select_strips(self, query: str, strips: List[str]) -> List[bool]:
+        """Return a keep-flag per strip (one LLM call for all strips)."""
 
-        if not strips:
-            return []
+        if self.llm_client is None:
+            query_terms = token_set(query, remove_stopwords=True)
+            flags = [bool(query_terms & token_set(strip)) for strip in strips]
+            return flags if any(flags) else [True] * len(strips)
 
-        llm_client = self.llm_client
-        if llm_client is None:
-            return strips
-
-        numbered_strips = "\n".join(f"{idx + 1}. {strip}" for idx, strip in enumerate(strips))
+        numbered = "\n".join(f"{index}. {strip}" for index, strip in enumerate(strips, start=1))
         prompt = (
             f"Query: {query}\n\n"
-            f"Knowledge strips:\n{numbered_strips}\n\n"
-            "Which strip numbers are relevant to the query? "
-            "Reply with only the relevant numbers separated by commas (e.g. 1,3,5). "
-            "If all are relevant reply ALL. If none reply NONE."
+            f"Knowledge strips:\n{numbered}\n\n"
+            "Which strip numbers contain information useful for answering the query? "
+            "Reply with only the numbers separated by commas (e.g. 1,3,5). "
+            "Reply ALL if all are useful, NONE if none are."
         )
-
         try:
-            response = llm_client.complete(prompt).strip().upper()
+            response = self.llm_client.complete(prompt).strip().upper()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("CRAG strip filter LLM call failed: %s - keeping all strips.", exc)
-            return strips
+            logger.warning("CRAG strip filter failed: %s - keeping all strips", exc)
+            return [True] * len(strips)
+        if re.search(r"\bALL\b", response):
+            return [True] * len(strips)
+        if re.search(r"\bNONE\b", response):
+            return [False] * len(strips)
+        chosen = {int(number) - 1 for number in re.findall(r"\d+", response)}
+        flags = [index in chosen for index in range(len(strips))]
+        return flags if any(flags) else [True] * len(strips)
 
-        if response == "ALL":
-            return strips
-        if response == "NONE":
-            return []
+    # ------------------------------------------------------------------ search
+    def _knowledge_search(self, ctx: PipelineContext, failed_docs: List[Document]) -> List[Document]:
+        """Search external knowledge (web) or, without web, retry the corpus with a refined query."""
 
-        import re
-
-        numbers = re.findall(r"\d+", response)
-        kept: List[str] = []
-        for raw_number in numbers:
-            index = int(raw_number) - 1
-            if 0 <= index < len(strips):
-                kept.append(strips[index])
-
-        return kept if kept else strips
-
-    def _knowledge_searching(self, query: str, trace: List[str]) -> List[Document]:
-        """Rewrite and search web for external context k_ex with vector fallback."""
-
-        if self.web_retriever is None:
-            logger.warning(
-                "CRAG: web_retriever not configured. Falling back to vector refiner retry."
-            )
-            return self._vector_refiner_fallback(query, trace)
-
-        search_query = self._rewrite_for_web_search(query)
-        trace.append(f"web_search_query:{search_query[:60]}")
-        logger.info("CRAG web search query: '%s'", search_query)
-
-        try:
-            web_documents = self.web_retriever.retrieve(search_query)
-            logger.info("CRAG web search returned %d documents.", len(web_documents))
-            trace.append(f"web_results:{len(web_documents)}")
+        if self.web_retriever is not None:
+            search_query = self._rewrite_for_web_search(ctx.search_query)
+            ctx.trace.append(f"web_search_query:{search_query[:60]}")
+            with ctx.tracer.stage("web_search") as meta:
+                try:
+                    web_documents = self.web_retriever.retrieve(search_query)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("CRAG web search failed: %s", exc)
+                    ctx.trace.append("web_search_failed")
+                    web_documents = []
+                meta["docs"] = len(web_documents)
+            ctx.trace.append(f"web_results:{len(web_documents)}")
             return web_documents
-        except Exception as exc:  # noqa: BLE001
-            logger.error("CRAG web search failed: %s", exc)
-            trace.append("web_search_failed")
+
+        if self.refiner is None or self.retriever is None:
+            ctx.trace.append("search_unavailable")
             return []
+        query = ctx.search_query
+        known_ids = {doc.id for doc in failed_docs}
+        for attempt in range(1, self.max_retries + 1):
+            refined = self.refiner.refine(query, failed_docs)
+            if not refined or refined == query:
+                break
+            query = refined
+            ctx.trace.append(f"corpus_retry_{attempt}:{query[:60]}")
+            candidates = [doc for doc in self.retrieve_corpus(ctx, query) if doc.id not in known_ids]
+            verdict, relevant = self._evaluate(ctx.search_query, candidates)
+            if relevant:
+                return relevant
+            failed_docs = candidates or failed_docs
+        return []
 
     def _rewrite_for_web_search(self, query: str) -> str:
-        """Rewrite the user query into an effective web-search query string."""
+        """Rewrite the question into a web-search query."""
 
         if self.llm_client is None:
             return query
-
         prompt = (
-            "Rewrite the following question as a concise, effective web search query.\n"
-            "Return only the search query string - no explanation, no quotes.\n\n"
-            f"Question: {query}\n\n"
-            "Search query:"
+            "Rewrite the question as a concise web search query of keywords.\n"
+            f"Question: {query}\n"
+            "Return only the search query."
         )
-
         try:
-            rewritten = self.llm_client.complete(prompt).strip()
-            if 5 <= len(rewritten) <= 200:
-                return rewritten
+            return clean_llm_query(self.llm_client.complete(prompt), fallback=query, max_length=200)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("CRAG query rewrite failed: %s - using original.", exc)
-
-        return query
-
-    def _merge_context(self, k_in: List[Document], k_ex: List[Document], verdict: str) -> List[Document]:
-        """Build generator context according to CRAG verdict routing semantics."""
-
-        if verdict == VERDICT_CORRECT:
-            merged = k_in
-        elif verdict == VERDICT_AMBIGUOUS:
-            merged = k_in + k_ex
-        else:
-            merged = k_ex
-
-        seen_ids = set()
-        final_docs: List[Document] = []
-        for document in merged:
-            if document.id in seen_ids:
-                continue
-            seen_ids.add(document.id)
-            final_docs.append(document)
-        return final_docs
-
-    def _fallback_keyword_verdict(self, query: str, documents: List[Document]) -> Tuple[str, List[Document]]:
-        """Fallback verdict route based on keyword evaluator when LLM is unavailable."""
-
-        if self.evaluator is not None:
-            filtered = self.evaluator.evaluate(query, documents)
-            if len(filtered) == len(documents):
-                return VERDICT_CORRECT, filtered
-            if filtered:
-                return VERDICT_AMBIGUOUS, filtered
-            return VERDICT_INCORRECT, []
-        return VERDICT_AMBIGUOUS, documents
-
-    def _vector_refiner_fallback(self, query: str, trace: List[str]) -> List[Document]:
-        """Fallback to vector retriever retries when web retrieval is unavailable."""
-
-        if self.refiner is None or self.retriever is None:
-            logger.warning("CRAG: no web_retriever and no usable refiner/retriever fallback.")
-            return []
-
-        retries = 0
-        active_query = query
-        while retries < self.max_retries:
-            retries += 1
-            active_query = self.refiner.refine(active_query, [])
-            trace.append(f"vector_retry_{retries}")
-            logger.info("CRAG vector retry %d query='%s'", retries, active_query)
-            docs = self.retriever.retrieve(active_query)
-            if docs:
-                return docs
-
-        return []
+            logger.warning("CRAG query rewrite failed: %s", exc)
+            return query

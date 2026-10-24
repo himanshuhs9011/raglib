@@ -6,7 +6,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Sequence, Union
+from typing import Iterator, List, Optional, Sequence, Union
 
 from raglib.loaders.pdf_loader import PDFLoader
 from raglib.loaders.pptx_loader import PPTXLoader
@@ -18,7 +18,7 @@ from raglib.vision.base_vision import BaseVisionClient
 
 logger = logging.getLogger(__name__)
 
-SourceInput = Union[str, os.PathLike[str], Sequence[Union[str, os.PathLike[str]]], None]
+SourceInput = Union[str, os.PathLike[str], Document, Sequence[Union[str, os.PathLike[str], Document]], None]
 
 
 class DocumentLoader:
@@ -34,67 +34,110 @@ class DocumentLoader:
         pptx_loader: Optional[PPTXLoader] = None,
         text_loader: Optional[TextLoader] = None,
         web_loader: Optional[WebLoader] = None,
+        allow_private_urls: bool = False,
+        allowed_dirs: Optional[Sequence[Union[str, os.PathLike]]] = None,
     ):
-        """Initialize all concrete loaders used by the dispatcher."""
+        """Initialize all concrete loaders used by the dispatcher.
+
+        ``allowed_dirs`` restricts file/folder sources to those directories (use it when
+        sources come from untrusted users); ``allow_private_urls`` disables the SSRF guard.
+        """
+
+        self.allowed_dirs = [os.path.realpath(os.fspath(path)) for path in allowed_dirs] if allowed_dirs else None
 
         self.pdf_loader = pdf_loader or PDFLoader(vision_client=vision_client)
         self.word_loader = word_loader or WordLoader()
         self.pptx_loader = pptx_loader or PPTXLoader()
         self.text_loader = text_loader or TextLoader()
-        self.web_loader = web_loader or WebLoader()
+        self.web_loader = web_loader or WebLoader(allow_private_hosts=allow_private_urls)
 
     def load(self, source: SourceInput) -> List[Document]:
         """Load input source(s) into a list of normalized Document objects."""
 
-        if source is None:
-            return []
+        documents: List[Document] = []
+        for batch in self.iter_load(source):
+            documents.extend(batch)
+        return documents
 
+    def iter_load(self, source: SourceInput) -> Iterator[List[Document]]:
+        """Yield documents one source unit (file, URL, raw text) at a time.
+
+        Lets callers index huge folders incrementally instead of holding every file in memory.
+        Folder files that fail to load are skipped with a warning; explicit single sources raise.
+        """
+
+        if source is None:
+            return
         if isinstance(source, (list, tuple, set)):
-            documents: List[Document] = []
             for item in source:
-                documents.extend(self.load(item))
-            logger.info("DocumentLoader loaded %d documents from iterable source", len(documents))
-            return documents
+                yield from self.iter_load(item)
+            return
+
+        if isinstance(source, Document):
+            if source.content.strip():
+                yield [source]
+            return
 
         is_explicit_path = isinstance(source, os.PathLike)
         if is_explicit_path:
             source = os.fspath(source)
-
         if not isinstance(source, str):
-            raise TypeError("source must be a path, URL, raw string, or list of these")
-
+            raise TypeError("source must be a path, URL, raw string, Document, or list of these")
         normalized = source.strip()
         if not normalized:
-            return []
+            return
 
         if self._is_url(normalized):
-            documents = self.web_loader.load(normalized)
-            logger.info("DocumentLoader loaded %d documents from URL", len(documents))
-            return documents
+            yield self.web_loader.load(normalized)
+            return
 
         if os.path.exists(normalized):
+            self._check_allowed_path(normalized)
             if os.path.isdir(normalized):
-                documents = self._load_folder(normalized)
-                logger.info("DocumentLoader loaded %d documents from folder=%s", len(documents), normalized)
-                return documents
-
-            documents = self._load_file(normalized)
-            logger.info("DocumentLoader loaded %d documents from file=%s", len(documents), normalized)
-            return documents
+                yield from self._iter_folder(normalized)
+                return
+            yield self._load_file(normalized)
+            return
 
         if is_explicit_path or self._looks_like_missing_file_path(normalized):
             raise FileNotFoundError(f"Source file or directory not found: '{normalized}'")
 
-        logger.info("DocumentLoader treating source as raw text input")
         stable_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-        raw_document = Document(
-            f"raw-{stable_id}",
-            normalized,
-            {"loader": "raw_text"},
-            0.0,
-            "text",
-        )
-        return [raw_document]
+        yield [Document(f"raw-{stable_id}", normalized, {"loader": "raw_text"}, 0.0, "text")]
+
+    def iter_files(self, folder_path: str) -> Iterator[str]:
+        """Yield supported file paths under a folder (sorted, recursive)."""
+
+        for root, dirs, filenames in os.walk(folder_path):
+            dirs.sort()
+            for filename in sorted(filenames):
+                file_path = os.path.join(root, filename)
+                extension = Path(file_path).suffix.lower()
+                if extension and extension not in self.SUPPORTED_EXTENSIONS:
+                    continue
+                yield file_path
+
+    def _iter_folder(self, folder_path: str) -> Iterator[List[Document]]:
+        """Yield the documents of each file in a folder, skipping unreadable files."""
+
+        for file_path in self.iter_files(folder_path):
+            try:
+                self._check_allowed_path(file_path)  # symlinked files must stay inside allowed_dirs
+                yield self._load_file(file_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Skipping file=%s due to loader error: %s", file_path, exc)
+                yield []
+
+    def _check_allowed_path(self, path: str) -> None:
+        """Enforce ``allowed_dirs`` (symlinks and '..' are resolved first)."""
+
+        if self.allowed_dirs is None:
+            return
+        real = os.path.realpath(path)
+        for base in self.allowed_dirs:
+            if real == base or real.startswith(base.rstrip(os.sep) + os.sep):
+                return
+        raise PermissionError(f"Source path is outside allowed_dirs: {path}")
 
     def _looks_like_missing_file_path(self, value: str) -> bool:
         """Detect single-line strings that clearly refer to a missing file path."""
@@ -109,18 +152,7 @@ class DocumentLoader:
     def _load_folder(self, folder_path: str) -> List[Document]:
         """Load all supported files recursively from a folder path."""
 
-        documents: List[Document] = []
-        for root, _, filenames in os.walk(folder_path):
-            for filename in sorted(filenames):
-                file_path = os.path.join(root, filename)
-                extension = Path(file_path).suffix.lower()
-                if extension and extension not in self.SUPPORTED_EXTENSIONS:
-                    continue
-                try:
-                    documents.extend(self._load_file(file_path))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Skipping file=%s due to loader error: %s", file_path, exc)
-        return documents
+        return [document for batch in self._iter_folder(folder_path) for document in batch]
 
     def _load_file(self, path: str) -> List[Document]:
         """Load one file according to its extension."""

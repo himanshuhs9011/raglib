@@ -1,22 +1,22 @@
-"""Multi-query retrieval via semantic expansion and result merging."""
+"""Multi-query retrieval: parallel retrieval per query variant, fused with RRF."""
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from dataclasses import replace
-from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, List, Optional
 
 from raglib.components.deduplicator import Deduplicator
 from raglib.components.query_expander import QueryExpander
 from raglib.components.retriever import Retriever
+from raglib.core.fusion import reciprocal_rank_fusion
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
 
 class MultiQueryRetriever:
-    """Expands a query into variants and merges retrieval results."""
+    """Expands a query into variants, retrieves for each in parallel, and fuses with RRF."""
 
     def __init__(
         self,
@@ -24,6 +24,7 @@ class MultiQueryRetriever:
         query_expander: QueryExpander,
         deduplicator: Optional[Deduplicator] = None,
         top_k: int = 5,
+        max_workers: int = 4,
     ):
         """Initialize variant retrieval dependencies."""
 
@@ -31,35 +32,26 @@ class MultiQueryRetriever:
         self.query_expander = query_expander
         self.deduplicator = deduplicator
         self.top_k = top_k
+        self.max_workers = max_workers
 
-    def retrieve(self, query: str) -> List[Document]:
-        """Retrieve documents across query variants and merge scores."""
+    def retrieve(self, query: str, top_k: Optional[int] = None, **kwargs: Any) -> List[Document]:
+        """Retrieve documents across query variants and fuse rankings."""
 
+        return self.retrieve_with_variants(query, top_k=top_k, **kwargs)[0]
+
+    def retrieve_with_variants(self, query: str, top_k: Optional[int] = None, **kwargs: Any):
+        """Return (fused documents, query variants) - thread-safe, no shared state."""
+
+        k = top_k or self.top_k
         variants = self.query_expander.expand(query)
-        logger.info("MultiQueryRetriever generated %d variants", len(variants))
-
-        merged: Dict[str, Document] = {}
-        counts: Dict[str, int] = {}
-
-        for variant in variants:
-            docs = self.retriever.retrieve(variant)
-            for doc in docs:
-                digest = hashlib.sha256(doc.content.lower().strip().encode("utf-8")).hexdigest()[:16]
-                key = doc.id or f"doc-{digest}"
-                if key in merged:
-                    previous = merged[key]
-                    merged[key] = replace(previous, score=max(previous.score, doc.score))
-                    counts[key] += 1
-                else:
-                    merged[key] = doc
-                    counts[key] = 1
-
-        blended = [
-            replace(doc, score=doc.score * (1.0 + 0.1 * (counts[key] - 1)))
-            for key, doc in merged.items()
-        ]
-
-        ranked = sorted(blended, key=lambda d: d.score, reverse=True)
-        if self.deduplicator:
-            ranked = self.deduplicator.deduplicate(ranked)
-        return ranked[: self.top_k]
+        if len(variants) == 1:
+            ranked_lists = [self.retriever.retrieve(variants[0], top_k=k, **kwargs)]
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(variants))) as pool:
+                ranked_lists = list(pool.map(lambda v: self.retriever.retrieve(v, top_k=k, **kwargs), variants))
+        # The original query gets a higher weight than paraphrases.
+        weights = [1.5] + [1.0] * (len(ranked_lists) - 1)
+        fused = reciprocal_rank_fusion(ranked_lists, weights=weights)
+        if self.deduplicator is not None:
+            fused = self.deduplicator.deduplicate(fused)
+        return fused[:k], variants

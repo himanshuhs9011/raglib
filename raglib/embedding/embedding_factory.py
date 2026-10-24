@@ -39,7 +39,18 @@ class EmbeddingFactory:
 
         if provider_name == "openai":
             logger.info("EmbeddingFactory selected provider='openai'")
-            return OpenAIEmbedding(api_key=api_key, model_name=model_name)
+            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url)
+
+        if provider_name == "openai_compatible":
+            if not base_url or not model_name:
+                raise ValueError("openai_compatible embeddings require base_url and model_name")
+            logger.info("EmbeddingFactory selected provider='openai_compatible' (%s)", base_url)
+            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, compatible=True)
+
+        if provider_name == "azure":
+            if not base_url or not model_name:
+                raise ValueError("Azure embeddings require the endpoint (base_url / AZURE_OPENAI_ENDPOINT) and deployment")
+            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, azure=True)
 
         if provider_name == "google":
             logger.info("EmbeddingFactory selected provider='google'")

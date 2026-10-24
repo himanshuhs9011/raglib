@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from raglib.core.text import tokenize
 from raglib.graph_context.schemas import ConnectedNodeRef, GraphContextResult, GraphNode
 from raglib.llm.base_client import BaseLLMClient
 from raglib.loaders.chunk_splitter import ChunkSplitter
@@ -46,8 +47,16 @@ class GraphContextWindow:
         chunk_overlap: int = 25,
         max_context_tokens: int = 1200,
         include_neighbor_signposts: bool = True,
+        embedding: Optional[Any] = None,
+        semantic_weight: float = 1.0,
     ):
-        """Initialize the standalone graph context engine."""
+        """Initialize the standalone graph context engine.
+
+        ``embedding`` (any raglib ``BaseEmbedding``) adds semantic seeding: chunks are embedded once
+        at ingestion and seeds are scored by keyword overlap + ``semantic_weight`` x cosine similarity,
+        so paraphrased questions ("Iceland's capital" -> "Reykjavik") still find the right chunk.
+        Without it, seeding is keyword-only and needs no model at all.
+        """
 
         self._llm_client = llm_client
         self._chunking_strategy = chunking_strategy
@@ -55,6 +64,10 @@ class GraphContextWindow:
         self._chunk_overlap = min(chunk_overlap, max(0, chunk_size - 1))
         self._max_context_tokens = max_context_tokens
         self._include_neighbor_signposts = include_neighbor_signposts
+        self._embedding = embedding
+        self._semantic_weight = semantic_weight
+        self._chunk_vectors: Dict[str, List[float]] = {}
+        self._vector_matrix: Any = None  # (ids, normalized numpy matrix) cache, rebuilt after ingestion
 
         effective_strategy = chunking_strategy
         if effective_strategy in ("llm", "semantic", "llm_semantic") and llm_client is None:
@@ -73,6 +86,8 @@ class GraphContextWindow:
         self.type_index: Dict[str, List[str]] = defaultdict(list)
         self.entity_index: Dict[str, Set[str]] = defaultdict(set)
         self.keyword_index: Dict[str, Set[str]] = defaultdict(set)
+        self._seed_term_index: Dict[str, Set[str]] = defaultdict(set)
+        self._term_cache: Dict[str, Tuple[Set[str], Set[str]]] = {}
         self.doc_to_chunks: Dict[str, List[str]] = defaultdict(list)
         self._turn_counter: int = 0
 
@@ -288,7 +303,44 @@ class GraphContextWindow:
 
         # Wire cross-section and cross-document SHARED_ENTITY connections
         self._wire_shared_entity_links(new_chunk_nodes)
+        if self._embedding is not None and new_chunk_nodes:
+            vectors = self._embedding.embed_documents([node.content for node in new_chunk_nodes])
+            for node, vector in zip(new_chunk_nodes, vectors):
+                self._chunk_vectors[node.id] = list(vector)
+            self._vector_matrix = None
         return created_nodes
+
+    def _semantic_scores(self, query: str, limit: int) -> Dict[str, float]:
+        """Cosine similarity of the query to the closest ``limit`` chunk nodes (empty without embedding)."""
+
+        if self._embedding is None or not self._chunk_vectors:
+            return {}
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - numpy ships with most installs
+            np = None
+        query_vector = self._embedding.embed_query(query)
+        if np is None:
+            def cos(a, b):
+                dot = sum(x * y for x, y in zip(a, b))
+                na = sum(x * x for x in a) ** 0.5
+                nb = sum(y * y for y in b) ** 0.5
+                return dot / (na * nb) if na and nb else 0.0
+
+            scores = {node_id: cos(query_vector, vec) for node_id, vec in self._chunk_vectors.items()}
+        else:
+            if self._vector_matrix is None:
+                ids = list(self._chunk_vectors)
+                matrix = np.asarray([self._chunk_vectors[i] for i in ids], dtype=np.float32)
+                norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+                self._vector_matrix = (ids, matrix / np.where(norms == 0, 1.0, norms))
+            ids, matrix = self._vector_matrix
+            q = np.asarray(query_vector, dtype=np.float32)
+            q = q / (np.linalg.norm(q) or 1.0)
+            sims = matrix @ q
+            scores = {ids[i]: float(sims[i]) for i in range(len(ids))}
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
+        return {node_id: score for node_id, score in ranked if score > 0}
 
     # ------------------------------------------------------------------
     # 2. Chat Context Graph (Conversational Turns + Links to Doc Chunks)
@@ -438,13 +490,28 @@ class GraphContextWindow:
         is_followup = bool(raw_lower_words & _FOLLOWUP_CUES)
 
         # Step 1: Score and select seed nodes (chunks + chat turns)
+        # Only nodes sharing at least one term with the query can score > 0, so look them up in
+        # the inverted index instead of scanning every node (query cost ~ matches, not graph size).
         seed_scores: Dict[str, float] = {}
-        for node_id, node in self.nodes.items():
-            if node.node_type not in ("chunk", "chat_turn"):
+        candidate_ids: Set[str] = set()
+        for token in query_tokens:
+            candidate_ids.update(self._seed_term_index.get(token, ()))
+        for node_id in candidate_ids:
+            node = self.nodes.get(node_id)
+            if node is None or node.node_type not in ("chunk", "chat_turn"):
                 continue
             score = self._score_node_against_query(node, query_tokens, query.lower())
             if score > 0:
                 seed_scores[node_id] = score
+
+        semantic = self._semantic_scores(query, limit=max(8, top_k_seeds * 4))
+        if semantic:
+            # Scale cosine to the keyword score range so neither signal drowns the other.
+            scale = max(seed_scores.values(), default=1.0) or 1.0
+            for node_id, similarity in semantic.items():
+                if node_id in self.nodes:
+                    seed_scores[node_id] = seed_scores.get(node_id, 0.0) + self._semantic_weight * similarity * scale
+            traversal_trace.append(f"Semantic seeding over {len(self._chunk_vectors)} embedded chunks")
 
         # If conversational follow-up, also seed from the most recent chat turn
         chat_turn_ids = self.type_index.get("chat_turn", [])
@@ -587,6 +654,13 @@ class GraphContextWindow:
             formatted_context=formatted_context,
             total_tokens=used_tokens,
         )
+
+    def to_html(self, path: Optional[str] = None, max_nodes: int = 500) -> str:
+        """Interactive HTML view of the document + chat graph; writes to ``path`` if given."""
+
+        from raglib.visualize import context_window_to_html
+
+        return context_window_to_html(self, path=path, max_nodes=max_nodes)
 
     def retrieve(self, query: str, top_k: int = 4) -> List[Document]:
         """Drop-in retrieval helper returning standard `raglib.schemas.Document` objects."""
@@ -760,7 +834,6 @@ class GraphContextWindow:
     def _wire_shared_entity_links(self, new_chunks: Sequence[GraphNode]) -> None:
         """Connect chunks across sections or documents that share salient entities/keywords."""
 
-        all_chunk_ids = self.type_index.get("chunk", [])
         for chunk in new_chunks:
             chunk_entities = set(chunk.metadata.get("entities", []))
             chunk_keywords = set(chunk.metadata.get("keywords", []))
@@ -768,8 +841,16 @@ class GraphContextWindow:
             if not salient_terms:
                 continue
 
+            # Candidates come from the entity/keyword inverted indexes (no all-pairs scan).
+            candidate_ids: Set[str] = set()
+            for term in salient_terms:
+                candidate_ids.update(self.entity_index.get(str(term).lower(), ()))
+                candidate_ids.update(self.keyword_index.get(str(term).lower(), ()))
+
             candidate_scores: List[Tuple[GraphNode, List[str], float]] = []
-            for other_id in all_chunk_ids:
+            for other_id in sorted(candidate_ids):
+                if self.nodes.get(other_id) is None or self.nodes[other_id].node_type != "chunk":
+                    continue
                 if other_id == chunk.id:
                     continue
                 other = self.nodes.get(other_id)
@@ -880,8 +961,7 @@ class GraphContextWindow:
 
         node_keywords = set(node.metadata.get("keywords", []))
         node_entities = set(node.metadata.get("entities", []))
-        summary_tokens = set(self._extract_keywords(node.summary, limit=12))
-        content_tokens = set(self._extract_keywords(node.content, limit=40))
+        summary_tokens, content_tokens = self._node_terms(node)
 
         entity_hits = len(query_tokens & node_entities)
         keyword_hits = len(query_tokens & node_keywords)
@@ -952,12 +1032,32 @@ class GraphContextWindow:
         self._index_node_terms(node)
 
     def _index_node_terms(self, node: GraphNode) -> None:
-        """Index a node's entities and keywords for fast lookup."""
+        """Index a node's entities and keywords (and, for seedable nodes, every scored term)."""
 
         for entity in node.metadata.get("entities", []):
             self.entity_index[str(entity).lower()].add(node.id)
         for kw in node.metadata.get("keywords", []):
             self.keyword_index[str(kw).lower()].add(node.id)
+        if node.node_type in ("chunk", "chat_turn"):
+            self._term_cache.pop(node.id, None)
+            summary_tokens, content_tokens = self._node_terms(node)
+            terms = summary_tokens | content_tokens
+            terms.update(str(item).lower() for item in node.metadata.get("entities", []))
+            terms.update(str(item).lower() for item in node.metadata.get("keywords", []))
+            for term in terms:
+                self._seed_term_index[term].add(node.id)
+
+    def _node_terms(self, node: GraphNode) -> Tuple[Set[str], Set[str]]:
+        """Return cached (summary_terms, content_terms) for a node (computed once, not per query)."""
+
+        cached = self._term_cache.get(node.id)
+        if cached is None:
+            cached = (
+                set(self._extract_keywords(node.summary, limit=12)),
+                set(self._extract_keywords(node.content, limit=40)),
+            )
+            self._term_cache[node.id] = cached
+        return cached
 
     @staticmethod
     def _build_section_summary(
@@ -1000,7 +1100,7 @@ class GraphContextWindow:
     def _extract_keywords(text: str, limit: int = 8) -> List[str]:
         """Extract salient lowercase keywords ordered by frequency and position."""
 
-        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", text.lower())
+        tokens = [token for token in tokenize(text) if len(token) >= 3 and not token[0].isdigit()]
         counts: Dict[str, int] = {}
         first_pos: Dict[str, int] = {}
         for idx, tok in enumerate(tokens):

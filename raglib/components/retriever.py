@@ -1,362 +1,402 @@
-"""In-memory vector retriever with optional FAISS acceleration and incremental vector indexing."""
+"""Corpus retriever: dense (vector store), sparse (BM25) or hybrid (RRF fusion of both)."""
 
 from __future__ import annotations
 
 import logging
 import math
-import re
-from collections import Counter
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
+from raglib.components.bm25 import BM25Index
+from raglib.core.concurrency import ReadWriteLock
+from raglib.core.fusion import DEFAULT_RRF_K, reciprocal_rank_fusion
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.schemas import Document
-from raglib.vectorstores.base_store import BaseVectorStore, VectorRecord
+from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord, matches_filter
 from raglib.vectorstores.factory import VectorStoreFactory
 
 logger = logging.getLogger(__name__)
 
+RETRIEVAL_MODES = ("dense", "sparse", "hybrid")
+FUSION_METHODS = ("relative", "rrf")
+
 
 class Retriever:
-    """Retrieves relevant documents from a vector store or in-memory corpus."""
+    """Retrieves relevant chunks from the corpus.
+
+    * ``mode="hybrid"`` (default when an embedding is configured): dense vector search and
+      BM25 run side by side and are fused - robust to both semantic paraphrase and exact
+      keyword / ID queries. ``fusion="relative"`` (default) scores every candidate on BOTH
+      signals, min-max normalizes each and blends them with ``hybrid_alpha`` (weight of the
+      dense score); ``fusion="rrf"`` uses rank-only Reciprocal Rank Fusion.
+    * ``mode="dense"``: vector search only.  ``mode="sparse"``: BM25 only (no embedding needed).
+
+    Adding a document whose id is already indexed is a no-op, so ingestion is idempotent.
+    """
 
     def __init__(
         self,
-        documents: List[Document],
+        documents: Optional[List[Document]] = None,
         embedding: Optional[BaseEmbedding] = None,
         top_k: int = 5,
         vector_db: Optional[Union[str, BaseVectorStore]] = None,
         vector_db_kwargs: Optional[Dict[str, Any]] = None,
+        mode: Optional[str] = None,
+        fetch_k: Optional[int] = None,
+        rrf_k: int = DEFAULT_RRF_K,
+        fusion: str = "relative",
+        hybrid_alpha: float = 0.5,
+        mmr_lambda: Optional[float] = None,
+        neighbor_window: int = 0,
     ):
-        """Initialize retriever state and optional FAISS backend."""
+        """Initialize indexes and ingest the initial documents."""
+
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero")
+        resolved_mode = (mode or ("hybrid" if embedding is not None else "sparse")).strip().lower()
+        if resolved_mode not in RETRIEVAL_MODES:
+            raise ValueError(f"Unknown retrieval mode '{mode}'. Supported: {list(RETRIEVAL_MODES)}")
+        if resolved_mode in {"dense", "hybrid"} and embedding is None:
+            raise ValueError(f"retrieval mode '{resolved_mode}' requires an embedding model")
+        if mmr_lambda is not None and not 0.0 <= mmr_lambda <= 1.0:
+            raise ValueError("mmr_lambda must be between 0 and 1")
+        if fusion not in FUSION_METHODS:
+            raise ValueError(f"Unknown fusion '{fusion}'. Supported: {list(FUSION_METHODS)}")
+        if not 0.0 <= hybrid_alpha <= 1.0:
+            raise ValueError("hybrid_alpha must be between 0 and 1")
 
         self.top_k = top_k
+        self.mode = resolved_mode
+        self.fetch_k = fetch_k
+        self.rrf_k = rrf_k
+        self.fusion = fusion
+        self.hybrid_alpha = hybrid_alpha
+        self.mmr_lambda = mmr_lambda
+        self.neighbor_window = max(0, neighbor_window)
+
         self._embedding = embedding
         self._vector_store: Optional[BaseVectorStore] = None
-        self._documents: List[Document] = []
-        self._vector_document_lookup: Dict[str, Document] = {}
-        self._doc_tokens: List[List[str]] = []
-        self._doc_tfidf: List[Dict[str, float]] = []
-        self._document_frequency: Counter[str] = Counter()
-        self._faiss_index = None
-        self._faiss_vocabulary: List[str] = []
-        self._faiss_ready = False
-        self._faiss_import_error: Optional[Exception] = None
-
-        if self._embedding is not None:
-            logger.info("Retriever using embedding model=%s", type(self._embedding).__name__)
-            self._vector_store = VectorStoreFactory.build(
-                vector_db=vector_db,
-                vector_db_kwargs=vector_db_kwargs,
+        if embedding is not None:
+            self._vector_store = VectorStoreFactory.build(vector_db=vector_db, vector_db_kwargs=vector_db_kwargs)
+            logger.info(
+                "Retriever mode=%s embedding=%s vector_store=%s",
+                self.mode,
+                type(embedding).__name__,
+                type(self._vector_store).__name__,
             )
-            logger.info("Retriever using vector store=%s", type(self._vector_store).__name__)
 
-        self._detect_faiss()
-        self.add_documents(documents)
+        self._documents: List[Document] = []
+        self._doc_index: Dict[str, Document] = {}
+        self._bm25 = BM25Index()
+        # Queries read concurrently; add/delete mutate under the write side.
+        self._lock = ReadWriteLock()
+        self.add_documents(documents or [])
 
-    def add_documents(self, documents: List[Document]) -> None:
-        """Add documents to the corpus and incrementally upsert new vectors."""
+    # ------------------------------------------------------------------ properties
+    @property
+    def embedding(self) -> Optional[BaseEmbedding]:
+        """Return the embedding model (None for sparse-only retrieval)."""
 
-        if not documents:
-            return
-        start_index = len(self._documents)
-        self._documents.extend(documents)
-        logger.info("Retriever added %d documents (total=%d)", len(documents), len(self._documents))
-        self._reindex(new_documents=documents, start_index=start_index)
+        return self._embedding
 
-    def retrieve(self, query: str) -> List[Document]:
-        """Retrieve top-k documents ranked by query similarity."""
+    @property
+    def vector_store(self) -> Optional[BaseVectorStore]:
+        """Return the vector store backend (None for sparse-only retrieval)."""
 
-        logger.debug("Retriever received query=%s", query)
-        if not query or not query.strip():
-            logger.info("Retriever returning empty result for empty query")
+        return self._vector_store
+
+    @property
+    def documents(self) -> List[Document]:
+        """Return the indexed chunks in insertion order (a snapshot copy)."""
+
+        with self._lock.read():
+            return list(self._documents)
+
+    def get(self, doc_id: str) -> Optional[Document]:
+        """Return an indexed chunk by id."""
+
+        with self._lock.read():
+            return self._doc_index.get(doc_id)
+
+    # ------------------------------------------------------------------ ingestion
+    def add_documents(self, documents: Sequence[Document]) -> List[Document]:
+        """Index new documents; ids already indexed are skipped. Returns the newly added docs."""
+
+        new_docs: List[Document] = []
+        seen = set()
+        with self._lock.read():
+            for document in documents:
+                if not document.id:
+                    raise ValueError("Documents must have a non-empty id to be indexed")
+                if document.id in self._doc_index or document.id in seen:
+                    continue
+                seen.add(document.id)
+                new_docs.append(document)
+        if not new_docs:
             return []
 
-        if not self._tokenize(query):
-            logger.info("Retriever returning empty result for query with no indexable tokens")
-            return []
-
+        # Embedding (slow network call) happens outside the lock so queries keep running.
         if self._embedding is not None and self._vector_store is not None:
-            embedding_docs = self._retrieve_with_embedding(query)
-            if embedding_docs:
-                logger.info("Retriever returned %d documents via embedding search", len(embedding_docs))
-                return embedding_docs
-            logger.warning("Embedding retrieval produced no results; falling back to sparse search")
+            self._index_dense(new_docs)
 
-        if not self._documents:
-            logger.warning("Retriever called with empty corpus")
-            return []
+        with self._lock.write():
+            new_docs = [document for document in new_docs if document.id not in self._doc_index]
+            for document in new_docs:
+                self._documents.append(document)
+                self._doc_index[document.id] = document
+                self._bm25.add(document.id, document.content)
 
-        if self._faiss_ready:
-            faiss_docs = self._retrieve_with_faiss(query)
-            if faiss_docs:
-                logger.info("Retriever returned %d documents", len(faiss_docs))
-                return faiss_docs
+        logger.info("Retriever indexed %d new documents (total=%d)", len(new_docs), len(self._documents))
+        return new_docs
 
-        docs = self._retrieve_with_sparse_cosine(query)
-        logger.info("Retriever returned %d documents", len(docs))
-        return docs
+    def _index_dense(self, documents: List[Document]) -> None:
+        """Embed and upsert documents not already present in the vector store."""
 
-    def _detect_faiss(self) -> None:
-        """Detect FAISS availability without requiring it at runtime."""
+        assert self._embedding is not None and self._vector_store is not None
+        already_stored = self._vector_store.existing_ids(doc.id for doc in documents)
+        to_embed = [doc for doc in documents if doc.id not in already_stored]
+        if not to_embed:
+            return
+        vectors = self._embedding.embed_documents([doc.content for doc in to_embed])
+        if len(vectors) != len(to_embed):
+            raise RuntimeError(
+                f"Embedding model returned {len(vectors)} vectors for {len(to_embed)} documents"
+            )
+        records = [
+            VectorRecord(
+                document_id=doc.id,
+                embedding=list(vector),
+                document_text=doc.content,
+                metadata={**doc.metadata, "source": doc.source, "doc_id": doc.id},
+            )
+            for doc, vector in zip(to_embed, vectors)
+        ]
+        self._vector_store.upsert(records)
 
-        try:
-            import faiss  # type: ignore # noqa: F401
-            import numpy  # type: ignore # noqa: F401
+    def delete_documents(self, ids: Iterable[str]) -> int:
+        """Remove documents from every index. Returns the number removed."""
 
-            logger.info("FAISS backend detected and will be used when possible")
-        except Exception as exc:  # noqa: BLE001
-            self._faiss_import_error = exc
-            logger.info("FAISS backend unavailable; using pure Python retriever")
+        with self._lock.write():
+            id_set = {doc_id for doc_id in ids if doc_id in self._doc_index}
+            if not id_set:
+                return 0
+            for doc_id in id_set:
+                self._bm25.remove(doc_id)
+                del self._doc_index[doc_id]
+            self._documents = [doc for doc in self._documents if doc.id not in id_set]
+            if self._vector_store is not None:
+                self._vector_store.delete(list(id_set))
+        logger.info("Retriever deleted %d documents (total=%d)", len(id_set), len(self._documents))
+        return len(id_set)
 
-    def _reindex(
+    # ------------------------------------------------------------------ retrieval
+    def retrieve(
         self,
-        new_documents: Optional[List[Document]] = None,
-        start_index: int = 0,
-    ) -> None:
-        """Recompute sparse vectors and incrementally index new dense vectors."""
+        query: str,
+        top_k: Optional[int] = None,
+        filters: Optional[MetadataFilter] = None,
+        mode: Optional[str] = None,
+    ) -> List[Document]:
+        """Return the top-k chunks for ``query`` (optionally filtered by metadata)."""
 
-        self._doc_tokens = [self._tokenize(doc.content) for doc in self._documents]
-        self._document_frequency = Counter()
-
-        for tokens in self._doc_tokens:
-            for token in set(tokens):
-                self._document_frequency[token] += 1
-
-        self._doc_tfidf = []
-        for tokens in self._doc_tokens:
-            tf = Counter(tokens)
-            self._doc_tfidf.append(self._counter_to_tfidf(tf, len(tokens)))
-
-        docs_to_embed = new_documents if new_documents is not None else self._documents
-        offset = start_index if new_documents is not None else 0
-
-        if self._embedding is not None and self._vector_store is not None and docs_to_embed:
-            try:
-                texts = [document.content for document in docs_to_embed]
-                vectors = self._embedding.embed_documents(texts)
-                records: List[VectorRecord] = []
-
-                limit = min(len(docs_to_embed), len(vectors))
-                for index in range(limit):
-                    document = docs_to_embed[index]
-                    vector = vectors[index]
-                    vector_id = self._build_vector_id(document=document, index=offset + index)
-                    records.append(
-                        VectorRecord(
-                            document_id=vector_id,
-                            embedding=vector,
-                            document_text=document.content,
-                            metadata={
-                                **document.metadata,
-                                "source": document.source,
-                                "doc_id": document.id,
-                            },
-                        )
-                    )
-                    self._vector_document_lookup[vector_id] = document
-
-                self._vector_store.upsert(records)
-                logger.info(
-                    "Retriever indexed %d embedding vectors in %s (dim=%d)",
-                    len(records),
-                    type(self._vector_store).__name__,
-                    self._embedding.dimension,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Embedding indexing failed; using sparse fallback only: %s", exc)
-
-        self._build_faiss_index()
-
-    def _build_faiss_index(self) -> None:
-        """Build FAISS index if optional dependencies are available."""
-
-        if self._embedding is not None:
-            self._faiss_ready = False
-            self._faiss_index = None
-            return
-
-        try:
-            import faiss  # type: ignore
-            import numpy as np  # type: ignore
-        except Exception:
-            self._faiss_ready = False
-            self._faiss_index = None
-            return
-
-        if not self._documents:
-            self._faiss_ready = False
-            self._faiss_index = None
-            return
-
-        vocabulary = sorted(self._document_frequency.keys())
-        if not vocabulary:
-            self._faiss_ready = False
-            self._faiss_index = None
-            return
-
-        dim = len(vocabulary)
-        matrix = np.zeros((len(self._documents), dim), dtype="float32")
-        for row_index, doc_vector in enumerate(self._doc_tfidf):
-            for term_index, term in enumerate(vocabulary):
-                matrix[row_index, term_index] = float(doc_vector.get(term, 0.0))
-
-        faiss.normalize_L2(matrix)
-        index = faiss.IndexFlatIP(dim)
-        index.add(matrix)
-
-        self._faiss_index = index
-        self._faiss_vocabulary = vocabulary
-        self._faiss_ready = True
-        logger.debug("FAISS index built with %d docs and dim=%d", len(self._documents), dim)
-
-    def _retrieve_with_faiss(self, query: str) -> List[Document]:
-        """Retrieve documents using FAISS inner-product search."""
-
-        if not self._faiss_ready or self._faiss_index is None:
+        if not isinstance(query, str) or not query.strip():
             return []
+        k = top_k or self.top_k
+        active_mode = (mode or self.mode).strip().lower()
+        if active_mode not in RETRIEVAL_MODES:
+            raise ValueError(f"Unknown retrieval mode '{mode}'")
+        if active_mode != "sparse" and self._vector_store is None:
+            active_mode = "sparse"
+        candidate_k = max(self.fetch_k or 0, k * 4 if (self.mmr_lambda is not None or active_mode == "hybrid") else k)
 
-        try:
-            import faiss  # type: ignore
-            import numpy as np  # type: ignore
-        except Exception:
-            return []
+        query_vector = self._embedding.embed_query(query) if active_mode in {"dense", "hybrid"} else None
+        with self._lock.read():
+            dense = self._dense_search(query_vector, candidate_k, filters) if query_vector is not None else []
+            sparse = self._sparse_search(query, candidate_k, filters) if active_mode in {"sparse", "hybrid"} else []
 
-        query_tokens = self._tokenize(query)
-        tf = Counter(query_tokens)
-        query_vector = self._counter_to_tfidf(tf, len(query_tokens))
-        dense = np.zeros((1, len(self._faiss_vocabulary)), dtype="float32")
-        for term_index, term in enumerate(self._faiss_vocabulary):
-            dense[0, term_index] = float(query_vector.get(term, 0.0))
+            if active_mode == "hybrid" and self.fusion == "rrf":
+                candidates = reciprocal_rank_fusion([dense, sparse], k=self.rrf_k, list_names=["dense", "bm25"])
+            elif active_mode == "hybrid":
+                candidates = self._relative_score_fusion(query, query_vector, dense, sparse)
+            else:
+                candidates = dense or sparse
 
-        faiss.normalize_L2(dense)
-        distances, indices = self._faiss_index.search(dense, min(self.top_k, len(self._documents)))
+            if self.mmr_lambda is not None and len(candidates) > k:
+                candidates = self._mmr(query, candidates, k)
 
-        ranked: List[Tuple[float, int]] = []
-        for rank_idx, doc_idx in enumerate(indices[0].tolist()):
-            if doc_idx < 0:
-                continue
-            ranked.append((float(distances[0][rank_idx]), int(doc_idx)))
+            results = candidates[:k]
+            if self.neighbor_window > 0:
+                results = [self._expand_neighbors(doc) for doc in results]
+        logger.debug("Retriever mode=%s returned %d docs", active_mode, len(results))
+        return [
+            replace(doc, metadata={**doc.metadata, "retriever": active_mode}, source=doc.source or "vector")
+            for doc in results
+        ]
 
-        return self._to_scored_documents(ranked)
+    def _dense_search(self, query_vector: List[float], limit: int, filters: Optional[MetadataFilter]) -> List[Document]:
+        """Vector search; reconstructs documents from the store when not indexed locally."""
 
-    def _retrieve_with_sparse_cosine(self, query: str) -> List[Document]:
-        """Retrieve documents using sparse cosine similarity."""
-
-        query_tokens = self._tokenize(query)
-        query_tf = Counter(query_tokens)
-        query_vector = self._counter_to_tfidf(query_tf, len(query_tokens))
-
-        scored: List[Tuple[float, int]] = []
-        for idx, doc_vector in enumerate(self._doc_tfidf):
-            score = self._cosine_similarity(query_vector, doc_vector)
-            scored.append((score, idx))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        top = scored[: min(self.top_k, len(scored))]
-        return self._to_scored_documents(top)
-
-    def _retrieve_with_embedding(self, query: str) -> List[Document]:
-        """Retrieve documents using dense embedding similarity."""
-
-        if self._embedding is None or self._vector_store is None:
-            return []
-
-        try:
-            query_vector = self._embedding.embed_query(query)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Embedding query failed; using sparse fallback: %s", exc)
-            return []
-
-        limit = min(self.top_k, len(self._vector_document_lookup)) if self._vector_document_lookup else self.top_k
-        hits = self._vector_store.query(
-            query_embedding=query_vector,
-            top_k=max(1, limit),
-        )
+        assert self._vector_store is not None
+        hits = self._vector_store.query(query_embedding=query_vector, top_k=limit, filters=filters)
         documents: List[Document] = []
         for hit in hits:
-            base_document = self._vector_document_lookup.get(hit.document_id)
-            if base_document is not None:
-                logger.debug("Embedding score doc_id=%s score=%.4f", base_document.id, hit.score)
-                documents.append(
-                    replace(
-                        base_document,
-                        score=float(hit.score),
-                        source=base_document.source or "vector",
-                        metadata={
-                            **base_document.metadata,
-                            "retriever": "vector_store",
-                            "vector_db": type(self._vector_store).__name__,
-                        },
-                    )
-                )
-            elif hit.document_text:
+            base = self._doc_index.get(hit.document_id)
+            if base is None:
+                if not hit.document_text:
+                    continue
                 meta = dict(hit.metadata or {})
-                doc_id = str(meta.pop("doc_id", hit.document_id))
-                source = str(meta.pop("source", "vector"))
-                documents.append(
-                    Document(
-                        id=doc_id,
-                        content=hit.document_text,
-                        score=float(hit.score),
-                        source=source,
-                        metadata={
-                            **meta,
-                            "retriever": "vector_store",
-                            "vector_db": type(self._vector_store).__name__,
-                        },
-                    )
+                base = Document(
+                    id=str(meta.pop("doc_id", hit.document_id)),
+                    content=hit.document_text,
+                    source=str(meta.pop("source", "vector")),
+                    metadata=meta,
                 )
+            documents.append(
+                replace(base, score=float(hit.score), metadata={**base.metadata, "dense_score": float(hit.score)})
+            )
         return documents
 
-    def _to_scored_documents(self, scored_indices: Sequence[Tuple[float, int]]) -> List[Document]:
-        """Convert score/index pairs into copied scored Documents."""
+    def _sparse_search(self, query: str, limit: int, filters: Optional[MetadataFilter]) -> List[Document]:
+        """BM25 search honoring metadata filters."""
 
-        docs: List[Document] = []
-        for score, doc_idx in scored_indices:
-            base = self._documents[doc_idx]
-            docs.append(
+        allow = None
+        if filters:
+            allow = lambda doc_id: matches_filter(  # noqa: E731
+                {**self._doc_index[doc_id].metadata, "source": self._doc_index[doc_id].source}, filters
+            )
+        documents: List[Document] = []
+        for doc_id, score in self._bm25.search(query, top_k=limit, allow=allow):
+            base = self._doc_index[doc_id]
+            documents.append(replace(base, score=float(score), metadata={**base.metadata, "bm25_score": float(score)}))
+        return documents
+
+    def _relative_score_fusion(
+        self,
+        query: str,
+        query_vector: Optional[List[float]],
+        dense: List[Document],
+        sparse: List[Document],
+    ) -> List[Document]:
+        """Score the union of candidates on both signals, min-max normalize, and blend.
+
+        Unlike rank fusion, a document that is decisive in one signal (e.g. the only chunk
+        containing an exact ID) is not out-voted by documents that are mediocre in both.
+        """
+
+        union: Dict[str, Document] = {}
+        dense_scores: Dict[str, float] = {}
+        bm25_scores: Dict[str, float] = {}
+        for doc in dense:
+            union.setdefault(doc.id, doc)
+            dense_scores[doc.id] = doc.score
+        for doc in sparse:
+            union.setdefault(doc.id, doc)
+            bm25_scores[doc.id] = doc.score
+        if not union:
+            return []
+
+        missing_bm25 = [doc_id for doc_id in union if doc_id not in bm25_scores]
+        if missing_bm25:
+            bm25_scores.update(self._bm25.score(query, missing_bm25))
+        missing_dense = [doc_id for doc_id in union if doc_id not in dense_scores]
+        if missing_dense and query_vector is not None and self._vector_store is not None:
+            stored = self._vector_store.get_embeddings(missing_dense)
+            for doc_id in missing_dense:
+                if doc_id in stored:
+                    dense_scores[doc_id] = _cosine(query_vector, stored[doc_id])
+
+        dense_norm = _min_max(dense_scores)
+        bm25_norm = _min_max(bm25_scores)
+        alpha = self.hybrid_alpha
+        fused = []
+        for doc_id, doc in union.items():
+            score = alpha * dense_norm.get(doc_id, 0.0) + (1 - alpha) * bm25_norm.get(doc_id, 0.0)
+            fused.append(
                 replace(
-                    base,
-                    score=float(score),
-                    source=base.source or "vector",
-                    metadata={**base.metadata, "retriever": "in_memory"},
+                    doc,
+                    score=round(score, 6),
+                    metadata={
+                        **doc.metadata,
+                        "fusion": "relative",
+                        "dense_score": round(dense_scores.get(doc_id, 0.0), 6),
+                        "bm25_score": round(bm25_scores.get(doc_id, 0.0), 6),
+                    },
                 )
             )
-        return docs
+        fused.sort(key=lambda doc: doc.score, reverse=True)
+        return fused
 
-    def _counter_to_tfidf(self, term_counter: Counter[str], token_count: int) -> Dict[str, float]:
-        """Convert term counts to tf-idf sparse weights."""
+    def _mmr(self, query: str, candidates: List[Document], k: int) -> List[Document]:
+        """Maximal Marginal Relevance: trade relevance for diversity among candidates."""
 
-        if token_count <= 0:
-            return {}
-        vector: Dict[str, float] = {}
-        doc_total = max(len(self._documents), 1)
-        for term, count in term_counter.items():
-            tf = count / token_count
-            idf = math.log((1 + doc_total) / (1 + self._document_frequency.get(term, 0))) + 1.0
-            vector[term] = tf * idf
-        return vector
+        if self._embedding is None or self._vector_store is None:
+            return candidates
+        vectors = self._vector_store.get_embeddings([doc.id for doc in candidates])
+        if len(vectors) < len(candidates):
+            missing = [doc for doc in candidates if doc.id not in vectors]
+            for doc, vector in zip(missing, self._embedding.embed_documents([doc.content for doc in missing])):
+                vectors[doc.id] = vector
+        query_vector = self._embedding.embed_query(query)
+        lam = float(self.mmr_lambda if self.mmr_lambda is not None else 0.5)
 
-    def _cosine_similarity(self, a: Dict[str, float], b: Dict[str, float]) -> float:
-        """Compute cosine similarity for sparse vectors."""
+        selected: List[Document] = []
+        remaining = list(candidates)
+        relevance = {doc.id: _cosine(query_vector, vectors[doc.id]) for doc in remaining}
+        while remaining and len(selected) < k:
+            best_doc = max(
+                remaining,
+                key=lambda doc: lam * relevance[doc.id]
+                - (1 - lam) * max((_cosine(vectors[doc.id], vectors[s.id]) for s in selected), default=0.0),
+            )
+            selected.append(best_doc)
+            remaining.remove(best_doc)
+        return selected
 
-        if not a or not b:
-            return 0.0
-        shared_terms = set(a.keys()) & set(b.keys())
-        dot = sum(a[t] * b[t] for t in shared_terms)
-        norm_a = math.sqrt(sum(v * v for v in a.values()))
-        norm_b = math.sqrt(sum(v * v for v in b.values()))
-        if norm_a == 0.0 or norm_b == 0.0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+    def _expand_neighbors(self, doc: Document) -> Document:
+        """Small-to-big: widen a hit with its neighbouring chunks from the same parent."""
 
-    def _build_vector_id(self, document: Document, index: int) -> str:
-        """Build a unique vector record id for a document entry."""
+        parts = [doc.content]
+        current = doc
+        for _ in range(self.neighbor_window):
+            prev_id = current.metadata.get("prev_id")
+            prev_doc = self._doc_index.get(prev_id) if prev_id else None
+            if prev_doc is None:
+                break
+            parts.insert(0, prev_doc.content)
+            current = prev_doc
+        current = doc
+        for _ in range(self.neighbor_window):
+            next_id = current.metadata.get("next_id")
+            next_doc = self._doc_index.get(next_id) if next_id else None
+            if next_doc is None:
+                break
+            parts.append(next_doc.content)
+            current = next_doc
+        if len(parts) == 1:
+            return doc
+        return replace(doc, content="\n".join(parts), metadata={**doc.metadata, "neighbor_expanded": True})
 
-        return f"{document.id}__{index}"
 
-    def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text into lowercase alphanumeric terms."""
+def _min_max(scores: Dict[str, float]) -> Dict[str, float]:
+    """Min-max normalize to [0, 1]; a constant column carries no signal and maps to 0."""
 
-        return re.findall(r"[a-zA-Z0-9]+", text.lower())
+    if not scores:
+        return {}
+    low, high = min(scores.values()), max(scores.values())
+    if high - low <= 1e-12:
+        return {key: (1.0 if high > 0 and len(scores) == 1 else 0.0) for key in scores}
+    return {key: (value - low) / (high - low) for key, value in scores.items()}
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    """Cosine similarity for dense vectors."""
+
+    length = min(len(left), len(right))
+    if length == 0:
+        return 0.0
+    dot = sum(left[i] * right[i] for i in range(length))
+    left_norm = math.sqrt(sum(left[i] * left[i] for i in range(length)))
+    right_norm = math.sqrt(sum(right[i] * right[i] for i in range(length)))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return dot / (left_norm * right_norm)

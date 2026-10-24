@@ -45,7 +45,7 @@ class DuckDuckGoProvider(BaseSearchProvider):
             return []
 
         top_k = max(1, int(num_results))
-        logger.info("Running DuckDuckGo search for query=%s", query)
+        logger.debug("Running DuckDuckGo search")
 
         documents = self._search_langchain_structured(query=query, num_results=top_k)
         if documents:
@@ -227,7 +227,7 @@ class DuckDuckGoProvider(BaseSearchProvider):
             logger.error(message)
             raise ProviderError(message) from exc
 
-        logger.info("DuckDuckGo provider using ddgs fallback for query=%s", query)
+        logger.debug("DuckDuckGo provider using ddgs fallback")
         documents: List[Document] = []
 
         try:

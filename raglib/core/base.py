@@ -1,9 +1,24 @@
-"""Base orchestration class for all RAG pipeline variants."""
+"""Shared RAG pipeline that every strategy builds on.
+
+Pipeline (each step is an overridable method):
+
+    start (load session history, condense follow-up into a standalone query)
+      -> answer(ctx):
+           retrieve(ctx)            # strategies mostly override this
+           post_retrieve hook
+           process_documents(ctx)   # rerank -> dedupe -> context reduce
+           pre_generate hook
+           generate(ctx, docs)      # grounded, cited generation
+           post_generate hook
+      -> finish (store memory turn, attach trace events + usage)
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from raglib.components.context_reducer import ContextReducer
 from raglib.components.decision import (
@@ -16,27 +31,48 @@ from raglib.components.decision import (
 from raglib.components.deduplicator import Deduplicator
 from raglib.components.evaluator import Evaluator
 from raglib.components.generator import Generator
+from raglib.components.grader import RelevanceGrader
 from raglib.components.hybrid_retriever import HybridRetriever
-from raglib.components.memory import MemoryModule
+from raglib.components.memory import ConversationStore, MemoryModule
 from raglib.components.multi_hop_retriever import MultiHopRetriever
 from raglib.components.multi_query_retriever import MultiQueryRetriever
 from raglib.components.planner import Planner
 from raglib.components.query_expander import QueryExpander
-from raglib.components.query_rewriter import QueryRewriter
+from raglib.components.query_rewriter import QueryCondenser, QueryRewriter
 from raglib.components.refiner import Refiner
 from raglib.components.reflection import ReflectionModule
 from raglib.components.reranker import Reranker
 from raglib.components.retriever import Retriever
 from raglib.components.router_retriever import RouterRetriever
 from raglib.components.web_retriever import WebRetriever
+from raglib.core.intents import is_greeting
+from raglib.core.tracing import Tracer
 from raglib.llm.base_client import BaseLLMClient
-from raglib.schemas import Document, GenerationResult
+from raglib.schemas import Document, GenerationResult, TraceEvent
+from raglib.vectorstores.base_store import MetadataFilter
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class PipelineContext:
+    """Mutable state for one pipeline run."""
+
+    query: str
+    search_query: str
+    session_id: Optional[str]
+    filters: Optional[MetadataFilter]
+    tracer: Tracer
+    history: str = ""
+    trace: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class BaseRAG:
-    """Defines shared orchestration behavior for RAG strategies."""
+    """Defines the shared orchestration behaviour for all RAG strategies."""
+
+    pipeline_name = "base"
+    uses_decision_engine = True
 
     def __init__(
         self,
@@ -60,6 +96,13 @@ class BaseRAG:
         generator: Optional[Generator] = None,
         llm_client: Optional[BaseLLMClient] = None,
         max_retries: int = 2,
+        conversation_store: Optional[ConversationStore] = None,
+        condenser: Optional[QueryCondenser] = None,
+        grader: Optional[RelevanceGrader] = None,
+        graph_retriever: Optional[Any] = None,
+        use_memory: bool = False,
+        skip_retrieval_for_smalltalk: bool = True,
+        on_event: Optional[Callable[[TraceEvent], None]] = None,
     ):
         """Initialize optional pipeline components via dependency injection."""
 
@@ -83,93 +126,152 @@ class BaseRAG:
         self.generator = generator
         self.llm_client = llm_client
         self.max_retries = max_retries
+        self.conversation_store = conversation_store
+        self.condenser = condenser
+        self.grader = grader
+        self.graph_retriever = graph_retriever
+        self.use_memory = use_memory
+        self.skip_retrieval_for_smalltalk = skip_retrieval_for_smalltalk
+        self.on_event = on_event
 
-    def run(self, query: str) -> GenerationResult:
-        """Execute the default pipeline: decision, retrieve, rerank, evaluate, refine, generate."""
+    # ================================================================== entry points
+    def run(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        filters: Optional[MetadataFilter] = None,
+    ) -> GenerationResult:
+        """Execute the pipeline for one query and return the answer with sources."""
 
-        reasoning_trace: List[str] = []
-        working_query = self.pre_retrieve(query)
+        ctx = self._start(query, session_id, filters)
+        result = self.answer(ctx)
+        return self._finish(ctx, result)
 
-        if self.query_rewriter is not None:
-            rewritten = self.query_rewriter.rewrite(working_query)
-            if rewritten != working_query:
-                reasoning_trace.append(f"query_rewritten:{rewritten}")
-                working_query = rewritten
+    async def arun(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        filters: Optional[MetadataFilter] = None,
+    ) -> GenerationResult:
+        """Async variant of ``run`` (executes the pipeline in a worker thread)."""
 
-        should_retrieve = True
-        retrieval_mode = RETRIEVAL_VECTOR
-        if self.decision_engine is not None:
-            retrieval_mode = self.decision_engine.retrieval_type(working_query)
-            should_retrieve = retrieval_mode != RETRIEVAL_NONE
-            reasoning_trace.append(f"decision:{retrieval_mode}")
+        return await asyncio.to_thread(self.run, query, session_id, filters)
 
-        documents: List[Document] = []
-        if should_retrieve and retrieval_mode != RETRIEVAL_NONE:
-            documents = self._retrieve_by_mode(working_query, retrieval_mode)
-            documents = self.post_retrieve(working_query, documents)
-        else:
-            reasoning_trace.append("retrieval_skipped")
+    def stream(
+        self,
+        query: str,
+        session_id: Optional[str] = None,
+        filters: Optional[MetadataFilter] = None,
+    ) -> Iterator[str]:
+        """Yield answer tokens; the generator's return value is the final GenerationResult.
 
-        if self.reranker is not None and documents:
-            documents = self.reranker.rerank(working_query, documents)
-            reasoning_trace.append("reranked")
+        Strategies that loop over generation (e.g. Self-RAG) yield the final answer once.
+        """
+
+        if type(self).answer is not BaseRAG.answer or self.generator is None:
+            result = self.run(query, session_id=session_id, filters=filters)
+            yield result.answer
+            return result
+
+        ctx = self._start(query, session_id, filters)
+        documents = self._prepare_documents(ctx)
+        with ctx.tracer.stage("generate", streaming=True) as meta:
+            context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
+            parts: List[str] = []
+            for token in tokens:
+                parts.append(token)
+                yield token
+            meta["docs"] = len(context_docs)
+        result = self.generator.finalize("".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"])
+        result = self.post_generate(result)
+        return self._finish(ctx, result)
+
+    # ================================================================== pipeline steps
+    def answer(self, ctx: PipelineContext) -> GenerationResult:
+        """Default pipeline: retrieve -> process -> generate."""
+
+        documents = self._prepare_documents(ctx)
+        result = self.generate(ctx, documents)
+        return self.post_generate(result)
+
+    def _prepare_documents(self, ctx: PipelineContext) -> List[Document]:
+        """Run retrieval and document post-processing with hooks."""
+
+        if ctx.metadata.get("smalltalk"):
+            ctx.trace.append("retrieval_skipped:smalltalk")
+            return []
+        with ctx.tracer.stage("retrieve") as meta:
+            documents = self.retrieve(ctx)
+            meta["docs"] = len(documents)
+        documents = self.post_retrieve(ctx.search_query, documents)
+        with ctx.tracer.stage("process_documents") as meta:
+            documents = self.process_documents(ctx, documents)
+            meta["docs"] = len(documents)
+        return self.pre_generate(ctx.search_query, documents)
+
+    def retrieve(self, ctx: PipelineContext) -> List[Document]:
+        """Default retrieval: optional decision engine routing + corrective refine loop."""
+
+        mode = RETRIEVAL_VECTOR
+        if self.uses_decision_engine and self.decision_engine is not None:
+            mode = self.decision_engine.retrieval_type(ctx.search_query)
+            ctx.trace.append(f"decision:{mode}")
+            if mode == RETRIEVAL_NONE:
+                ctx.trace.append("retrieval_skipped")
+                return []
+
+        documents = self._retrieve_by_mode(ctx, ctx.search_query, mode)
+        if self.evaluator is None:
+            return documents
 
         retries = 0
-        while self.evaluator is not None:
-            filtered = self.evaluator.evaluate(working_query, documents)
+        query = ctx.search_query
+        while True:
+            filtered = self.evaluator.evaluate(query, documents)
             if filtered:
-                documents = filtered
-                reasoning_trace.append("evaluation_passed")
-                break
-            reasoning_trace.append("evaluation_failed")
+                ctx.trace.append("evaluation_passed")
+                return filtered
+            ctx.trace.append("evaluation_failed")
             if self.refiner is None or retries >= self.max_retries:
-                documents = filtered
-                break
-            refined = self.refiner.refine(working_query, documents)
-            if not refined or refined == working_query:
-                break
+                return documents
+            refined = self.refiner.refine(query, documents)
+            if not refined or refined == query:
+                return documents
             retries += 1
-            working_query = refined
-            reasoning_trace.append(f"retry_{retries}:{working_query}")
-            documents = self._retrieve_by_mode(working_query, retrieval_mode)
-            if self.reranker is not None and documents:
-                documents = self.reranker.rerank(working_query, documents)
+            query = refined
+            ctx.trace.append(f"retry_{retries}:{query}")
+            documents = self._retrieve_by_mode(ctx, query, mode)
 
+    def process_documents(self, ctx: PipelineContext, documents: List[Document]) -> List[Document]:
+        """Rerank, deduplicate and reduce documents."""
+
+        if self.reranker is not None and documents:
+            documents = self.reranker.rerank(ctx.search_query, documents)
+            ctx.trace.append("reranked")
         if self.deduplicator is not None and documents:
             documents = self.deduplicator.deduplicate(documents)
-            reasoning_trace.append("deduplicated")
-
         if self.context_reducer is not None and documents:
             documents = self.context_reducer.reduce(documents)
-            reasoning_trace.append("context_reduced")
+        return documents
 
-        documents = self.pre_generate(working_query, documents)
-        memory_context = self.memory_module.get_context() if self.memory_module is not None else ""
+    def generate(self, ctx: PipelineContext, documents: List[Document]) -> GenerationResult:
+        """Generate the final answer for the original question."""
 
-        if self.generator is not None:
+        if self.generator is None:
+            if self.llm_client is None:
+                raise ValueError("Either generator or llm_client must be provided")
+            self.generator = Generator(llm_client=self.llm_client)
+        with ctx.tracer.stage("generate") as meta:
             result = self.generator.generate(
-                query=working_query,
+                query=ctx.query,
                 documents=documents,
-                memory_context=memory_context,
-                reasoning_trace=reasoning_trace,
+                memory_context=ctx.history,
+                reasoning_trace=ctx.trace,
             )
-        elif self.llm_client is not None:
-            answer = self.llm_client.complete(
-                prompt=f"Query: {working_query}\nContext: {memory_context}",
-                system="Provide a concise grounded answer.",
-            )
-            result = GenerationResult(answer=answer, sources=documents, reasoning_trace=reasoning_trace)
-        else:
-            raise ValueError("Either generator or llm_client must be provided")
-
-        result = self.post_generate(result)
-
-        if self.memory_module is not None:
-            self.memory_module.add(query=query, answer=result.answer, documents=result.sources)
-
-        logger.info("BaseRAG run completed for query=%s", query)
+            meta.update(result.usage)
         return result
 
+    # ================================================================== hooks
     def pre_retrieve(self, query: str) -> str:
         """Hook executed before retrieval starts."""
 
@@ -190,22 +292,89 @@ class BaseRAG:
 
         return result
 
-    def _retrieve_by_mode(self, query: str, mode: str) -> List[Document]:
+    # ================================================================== helpers
+    def candidate_k(self) -> Optional[int]:
+        """How many candidates to retrieve: more when a real reranker will cut them down."""
+
+        if self.reranker is not None and self.reranker.backend != "none":
+            return max(self.reranker.top_k * 4, 20)
+        return None
+
+    def retrieve_corpus(self, ctx: PipelineContext, query: str, top_k: Optional[int] = None) -> List[Document]:
+        """Retrieve from the corpus honoring filters and candidate_k."""
+
+        if self.retriever is None:
+            return []
+        return self.retriever.retrieve(query, top_k=top_k or self.candidate_k(), filters=ctx.filters)
+
+    def _retrieve_by_mode(self, ctx: PipelineContext, query: str, mode: str) -> List[Document]:
         """Dispatch retrieval to the selected mode with graceful fallbacks."""
 
         if mode == RETRIEVAL_WEB and self.web_retriever is not None:
             return self.web_retriever.retrieve(query)
         if mode == RETRIEVAL_HYBRID and self.hybrid_retriever is not None:
             return self.hybrid_retriever.retrieve(query)
-        if mode == RETRIEVAL_VECTOR and self.retriever is not None:
-            return self.retriever.retrieve(query)
-
         if self.retriever is not None:
-            logger.warning("Falling back to vector retriever for mode=%s", mode)
-            return self.retriever.retrieve(query)
+            return self.retrieve_corpus(ctx, query)
         if self.web_retriever is not None:
-            logger.warning("Falling back to web retriever for mode=%s", mode)
             return self.web_retriever.retrieve(query)
-
         logger.warning("No retriever available for mode=%s", mode)
         return []
+
+    def memory_for(self, session_id: Optional[str]) -> Optional[MemoryModule]:
+        """Return the memory for a session (conversation store first, legacy module second)."""
+
+        if self.conversation_store is not None:
+            return self.conversation_store.get(session_id)
+        return self.memory_module
+
+    def _start(self, query: str, session_id: Optional[str], filters: Optional[MetadataFilter]) -> PipelineContext:
+        """Validate input, load history, and build the retrieval query."""
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        query = query.strip()
+        tracer = Tracer(on_event=self.on_event)
+        ctx = PipelineContext(query=query, search_query=query, session_id=session_id, filters=filters, tracer=tracer)
+
+        if self.use_memory:
+            memory = self.memory_for(session_id)
+            if memory is not None:
+                ctx.history = memory.get_context()
+            if ctx.history and self.condenser is not None:
+                with tracer.stage("condense") as meta:
+                    ctx.search_query = self.condenser.condense(query, ctx.history)
+                    meta["standalone_query"] = ctx.search_query
+                if ctx.search_query != query:
+                    ctx.trace.append(f"condensed:{ctx.search_query[:80]}")
+
+        if self.query_rewriter is not None:
+            with tracer.stage("rewrite") as meta:
+                rewritten = self.query_rewriter.rewrite(ctx.search_query)
+                meta["rewritten_query"] = rewritten
+            if rewritten and rewritten != ctx.search_query:
+                ctx.trace.append(f"query_rewritten:{rewritten[:80]}")
+                ctx.search_query = rewritten
+
+        ctx.search_query = self.pre_retrieve(ctx.search_query)
+        if self.skip_retrieval_for_smalltalk and is_greeting(query) and not ctx.history:
+            ctx.metadata["smalltalk"] = True
+        return ctx
+
+    def _finish(self, ctx: PipelineContext, result: GenerationResult) -> GenerationResult:
+        """Persist memory and attach diagnostics."""
+
+        if self.use_memory:
+            memory = self.memory_for(ctx.session_id)
+            if memory is not None:
+                memory.add(query=ctx.query, answer=result.answer, documents=result.sources)
+        result.trace_events = list(ctx.tracer.events)
+        result.usage = {**result.usage, "latency_ms": ctx.tracer.total_latency_ms()}
+        result.metadata = {
+            **result.metadata,
+            "pipeline": self.pipeline_name,
+            "search_query": ctx.search_query,
+            "session_id": ctx.session_id,
+        }
+        logger.info("%s run completed (docs=%d, %.0fms)", self.pipeline_name, len(result.sources), result.usage["latency_ms"])
+        return result

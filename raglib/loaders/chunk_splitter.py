@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from typing import List, Optional, Sequence
@@ -80,28 +81,40 @@ class ChunkSplitter:
         return self._strategy
 
     def split(self, documents: List[Document]) -> List[Document]:
-        """Split input documents into overlapping chunks with preserved metadata."""
+        """Split documents into chunks with preserved metadata and prev/next links.
+
+        Chunk ids are ``{parent_id}_chunk_{n}_{content_hash}``: stable for unchanged text
+        (idempotent re-ingestion) and different when the text changes (safe upserts).
+        """
 
         chunks: List[Document] = []
         for document in documents:
             split_texts = self._split_document(document)
+            doc_chunks: List[Document] = []
             for index, chunk_text in enumerate(split_texts, start=1):
-                chunk_tokens = self._count_tokens(chunk_text)
-                chunks.append(
+                digest = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
+                doc_chunks.append(
                     Document(
-                        id=f"{document.id}_chunk_{index}",
+                        id=f"{document.id}_chunk_{index}_{digest}",
                         content=chunk_text,
                         metadata={
                             **document.metadata,
                             "parent_id": document.id,
                             "chunk_index": index,
-                            "chunk_tokens": chunk_tokens,
+                            "chunk_count": len(split_texts),
+                            "chunk_tokens": self._count_tokens(chunk_text),
                             "chunking_strategy": self._strategy,
                         },
                         score=document.score,
                         source=document.source,
                     )
                 )
+            for position, chunk in enumerate(doc_chunks):
+                if position > 0:
+                    chunk.metadata["prev_id"] = doc_chunks[position - 1].id
+                if position + 1 < len(doc_chunks):
+                    chunk.metadata["next_id"] = doc_chunks[position + 1].id
+            chunks.extend(doc_chunks)
 
         logger.info(
             "ChunkSplitter strategy=%s created %d chunks from %d documents",

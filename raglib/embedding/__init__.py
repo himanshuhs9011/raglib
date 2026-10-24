@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from raglib.embedding.base_embedding import BaseEmbedding
+from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.embedding.embedding_factory import EmbeddingFactory
 from raglib.embedding.google_embedding import GoogleEmbedding
 from raglib.embedding.huggingface_embedding import HuggingFaceEmbedding
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BaseEmbedding",
+    "CachedEmbedding",
     "EmbeddingFactory",
     "MockEmbedding",
     "HuggingFaceEmbedding",

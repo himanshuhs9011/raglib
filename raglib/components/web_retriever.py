@@ -6,41 +6,12 @@ import logging
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
-from raglib.providers import (
-    BingProvider,
-    BraveProvider,
-    DuckDuckGoProvider,
-    ExaProvider,
-    GoogleCSEProvider,
-    SearxNGProvider,
-    SerpAPIProvider,
-    TavilyProvider,
-)
-from raglib.providers.base_provider import (
-    BaseSearchProvider,
-    ProviderError,
-    ProviderNotConfiguredError,
-)
+from raglib.providers.base_provider import BaseSearchProvider, ProviderError
+from raglib.providers.duckduckgo_provider import DuckDuckGoProvider
+from raglib.providers.factory import build_search_provider
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
-
-
-WEB_PROVIDER_ALIASES: Dict[str, str] = {
-    "ddg": "duckduckgo",
-    "duckduckgo_search": "duckduckgo",
-    "google": "google_cse",
-}
-
-WEB_PROVIDERS_REQUIRING_API_KEY = {
-    "tavily",
-    "serpapi",
-    "brave",
-    "bing",
-    "google_cse",
-    "exa",
-    "searxng",
-}
 
 
 class WebRetriever:
@@ -53,7 +24,7 @@ class WebRetriever:
         provider_api_key: Optional[str] = None,
         provider_kwargs: Optional[Dict[str, Any]] = None,
         fallback_provider: Optional[BaseSearchProvider] = None,
-        enable_duckduckgo_fallback: bool = True,
+        enable_duckduckgo_fallback: bool = False,
         top_k: int = 5,
         fail_silently: bool = True,
     ):
@@ -167,97 +138,14 @@ class WebRetriever:
         provider_api_key: Optional[str],
         provider_kwargs: Optional[Dict[str, Any]],
     ) -> BaseSearchProvider:
-        """Build provider instance from name and config for plug-and-play setup."""
+        """Build a provider instance from name and config (no env lookup: explicit config only)."""
 
-        kwargs = dict(provider_kwargs or {})
-        normalized_name = self._normalize_provider_name(provider_name)
-
-        if normalized_name in WEB_PROVIDERS_REQUIRING_API_KEY and not provider_api_key:
-            raise ProviderNotConfiguredError(
-                f"web provider '{normalized_name}' requires a valid API key"
-            )
-
-        if normalized_name == "duckduckgo":
-            return DuckDuckGoProvider(
-                region=str(kwargs.pop("region", "wt-wt")),
-                safesearch=str(kwargs.pop("safesearch", "moderate")),
-                timelimit=kwargs.pop("timelimit", None),
-                backend=str(kwargs.pop("backend", "auto")),
-            )
-
-        if normalized_name == "tavily":
-            return TavilyProvider(
-                api_key=provider_api_key,
-                topic=str(kwargs.pop("topic", "general")),
-                search_depth=str(kwargs.pop("search_depth", "basic")),
-                include_answer=bool(kwargs.pop("include_answer", False)),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "serpapi":
-            return SerpAPIProvider(
-                api_key=provider_api_key,
-                engine=str(kwargs.pop("engine", "google")),
-                location=str(kwargs.pop("location", "United States")),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "brave":
-            return BraveProvider(
-                api_key=provider_api_key,
-                country=str(kwargs.pop("country", "us")),
-                search_lang=str(kwargs.pop("search_lang", "en")),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "bing":
-            return BingProvider(
-                api_key=provider_api_key,
-                market=str(kwargs.pop("market", "en-US")),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "google_cse":
-            cse_id = str(kwargs.pop("cse_id", "")).strip()
-            if not cse_id:
-                raise ProviderNotConfiguredError(
-                    "web provider 'google_cse' requires cse_id in provider_kwargs"
-                )
-            return GoogleCSEProvider(
-                api_key=provider_api_key,
-                cse_id=cse_id,
-                safe=str(kwargs.pop("safe", "off")),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "exa":
-            return ExaProvider(
-                api_key=provider_api_key,
-                use_autoprompt=bool(kwargs.pop("use_autoprompt", True)),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        if normalized_name == "searxng":
-            base_url = str(kwargs.pop("base_url", "")).strip()
-            if not base_url:
-                raise ProviderNotConfiguredError(
-                    "web provider 'searxng' requires base_url in provider_kwargs"
-                )
-            return SearxNGProvider(
-                api_key=provider_api_key,
-                base_url=base_url,
-                categories=str(kwargs.pop("categories", "general")),
-                language=str(kwargs.pop("language", "en")),
-                timeout=int(kwargs.pop("timeout", 10)),
-            )
-
-        raise ValueError(f"Unsupported web provider '{provider_name}'")
-
-    def _normalize_provider_name(self, provider_name: str) -> str:
-        """Normalize provider aliases to canonical names."""
-
-        normalized = (provider_name or DuckDuckGoProvider.PROVIDER_NAME).strip().lower()
-        return WEB_PROVIDER_ALIASES.get(normalized, normalized)
+        return build_search_provider(
+            provider_name=provider_name,
+            api_key=provider_api_key,
+            provider_kwargs=provider_kwargs,
+            use_env=False,
+        )
 
     def _derive_title(self, content: str) -> str:
         """Derive a compact title when provider response omits one."""

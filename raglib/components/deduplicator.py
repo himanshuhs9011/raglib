@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import List, Set
 
+from raglib.core.text import token_set
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ class Deduplicator:
     def _signature(self, text: str) -> Set[str]:
         """Build a token-set signature for similarity checks."""
 
-        return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+        return token_set(text)
 
     def _jaccard(self, a: Set[str], b: Set[str]) -> float:
         """Compute Jaccard similarity between token signatures."""

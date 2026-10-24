@@ -4,34 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "raglib-py"
-version = "1.0.0"
-description = "A modular, production-grade Retrieval-Augmented Generation library"
+version = "2.0.0"
+description = "Modular Retrieval-Augmented Generation: hybrid search, reranking, CRAG, Self-RAG, agentic and GraphRAG pipelines"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
   { name = "raglib maintainers" }
 ]
 requires-python = ">=3.9"
-dependencies = [
-  "ddgs>=6.0.0",
-  "duckduckgo-search>=3.9",
-  "langchain-community>=0.4.1",
-  "chromadb>=0.5.0",
-  "langchain-core>=0.2.0",
-  "langchain-openai>=0.1.0",
-  "langchain-anthropic>=0.1.0",
-  "langchain-groq>=0.1.0",
-  "langchain-google-genai>=1.0.0",
-  "langchain-ollama>=0.1.0",
-  "langchain-huggingface>=0.0.3",
-  "sentence-transformers>=2.6.0",
-  "PyMuPDF>=1.23.0",
-  "python-docx>=1.0.0",
-  "python-pptx>=0.6.21"
-]
-keywords = ["rag", "llm", "retrieval", "ai", "nlp", "vector-search"]
+# The core is pure Python (BM25, in-memory vectors, all pipelines). Everything else is an extra.
+dependencies = []
+keywords = ["rag", "llm", "retrieval", "ai", "nlp", "vector-search", "graphrag", "hybrid-search"]
 classifiers = [
-  "Development Status :: 5 - Production/Stable",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
@@ -43,32 +28,45 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.scripts]
+raglib = "raglib.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/himanshuhs9011/raglib"
+Documentation = "https://github.com/himanshuhs9011/raglib/blob/main/docs/USAGE.md"
 Repository = "https://github.com/himanshuhs9011/raglib"
 "Bug Tracker" = "https://github.com/himanshuhs9011/raglib/issues"
 
 [project.optional-dependencies]
-tavily = ["tavily-python>=0.2.0"]
-serpapi = ["google-search-results>=2.4.0"]
-faiss = ["faiss-cpu>=1.7.0"]
+# chat / embedding providers
+# "openai" also covers OpenRouter, DeepSeek, Mistral, Together, Fireworks, xAI, Perplexity,
+# Cerebras, Azure OpenAI, LM Studio, vLLM and any other OpenAI-compatible API.
+openai = ["langchain-core>=0.2.0", "langchain-openai>=0.1.0"]
+openrouter = ["langchain-core>=0.2.0", "langchain-openai>=0.1.0"]
+anthropic = ["langchain-core>=0.2.0", "langchain-anthropic>=0.1.0"]
+groq = ["langchain-core>=0.2.0", "langchain-groq>=0.1.0"]
+google = ["langchain-core>=0.2.0", "langchain-google-genai>=1.0.0"]
+ollama = ["langchain-core>=0.2.0", "langchain-ollama>=0.1.0"]
+hf = ["langchain-huggingface>=0.0.3", "sentence-transformers>=2.6.0"]
+# retrieval quality
+rerank = ["sentence-transformers>=2.6.0"]
+cohere = ["cohere>=5.0.0"]
+fast = ["numpy>=1.24", "tiktoken>=0.5.0"]
+# storage
 chroma = ["chromadb>=0.5.0"]
-openai = ["langchain-openai>=0.1.0"]
-anthropic = ["langchain-anthropic>=0.1.0"]
-groq = ["langchain-groq>=0.1.0"]
-google = ["langchain-google-genai>=1.0.0"]
-ollama = ["langchain-ollama>=0.1.0"]
-langchain = ["langchain-core>=0.2.0"]
+graph = ["networkx>=3.0"]
+leiden = ["networkx>=3.0", "graspologic>=3.3"]
+neo4j = ["neo4j>=5.0", "networkx>=3.0"]
+# loaders
 pdf = ["PyMuPDF>=1.23.0"]
 docx = ["python-docx>=1.0.0"]
 pptx = ["python-pptx>=0.6.21"]
-free-embed = ["langchain-huggingface>=0.0.3", "sentence-transformers>=2.6.0"]
 ocr = ["pytesseract>=0.3.10", "Pillow>=10.0.0"]
-vision = [
-  "langchain-openai>=0.1.0",
-  "langchain-anthropic>=0.1.0",
-  "langchain-google-genai>=1.0.0",
-]
+# web search
+web = ["ddgs>=6.0.0"]
+tavily = ["tavily-python>=0.2.0"]
+serpapi = ["google-search-results>=2.4.0"]
+# bundles
 all-llm = [
   "langchain-core>=0.2.0",
   "langchain-openai>=0.1.0",
@@ -78,7 +76,6 @@ all-llm = [
   "langchain-ollama>=0.1.0",
 ]
 all = [
-  "chromadb>=0.5.0",
   "langchain-core>=0.2.0",
   "langchain-openai>=0.1.0",
   "langchain-anthropic>=0.1.0",
@@ -87,18 +84,22 @@ all = [
   "langchain-ollama>=0.1.0",
   "langchain-huggingface>=0.0.3",
   "sentence-transformers>=2.6.0",
+  "numpy>=1.24",
+  "tiktoken>=0.5.0",
+  "chromadb>=0.5.0",
+  "networkx>=3.0",
   "PyMuPDF>=1.23.0",
   "python-docx>=1.0.0",
   "python-pptx>=0.6.21",
-  "pytesseract>=0.3.10",
-  "Pillow>=10.0.0",
+  "ddgs>=6.0.0",
 ]
 dev = [
   "pytest>=7.4.0",
   "pytest-cov>=4.1.0",
-  "pytest-mock>=3.11.0",
+  "ruff>=0.5.0",
   "build>=1.0.0",
   "twine>=4.0.0",
+  "networkx>=3.0",
 ]
 
 [tool.hatch.build.targets.wheel]

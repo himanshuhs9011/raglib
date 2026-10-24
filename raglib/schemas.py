@@ -42,9 +42,33 @@ class RetrievalContext:
 
 
 @dataclass
+class TraceEvent:
+    """One timed pipeline stage (retrieve, rerank, generate, ...)."""
+
+    stage: str
+    latency_ms: float
+    meta: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+
+
+@dataclass
+class Citation:
+    """A source cited by the answer as ``[index]``."""
+
+    index: int
+    document_id: str
+    source: str = ""
+    snippet: str = ""
+
+
+@dataclass
 class GenerationResult:
-    """Represents a generated answer with sources and reasoning trace."""
+    """Represents a generated answer with sources, citations, and diagnostics."""
 
     answer: str
     sources: List[Document]
     reasoning_trace: List[str] = field(default_factory=list)
+    citations: List[Citation] = field(default_factory=list)
+    trace_events: List[TraceEvent] = field(default_factory=list)
+    usage: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)

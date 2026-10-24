@@ -6,6 +6,8 @@ preprocessing and loaders share one implementation (fixed / recursive / llm).
 
 from __future__ import annotations
 
+import warnings
+
 from raglib.loaders.chunk_splitter import (
     CHUNKING_STRATEGY_ALIASES,
     DEFAULT_RECURSIVE_SEPARATORS,
@@ -19,3 +21,9 @@ __all__ = [
     "CHUNKING_STRATEGY_ALIASES",
     "DEFAULT_RECURSIVE_SEPARATORS",
 ]
+
+warnings.warn(
+    "raglib.preprocessing is deprecated; import ChunkSplitter from raglib.loaders instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)

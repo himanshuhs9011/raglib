@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from raglib.components.memory import MemoryModule
-from raglib.graph_context import ConnectedNodeRef, GraphContextWindow, GraphNode
+from raglib.graph_context import GraphContextWindow
 from raglib.llm.base_client import BaseLLMClient
 from raglib.llm.mock_client import MockLLMClient
 from raglib.loaders.chunk_splitter import ChunkSplitter

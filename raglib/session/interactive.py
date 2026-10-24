@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
 
 from raglib.schemas import GenerationResult
+
+if TYPE_CHECKING:
+    from raglib.facade import RAG
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +21,7 @@ class InteractiveSession:
         "+------------------------------------------------------+\n"
         "|              raglib interactive session             |\n"
         "|  Type your question and press Enter.                |\n"
-        "|  Commands: help | history | clear | exit | bye      |\n"
+        "|  Commands: help | history | reset | clear | exit     |\n"
         "+------------------------------------------------------+"
     )
 
@@ -26,14 +29,16 @@ class InteractiveSession:
         "Available commands:\n"
         "  help      - show this message\n"
         "  history   - show all questions asked in this session\n"
+        "  reset     - forget the conversation so far\n"
         "  clear     - clear the terminal screen\n"
         "  exit / quit / q / bye / stop - end the session\n"
     )
 
-    def __init__(self, rag: "RAG"):
+    def __init__(self, rag: "RAG", session_id: str = "interactive"):
         """Store the RAG facade instance and initialize session state."""
 
         self._rag = rag
+        self._session_id = session_id
         self._history: List[Dict[str, str]] = []
         self._turn = 0
 
@@ -41,9 +46,10 @@ class InteractiveSession:
         """Print banner and run the input loop until the user exits."""
 
         print(self.BANNER)
-        print(f"  Documents loaded : {len(self._rag._documents)}")
-        print(f"  LLM              : {type(self._rag._llm).__name__}")
-        print(f"  RAG strategy     : {self._rag._rag_type}")
+        stats = self._rag.stats()
+        print(f"  Chunks indexed   : {stats['chunks']}")
+        print(f"  LLM              : {stats['llm']}")
+        print(f"  RAG strategy     : {stats['rag_type']}")
         print()
 
         while True:
@@ -69,11 +75,16 @@ class InteractiveSession:
             if normalized == "clear":
                 os.system("cls" if os.name == "nt" else "clear")
                 continue
+            if normalized == "reset":
+                self._rag.reset_memory(self._session_id)
+                self._history.clear()
+                print("  Conversation memory cleared.\n")
+                continue
 
             self._turn += 1
             print("\nThinking...\n")
             try:
-                result = self._rag.query(raw)
+                result = self._rag.query(raw, session_id=self._session_id)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("InteractiveSession query failed")
                 print(f"[Error] {exc}\n")
@@ -101,11 +112,11 @@ class InteractiveSession:
 
         print(f"Assistant: {result.answer}\n")
 
-        if result.sources:
-            summary = ", ".join(
-                f"{self._truncate_source_id(document.id)}(score={document.score:.2f})"
-                for document in result.sources[:3]
-            )
+        if result.citations:
+            for citation in result.citations:
+                print(f"  [{citation.index}] {self._truncate_source_id(citation.document_id)}")
+        elif result.sources:
+            summary = ", ".join(self._truncate_source_id(document.id) for document in result.sources[:3])
             print(f"  Sources: {summary}")
 
         if result.reasoning_trace:

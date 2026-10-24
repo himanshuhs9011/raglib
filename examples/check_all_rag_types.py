@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check all raglib rag_type variants")
     parser.add_argument(
         "--doc",
-        default=r"C:\Users\hs901\Downloads\Object_thermal_detection.docx",
+        required=True,
         help="Path to the source document",
     )
     parser.add_argument(
@@ -43,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vector-db", default="chroma", help="Vector backend: chroma or memory")
     parser.add_argument("--persist-dir", default=".raglib_chroma", help="Chroma persistence directory")
     parser.add_argument("--top-k", type=int, default=5, help="Top-k retrieval size")
+    parser.add_argument(
+        "--web-provider",
+        default="duckduckgo",
+        help="Web search provider for web / hybrid_web / corrective / routing (use 'none' to disable)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use the offline mock LLM + embeddings (no Ollama needed; answers are templated)",
+    )
     parser.add_argument(
         "--report-dir",
         default="examples/reports",
@@ -112,7 +122,10 @@ def main() -> None:
         "memory",
         "web",
         "tool",
+        "graph",
+        "hybrid_web",
     ]
+    web_provider = None if args.web_provider.lower() == "none" else args.web_provider
 
     results: List[Dict[str, Any]] = []
 
@@ -125,12 +138,21 @@ def main() -> None:
         }
 
         try:
+            model_kwargs: Dict[str, Any] = (
+                {"offline": True}
+                if args.offline
+                else {
+                    "chat_llm": "ollama",
+                    "chat_model": args.chat_model,
+                    "embedding_llm": "ollama",
+                    "embedding_model": args.embedding_model,
+                }
+            )
+            needs_web = rag_type in {"web", "hybrid_web", "corrective", "routing"}
             rag = RAG(
                 source=args.doc,
-                chat_llm="ollama",
-                chat_model=args.chat_model,
-                embedding_llm="ollama",
-                embedding_model=args.embedding_model,
+                **model_kwargs,
+                web_search_provider=web_provider if needs_web else None,
                 vector_db=args.vector_db,
                 vector_db_kwargs={
                     "collection_name": f"raglib_check_{rag_type}",
@@ -151,10 +173,12 @@ def main() -> None:
                         "answer": output.answer,
                         "source_count": len(output.sources),
                         "source_ids": [doc.id for doc in output.sources[:5]],
+                        "citations": [citation.document_id for citation in output.citations],
+                        "latency_ms": output.usage.get("latency_ms"),
                         "reasoning_trace": output.reasoning_trace,
                     }
                 )
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             result["status"] = "fail"
             result["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -193,6 +217,8 @@ def main() -> None:
         "embedding_model": args.embedding_model,
         "vector_db": args.vector_db,
         "top_k": args.top_k,
+        "offline": args.offline,
+        "web_provider": web_provider,
     }
 
     json_path = report_dir / f"all_rag_types_full_output_{timestamp}.json"

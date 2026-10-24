@@ -10,39 +10,15 @@ import pytest
 import raglib
 from raglib import (
     RAG,
-    AdvancedRAG,
-    AgenticRAG,
-    ChunkSplitter,
-    ContextReducer,
-    CorrectiveRAG,
     DecisionEngine,
-    Deduplicator,
     Document,
-    Evaluator,
     GenerationResult,
     Generator,
-    HybridRAG,
-    HybridRetriever,
-    MemoryModule,
-    MemoryRAG,
     MockLLMClient,
-    MultiHopRAG,
-    MultiHopRetriever,
-    MultiQueryRAG,
-    MultiQueryRetriever,
-    NaiveRAG,
-    Planner,
-    QueryExpander,
-    QueryRewriter,
-    Refiner,
-    ReflectionModule,
-    Reranker,
     Retriever,
     RouterRetriever,
     RoutingRAG,
     SelfRAG,
-    ToolAugmentedRAG,
-    WebRAG,
     WebRetriever,
 )
 from raglib.embedding.base_embedding import BaseEmbedding
@@ -304,10 +280,12 @@ def test_self_rag_word_boundary_verdict_parsing() -> None:
         "memory",
         "web",
         "tool",
+        "graph",
+        "hybrid_web",
     ],
 )
-def test_all_12_rag_types_run_end_to_end_via_facade(rag_type: str) -> None:
-    """Verify all 12 RAG strategies run cleanly through the RAG facade in offline mode."""
+def test_all_rag_types_run_end_to_end_via_facade(rag_type: str) -> None:
+    """Verify every RAG strategy runs cleanly through the RAG facade in offline mode."""
 
     corpus = (
         "Retrieval-Augmented Generation (RAG) grounds language model outputs in retrieved documents. "

@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.0.0 - 2026-10-24
+
+Production-hardening release with breaking changes. See README section 16 for the migration table.
+
+- **New: GraphRAG** (`rag_type="graph"`, `raglib.graphrag`): parallel, cached LLM entity/relation extraction; NetworkX (JSON-persisted) or Neo4j graph stores; hierarchical Leiden/Louvain communities with incremental reports; local search (no extra LLM calls) and global map-reduce search over embedding-prefiltered communities.
+- **Retrieval:** BM25 + dense hybrid search by default with relative-score fusion (or RRF), metadata filters, MMR, neighbour (small-to-big) expansion, Unicode-aware tokenization (Indic, Arabic, Thai, Cyrillic, ...).
+- **Reranking:** cross-encoder, Cohere, listwise-LLM and custom rerankers; the lossy lexical reranker was removed.
+- **Generation:** delimited sources with prompt-injection guard, `[n]` citations parsed into `GenerationResult.citations`, "don't know" instruction, token-budgeted packing that trims instead of dropping, lost-in-the-middle ordering, streaming and async.
+- **Conversations:** per-`session_id` memory with token budget and standalone-question condensation for every rag_type.
+- **Ingestion:** idempotent upserts with content-hashed chunk ids, `update()`, `delete()`, `save()` / `load()` without re-embedding.
+- **Strategies rewritten on one shared `BaseRAG` pipeline:** paper-faithful CRAG verdicts with batched grading and no implicit web search; Self-RAG with an LLM-call budget; real ReAct `AgenticRAG` with tools; iterative `MultiHopRAG`; parallel RRF `MultiQueryRAG`; `hybrid_web`; routing with a graph route.
+- **Reliability:** LLM timeouts, jittered exponential-backoff retries, LRU response cache, cached + batched embeddings, per-stage `TraceEvent`s with an `on_event` hook, `raglib.eval` (hit rate, MRR, recall, nDCG, faithfulness, answer relevance, context precision, correctness).
+- **Safety fixes:** substring keyword routing ("this" matched "hi" and skipped retrieval), silent mock LLM / embedding / vector-store fallbacks, shared Chroma collection across instances, deprecated default models.
+- **LLM providers:** 17 providers from one registry: OpenRouter, DeepSeek, Mistral, Together, Fireworks, xAI, Perplexity, Cerebras, Azure OpenAI, LM Studio, vLLM and any OpenAI-compatible endpoint, alongside OpenAI, Anthropic, Gemini, Groq and Ollama. `llm="provider/model"` strings, provider auto-detection from environment keys, and longest-prefix key detection (OpenRouter `sk-or-` keys were previously treated as OpenAI). Chat keys are no longer sent to a different embedding provider.
+- **Simpler usage:** `raglib.ask(source, question)` one-liner and a `raglib` CLI (`raglib ask`, `raglib chat`, `raglib providers`, also `python -m raglib`).
+- **Graph visualization:** `rag.visualize_graph()`, `GraphContextWindow.to_html()` and `raglib graph` write a self-contained interactive HTML view (no CDN; content escaped against script injection).
+- **Concurrency:** read-write locks in the retriever and in-memory store and locked graph-store reads. v1/early-v2 crashed in 25-42% of queries when documents were added during chats; now 0 errors under 16 concurrent sessions.
+- **Scale:** float32 in-memory vectors (2.5 GB -> 1 GB at 30k chunks), argpartition top-k, streaming batched `add()` with `on_progress` and resume-after-failure, concurrent embedding batches.
+- **Security:** SSRF guard for URL sources (private/metadata IPs, redirects, 20 MB cap), `allowed_dirs` path sandbox, user queries removed from INFO logs, `.env.example`, committed run reports with local paths untracked.
+- **Rate limits and resilience:** a shared client-side limiter (`llm_rpm`; OpenRouter `:free` models default to 20/min, with chat and embeddings sharing one budget), retries that honour `Retry-After` / `X-RateLimit-Reset`, `QuotaExceededError` for daily or credit caps (fail fast), `llm_fallbacks=[...]` model fallback, and timeouts and retries for embedding calls.
+- **GraphRAG cost:** communities with fewer than `min_llm_report_size` (3) entities get a template report instead of an LLM call.
+- **GraphContextWindow:** optional `embedding=` for semantic seeding (finds paraphrased questions).
+- **Ingestion and citations:** `rag.add()` accepts `Document` objects. Citations and prompt source labels use the file name and page, never the full local path (which used to be sent to the LLM provider).
+- **Live-verified** on OpenRouter free chat and embedding models: needle-in-a-haystack, GraphRAG local and global, GraphContextWindow.
+- **Packaging:** the core has no required dependencies; integrations are extras. Classifier set to Beta.
+- **Removed:** `raglib.config`, `raglib.main`, duplicate `powerpoint_loader` / `plain_text_loader` / `webpage_loader`; `raglib.preprocessing` is a deprecated shim.
+
 ## 1.0.0 - 2026-10-14
 
 - **Major Release (v1.0.0):**

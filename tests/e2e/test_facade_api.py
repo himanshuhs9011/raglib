@@ -151,10 +151,18 @@ def test_facade_web_provider_selection_duckduckgo() -> None:
     assert rag._web_provider.name == "duckduckgo"
 
 
-def test_facade_web_provider_defaults_to_duckduckgo() -> None:
-    """Verify facade defaults to DuckDuckGo when provider is not specified."""
+def test_facade_web_search_is_off_by_default() -> None:
+    """Verify private queries are never sent to the web unless a provider is configured."""
 
     rag = RAG("Local corpus text only.")
+    assert rag._web_provider is None
+    assert rag._web_retriever is None
+
+
+def test_facade_web_rag_type_defaults_to_duckduckgo() -> None:
+    """Verify rag_type='web' (which needs web search) defaults to DuckDuckGo."""
+
+    rag = RAG("Local corpus text only.", rag_type="web")
     assert rag._web_provider.name == "duckduckgo"
 
 

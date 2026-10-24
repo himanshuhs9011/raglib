@@ -15,7 +15,7 @@ from raglib import RAG
 def main() -> None:
     """Execute a real-user style local RAG test over a DOCX file."""
 
-    doc_path = r"C:\Users\hs901\Downloads\research-paper-format.docx"
+    doc_path = sys.argv[1] if len(sys.argv) > 1 else "docs/"
     questions = [
         "What is the core concept of this paper?",
         "What problem does this paper try to solve?",
@@ -34,11 +34,11 @@ def main() -> None:
             "collection_name": "raglib_local_test",
             "persist_directory": ".raglib_chroma",
         },
-        rag_type="corrective",
+        rag_type="advanced",
         top_k=5,
     )
 
-    print(f"Loaded chunks: {len(rag._documents)}")
+    print(f"Index: {rag.stats()}")
 
     for idx, question in enumerate(questions, start=1):
         result = rag.query(question)
@@ -47,7 +47,9 @@ def main() -> None:
         print("-" * 80)
         print(result.answer)
         print("-" * 80)
-        print("Top sources:", [doc.id for doc in result.sources[:3]])
+        for citation in result.citations:
+            print(f"  [{citation.index}] {citation.document_id}")
+        print(f"  latency: {result.usage.get('latency_ms')} ms")
 
 
 if __name__ == "__main__":

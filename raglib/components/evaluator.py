@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import replace
 from typing import List, Set
 
+from raglib.core.text import token_set
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -54,4 +54,4 @@ class Evaluator:
     def _tokenize(self, text: str) -> Set[str]:
         """Tokenize text into a normalized set of terms."""
 
-        return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+        return token_set(text, remove_stopwords=True) or token_set(text)

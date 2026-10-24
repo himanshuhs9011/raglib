@@ -3,6 +3,7 @@
 from raglib.rag_types.advanced_rag import AdvancedRAG
 from raglib.rag_types.agentic_rag import AgenticRAG
 from raglib.rag_types.corrective_rag import CorrectiveRAG
+from raglib.rag_types.graph_rag import GraphRAG
 from raglib.rag_types.hybrid_rag import HybridRAG
 from raglib.rag_types.memory_rag import MemoryRAG
 from raglib.rag_types.multi_hop_rag import MultiHopRAG
@@ -26,4 +27,5 @@ __all__ = [
     "MemoryRAG",
     "WebRAG",
     "ToolAugmentedRAG",
+    "GraphRAG",
 ]
