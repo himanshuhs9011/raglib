@@ -1,0 +1,9 @@
+// Cloudflare Workers static-assets deployment: `npm run build && npx wrangler deploy`
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "raglib",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}
