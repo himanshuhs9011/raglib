@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
+from raglib.core.concurrency import parallel_map
 from raglib.graphrag.schemas import Entity, ExtractionResult, Relation, normalize_entity_key
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
@@ -57,10 +57,7 @@ class GraphExtractor:
 
         if not chunks:
             return {}
-        if self.max_workers == 1 or len(chunks) == 1:
-            return {chunk.id: self.extract_one(chunk) for chunk in chunks}
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(chunks))) as pool:
-            results = list(pool.map(self.extract_one, chunks))
+        results = parallel_map(self.extract_one, chunks, self.max_workers)
         return {chunk.id: result for chunk, result in zip(chunks, results)}
 
     def extract_one(self, chunk: Document) -> ExtractionResult:

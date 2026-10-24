@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from raglib.core.concurrency import parallel_map
 from raglib.core.parsing import parse_json
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document, GenerationResult
@@ -138,11 +138,7 @@ def evaluate(
         sample.metrics["latency_ms"] = float(result.usage.get("latency_ms", 0.0))
         return sample
 
-    if max_workers <= 1 or len(dataset) <= 1:
-        samples = [run_one(row) for row in dataset]
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            samples = list(pool.map(run_one, dataset))
+    samples = parallel_map(run_one, dataset, max_workers)
 
     names = sorted({name for sample in samples for name in sample.metrics})
     summary = {

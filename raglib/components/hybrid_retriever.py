@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional
 
+from raglib.core.concurrency import parallel_map
 from raglib.components.retriever import Retriever
 from raglib.components.web_retriever import WebRetriever
 from raglib.core.fusion import interleave
@@ -54,11 +54,11 @@ class HybridRetriever:
     def retrieve(self, query: str, **kwargs: Any) -> List[Document]:
         """Retrieve from both sources in parallel and allocate top_k slots by weight."""
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            vector_future = pool.submit(self.vector_retriever.retrieve, query, **kwargs) if self.vector_weight > 0 else None
-            web_future = pool.submit(self.web_retriever.retrieve, query) if self.web_weight > 0 else None
-            vector_docs = vector_future.result() if vector_future else []
-            web_docs = web_future.result() if web_future else []
+        tasks = [
+            (lambda: self.vector_retriever.retrieve(query, **kwargs)) if self.vector_weight > 0 else (lambda: []),
+            (lambda: self.web_retriever.retrieve(query)) if self.web_weight > 0 else (lambda: []),
+        ]
+        vector_docs, web_docs = parallel_map(lambda task: task(), tasks, max_workers=2)
         fused = self.allocate(vector_docs, web_docs)
         logger.info("HybridRetriever fused %d corpus + %d web docs", len(vector_docs), len(web_docs))
         return fused

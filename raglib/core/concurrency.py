@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Callable, Iterator, List, Sequence, TypeVar
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 
 class ReadWriteLock:
@@ -72,3 +77,27 @@ class ReadWriteLock:
                 if self._writer_depth == 0:
                     self._writer = 0
                     self._cond.notify_all()
+
+
+# Browsers (Pyodide) and WASI runtimes cannot start threads.
+THREADS_AVAILABLE = sys.platform not in ("emscripten", "wasi")
+
+
+def parallel_map(fn: Callable[[T], R], items: Sequence[T], max_workers: int) -> List[R]:
+    """``[fn(x) for x in items]``, run on a thread pool when that helps and is possible.
+
+    Falls back to sequential execution when threads are unavailable (Pyodide / WASI) or
+    cannot be started, so raglib also runs inside a browser.
+    """
+
+    items = list(items)
+    workers = min(max_workers, len(items))
+    if workers <= 1 or not THREADS_AVAILABLE:
+        return [fn(item) for item in items]
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(fn, items))
+    except RuntimeError as exc:
+        if "thread" not in str(exc).lower():
+            raise
+        return [fn(item) for item in items]

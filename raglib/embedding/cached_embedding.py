@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
+from raglib.core.concurrency import parallel_map
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.llm.resilience import RateLimiter, retry_call
 
@@ -101,12 +101,8 @@ class CachedEmbedding(BaseEmbedding):
                 raise RuntimeError(f"Embedding model returned {len(vectors)} vectors for {len(batch_indexes)} texts")
             return vectors
 
-        if len(batches) > 1 and self.max_concurrency > 1:
-            # Embedding APIs are I/O bound: send several batches at once.
-            with ThreadPoolExecutor(max_workers=min(self.max_concurrency, len(batches))) as pool:
-                outputs = list(pool.map(embed_batch, batches))
-        else:
-            outputs = [embed_batch(batch) for batch in batches]
+        # Embedding APIs are I/O bound: send several batches at once.
+        outputs = parallel_map(embed_batch, batches, self.max_concurrency)
         for batch_indexes, vectors in zip(batches, outputs):
             for index, vector in zip(batch_indexes, vectors):
                 results[index] = list(vector)

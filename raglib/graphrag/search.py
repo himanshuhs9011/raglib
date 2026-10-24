@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Sequence
 
+from raglib.core.concurrency import parallel_map
 from raglib.core.intents import is_global_question
 from raglib.core.text import token_set
 from raglib.graphrag.indexer import GraphIndexer
@@ -186,11 +186,7 @@ class GlobalSearch:
             return []
         selected = self._prefilter(query, communities)
         self.last_mapped = len(selected)
-        if len(selected) == 1 or self.max_workers == 1:
-            mapped = [self._map(query, community) for community in selected]
-        else:
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(selected))) as pool:
-                mapped = list(pool.map(lambda c: self._map(query, c), selected))
+        mapped = parallel_map(lambda c: self._map(query, c), selected, self.max_workers)
 
         points: List[Document] = [doc for docs in mapped for doc in docs]
         points.sort(key=lambda doc: doc.score, reverse=True)

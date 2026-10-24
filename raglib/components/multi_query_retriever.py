@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional
 
+from raglib.core.concurrency import parallel_map
 from raglib.components.deduplicator import Deduplicator
 from raglib.components.query_expander import QueryExpander
 from raglib.components.retriever import Retriever
@@ -47,8 +47,7 @@ class MultiQueryRetriever:
         if len(variants) == 1:
             ranked_lists = [self.retriever.retrieve(variants[0], top_k=k, **kwargs)]
         else:
-            with ThreadPoolExecutor(max_workers=min(self.max_workers, len(variants))) as pool:
-                ranked_lists = list(pool.map(lambda v: self.retriever.retrieve(v, top_k=k, **kwargs), variants))
+            ranked_lists = parallel_map(lambda v: self.retriever.retrieve(v, top_k=k, **kwargs), variants, self.max_workers)
         # The original query gets a higher weight than paraphrases.
         weights = [1.5] + [1.0] * (len(ranked_lists) - 1)
         fused = reciprocal_rank_fusion(ranked_lists, weights=weights)

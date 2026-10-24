@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.2 - 2026-10-24
+
+- **Runs in the browser (Pyodide) and other thread-less runtimes:** all parallel work goes through `raglib.core.concurrency.parallel_map`, which runs sequentially when threads are unavailable or cannot be started. Every `rag_type` now works offline in the browser, which powers the website playground.
+
 ## 2.0.1 - 2026-10-24
 
 Fixes found by live testing every `rag_type` on OpenRouter free models.

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence
 
+from raglib.core.concurrency import parallel_map
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.graphrag.schemas import Community
 from raglib.graphrag.store.base import BaseGraphStore
@@ -144,12 +144,7 @@ class CommunityReporter:
         todo = [c for c in todo if len(c.entity_ids) >= self.min_llm_report_size]
         if todo:
             logger.info("Generating %d community reports (%d reused)", len(todo), len(communities) - len(todo))
-            if self.max_workers == 1 or len(todo) == 1:
-                for community in todo:
-                    self._report_one(community, store)
-            else:
-                with ThreadPoolExecutor(max_workers=min(self.max_workers, len(todo))) as pool:
-                    list(pool.map(lambda c: self._report_one(c, store), todo))
+            parallel_map(lambda c: self._report_one(c, store), todo, self.max_workers)
 
         needs_embedding = [c for c in communities if c.summary and c.embedding is None]
         if self.embedding is not None and needs_embedding:

@@ -236,3 +236,21 @@ def test_hybrid_web_always_includes_web_results():
     assert len(ids) == 5 and sum(i.startswith("web") for i in ids) == 2  # 40% of slots
     only_web = HybridRetriever(vector_retriever=Fake("corpus", 0), web_retriever=Fake("web", 4))
     assert [d.id for d in only_web.retrieve("q")] == ["web0", "web1", "web2", "web3"]
+
+
+def test_parallel_map_runs_without_threads(monkeypatch):
+    """Pyodide / WASI cannot start threads: raglib must fall back to sequential execution."""
+
+    import raglib.core.concurrency as concurrency
+
+    assert concurrency.parallel_map(lambda x: x * 2, [1, 2, 3], max_workers=4) == [2, 4, 6]
+    monkeypatch.setattr(concurrency, "THREADS_AVAILABLE", False)
+    assert concurrency.parallel_map(lambda x: x * 2, [1, 2, 3], max_workers=4) == [2, 4, 6]
+
+    class NoThreads:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(concurrency, "THREADS_AVAILABLE", True)
+    monkeypatch.setattr(concurrency, "ThreadPoolExecutor", NoThreads)
+    assert concurrency.parallel_map(lambda x: x + 1, [1, 2], max_workers=4) == [2, 3]
