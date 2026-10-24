@@ -232,11 +232,11 @@ function tick() {
   vis.forEach(n => { const k = Math.floor(n.x / cell) + "," + Math.floor(n.y / cell); (grid.get(k) || grid.set(k, []).get(k)).push(n); });
   vis.forEach(a => { const gx = Math.floor(a.x / cell), gy = Math.floor(a.y / cell);
     for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) { const bucket = grid.get((gx + dx) + "," + (gy + dy)); if (!bucket) continue;
-      for (const b of bucket) { if (b === a) continue; let x = a.x - b.x, y = a.y - b.y, d2 = x * x + y * y + 0.01; if (d2 > cell * cell) continue;
+      for (const b of bucket) { if (b === a) continue; let x = a.x - b.x, y = a.y - b.y, d2 = Math.max(x * x + y * y, 36); if (d2 > cell * cell) continue;
         const f = 900 / d2 * alpha; a.vx += x * f / Math.sqrt(d2); a.vy += y * f / Math.sqrt(d2); } } });
   edges.forEach(e => { if (!visible(e.s) || !visible(e.t)) return; const x = e.t.x - e.s.x, y = e.t.y - e.s.y, d = Math.sqrt(x * x + y * y) || 1, f = (d - 70) * 0.02 * alpha;
     e.s.vx += x / d * f; e.s.vy += y / d * f; e.t.vx -= x / d * f; e.t.vy -= y / d * f; });
-  vis.forEach(n => { n.vx -= n.x * 0.002 * alpha; n.vy -= n.y * 0.002 * alpha; if (n !== drag) { n.x += n.vx; n.y += n.vy; } n.vx *= 0.6; n.vy *= 0.6; });
+  vis.forEach(n => { n.vx -= n.x * 0.002 * alpha; n.vy -= n.y * 0.002 * alpha; const sp = Math.hypot(n.vx, n.vy); if (sp > 24) { n.vx *= 24 / sp; n.vy *= 24 / sp; } if (n !== drag) { n.x += n.vx; n.y += n.vy; } n.vx *= 0.6; n.vy *= 0.6; });
   alpha = Math.max(0.02, alpha * 0.985);
 }
 function toScreen(n) { return [n.x * view.k + view.x, n.y * view.k + view.y]; }

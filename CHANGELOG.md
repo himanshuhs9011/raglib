@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.3 - 2026-10-24
+
+- **Graph viewer layout:** nodes that started almost on top of each other were flung thousands of pixels away (repulsion had no minimum distance), so "Fit" zoomed out until the graph was a speck. Repulsion now has a minimum distance and node speed is capped.
+
 ## 2.0.2 - 2026-10-24
 
 - **Runs in the browser (Pyodide) and other thread-less runtimes:** all parallel work goes through `raglib.core.concurrency.parallel_map`, which runs sequentially when threads are unavailable or cannot be started. Every `rag_type` now works offline in the browser, which powers the website playground.
