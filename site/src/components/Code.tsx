@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 
 const KEYWORDS = new Set([
   "from", "import", "for", "in", "print", "def", "return", "if", "else", "with", "as", "async", "await", "True", "False", "None",
+  "class", "try", "except", "raise", "lambda", "not", "and", "or", "is",
 ]);
 
 /** Tiny Python/shell highlighter: comments, strings and keywords only (monochrome). */

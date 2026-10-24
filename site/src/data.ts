@@ -1,4 +1,4 @@
-export const VERSION = "2.0.3";
+export const VERSION = "2.0.4";
 
 const REPO = "https://github.com/himanshuhs9011/raglib";
 export const LINKS = {
@@ -16,23 +16,77 @@ export interface RagType {
   what: string;
   when: string;
   calls: string;
+  code: string;
 }
 
 export const RAG_TYPES: RagType[] = [
-  { id: "naive", name: "Naive", what: "Retrieve top-k chunks, answer with citations.", when: "Baselines, simple FAQs.", calls: "1" },
-  { id: "advanced", name: "Advanced (default)", what: "Hybrid BM25 + dense retrieval, optional rerank, grounded cited answer.", when: "Most document Q&A.", calls: "1" },
-  { id: "hybrid", name: "Hybrid", what: "Keyword and semantic search fused, so exact codes and paraphrases both match.", when: "IDs, product codes, mixed queries.", calls: "1" },
-  { id: "corrective", name: "Corrective (CRAG)", what: "Grades retrieved chunks; refines, or searches the web only when nothing relevant was found.", when: "When retrieval is often off-target.", calls: "2–3" },
-  { id: "self", name: "Self-RAG", what: "Decides whether to retrieve, checks relevance, support and usefulness of its answer.", when: "High-stakes answers that must be supported.", calls: "≤ 8 (capped)" },
-  { id: "agentic", name: "Agentic", what: "ReAct loop: the LLM picks tools (docs, web, graph, your own) until it has enough evidence.", when: "Open-ended, multi-part questions.", calls: "≤ steps + 1" },
-  { id: "tool", name: "Tool", what: "Agentic loop with your own tools, e.g. a calculator or an internal API.", when: "Answers that need live data or computation.", calls: "≤ steps + 1" },
-  { id: "multi_hop", name: "Multi-hop", what: "Iterative retrieval: each hop asks what is still missing.", when: "Questions that chain facts across documents.", calls: "1 per hop + 1" },
-  { id: "multi_query", name: "Multi-query", what: "Rewrites the question into variants and fuses their results.", when: "Vague or short questions.", calls: "2" },
-  { id: "memory", name: "Memory", what: "Per-session chat history; follow-ups are rewritten into standalone questions.", when: "Chatbots.", calls: "1 (+1 on follow-ups)" },
-  { id: "routing", name: "Routing", what: "Chooses vector, web, graph or no retrieval per question.", when: "Mixed workloads.", calls: "1–2" },
-  { id: "web", name: "Web", what: "Answers from live web search (9 providers, DuckDuckGo is free).", when: "Fresh information.", calls: "1 + search" },
-  { id: "hybrid_web", name: "Hybrid web", what: "Corpus and web results, each given a share of the context.", when: "Internal docs plus current facts.", calls: "1 + search" },
-  { id: "graph", name: "GraphRAG", what: "LLM-built knowledge graph with communities; local (entity) and global (theme) search.", when: "Relationships and corpus-wide themes.", calls: "1 per query; 1 per chunk to index" },
+  { id: "naive", name: "Naive", what: "Retrieve top-k chunks, answer with citations.", when: "Baselines, simple FAQs.", calls: "1", code: `rag = RAG("docs/", llm="openai", rag_type="naive", top_k=3)
+result = rag.query("How long do customers have to ask for a refund?")
+print(result.answer)` },
+  { id: "advanced", name: "Advanced (default)", what: "Hybrid BM25 + dense retrieval, optional rerank, grounded cited answer.", when: "Most document Q&A.", calls: "1", code: `rag = RAG(
+    "docs/", llm="openai",               # rag_type="advanced" is the default
+    reranker="cross_encoder",            # "none" | "cross_encoder" | "cohere" | "llm"
+    mmr_lambda=0.5, neighbor_window=1,   # diversity + neighbouring chunks
+)
+result = rag.query("Who leads support?", filters={"file": {"$in": ["docs/team.md"]}})` },
+  { id: "hybrid", name: "Hybrid", what: "Keyword and semantic search fused, so exact codes and paraphrases both match.", when: "IDs, product codes, mixed queries.", calls: "1", code: `rag = RAG(
+    "docs/", llm="openai", rag_type="hybrid",
+    fusion="relative",      # or "rrf"
+    hybrid_alpha=0.5,       # 0 = keywords only, 1 = vectors only
+)
+result = rag.query("INV-2024-0042 status")   # exact codes and paraphrases both match` },
+  { id: "corrective", name: "Corrective (CRAG)", what: "Grades retrieved chunks; refines, or searches the web only when nothing relevant was found.", when: "When retrieval is often off-target.", calls: "2–3", code: `rag = RAG("docs/", llm="openai", rag_type="corrective",
+          web_search_provider="duckduckgo")   # optional: used only when nothing relevant is found
+result = rag.query("Which database does billing use?")
+print(result.metadata["crag_verdict"])        # "correct" | "ambiguous" | "incorrect"` },
+  { id: "self", name: "Self-RAG", what: "Decides whether to retrieve, checks relevance, support and usefulness of its answer.", when: "High-stakes answers that must be supported.", calls: "≤ 8 (capped)", code: `rag = RAG("docs/", llm="openai", rag_type="self", max_llm_calls=8)
+result = rag.query("What does the auth service depend on?")
+print(result.reasoning_trace)   # decide_retrieval, is_relevant, is_sup, is_use, ...
+print(result.metadata["self_rag_llm_calls"])` },
+  { id: "agentic", name: "Agentic", what: "ReAct loop: the LLM picks tools (docs, web, graph, your own) until it has enough evidence.", when: "Open-ended, multi-part questions.", calls: "≤ steps + 1", code: `rag = RAG("docs/", llm="openai", rag_type="agentic", max_steps=4,
+          web_search_provider="duckduckgo",   # adds a search_web tool
+          enable_graph=True)                  # adds a graph_search tool
+result = rag.query("Which service does auth depend on, and what database does it use?")
+for step in result.metadata["agent_steps"]:
+    print(step["action"], step["input"])` },
+  { id: "tool", name: "Tool", what: "Agentic loop with your own tools, e.g. a calculator or an internal API.", when: "Answers that need live data or computation.", calls: "≤ steps + 1", code: `from raglib.components.tools import Tool
+
+def convert(text: str) -> str:
+    return "1 EUR = 1.10 USD"
+
+rag = RAG("docs/", llm="openai", rag_type="tool",
+          tools=[Tool(name="fx", description="Convert EUR to USD", func=convert)])
+result = rag.query("What is the travel cap in US dollars?")
+print(result.metadata["agent_steps"])   # shows when the LLM called "fx"` },
+  { id: "multi_hop", name: "Multi-hop", what: "Iterative retrieval: each hop asks what is still missing.", when: "Questions that chain facts across documents.", calls: "1 per hop + 1", code: `rag = RAG("docs/", llm="openai", rag_type="multi_hop", max_hops=3)
+result = rag.query("Who does the support team lead report to?")
+print(result.metadata["hop_queries"])   # the follow-up question asked at each hop` },
+  { id: "multi_query", name: "Multi-query", what: "Rewrites the question into variants and fuses their results.", when: "Vague or short questions.", calls: "2", code: `rag = RAG("docs/", llm="openai", rag_type="multi_query")
+result = rag.query("money back?")       # rewritten into several variants, results fused` },
+  { id: "memory", name: "Memory", what: "Per-session chat history; follow-ups are rewritten into standalone questions.", when: "Chatbots.", calls: "1 (+1 on follow-ups)", code: `rag = RAG("docs/", llm="openai", rag_type="memory", max_history_turns=10)
+rag.query("Who leads the support team?", session_id="user-1")
+result = rag.query("Who does she report to?", session_id="user-1")   # "she" is resolved
+print(result.metadata["search_query"])  # the standalone question used for retrieval
+rag.reset_memory("user-1")` },
+  { id: "routing", name: "Routing", what: "Chooses vector, web, graph or no retrieval per question.", when: "Mixed workloads.", calls: "1–2", code: `rag = RAG("docs/", llm="openai", rag_type="routing",
+          web_search_provider="duckduckgo", enable_graph=True)
+print(rag.query("hello!").reasoning_trace)              # no retrieval
+print(rag.query("refund window?").reasoning_trace)      # route:vector` },
+  { id: "web", name: "Web", what: "Answers from live web search (9 providers, DuckDuckGo is free).", when: "Fresh information.", calls: "1 + search", code: `rag = RAG(llm="openai", rag_type="web",
+          web_search_provider="duckduckgo")   # free; also tavily, serpapi, searxng, ...
+result = rag.query("Latest stable Python release")
+for doc in result.sources:
+    print(doc.metadata.get("url"))` },
+  { id: "hybrid_web", name: "Hybrid web", what: "Corpus and web results, each given a share of the context.", when: "Internal docs plus current facts.", calls: "1 + search", code: `rag = RAG("docs/", llm="openai", rag_type="hybrid_web",
+          web_search_provider="duckduckgo")
+result = rag.query("Our refund window vs the EU legal minimum?")
+print([doc.source for doc in result.sources])   # mix of your files and "duckduckgo"` },
+  { id: "graph", name: "GraphRAG", what: "LLM-built knowledge graph with communities; local (entity) and global (theme) search.", when: "Relationships and corpus-wide themes.", calls: "1 per query; 1 per chunk to index", code: `rag = RAG("papers/", llm="openai", rag_type="graph",
+          search_mode="auto",                    # "local" | "global"
+          graph_kwargs={"max_workers": 8, "resolve_with_embeddings": True})
+print(rag.query("How are auth and billing related?").metadata["graph_mode"])   # local
+print(rag.query("Main themes across all papers?").metadata["graph_mode"])      # global
+rag.visualize_graph("graph.html")` },
 ];
 
 export const FEATURES = [
@@ -60,17 +114,6 @@ export const LIVE_RESULTS: TestRow[] = [
   { test: "GraphContextWindow", result: "Graph built in 21 ms without an LLM; correct answer", status: "pass" },
   { test: "naive, hybrid, routing, corrective, self, memory, multi_query, multi_hop, tool, web", result: "All correct", status: "pass" },
   { test: "agentic, hybrid_web", result: "Bugs found live, fixed in 2.0.1; live re-check pending", status: "fixed" },
-];
-
-export const LIMITATIONS = [
-  { title: "In-memory store has a ceiling", text: "About 1 GB of RAM per 30,000 chunks (1536-dim). Above ~100k chunks use Chroma or another vector database." },
-  { title: "One process by default", text: "Chat memory and the in-memory index live in one process. Several server workers need a shared vector DB and chat store; no Redis store ships yet." },
-  { title: "GraphRAG costs one LLM call per chunk", text: "Indexing is parallel and cached, but large corpora are expensive. Similar names (\"Quillstone\" vs \"Quillstone Robotics\") stay separate unless resolve_with_embeddings=True." },
-  { title: "Free tiers are small", text: "An OpenRouter free account allows about 50 free-model requests per day, and embeddings count." },
-  { title: "Not every backend is live-tested", text: "OpenAI-compatible (OpenRouter) is tested live. Neo4j, Anthropic and Groq adapters are covered by code paths but not yet live-tested." },
-  { title: "Answers are only as good as the model", text: "Citations and the injection guard reduce, not eliminate, hallucination and prompt injection. Treat answers as untrusted output." },
-  { title: "Ingestion is single-threaded for PDFs", text: "Parsing many PDFs takes a while on the first run. Re-runs resume and skip unchanged files." },
-  { title: "GraphContextWindow is not thread-safe", text: "Use one instance per conversation or guard it with a lock." },
 ];
 
 export const WHY = [

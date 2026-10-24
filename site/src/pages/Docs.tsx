@@ -13,6 +13,8 @@ const TOC: [string, string][] = [
   ["graphrag", "GraphRAG"],
   ["context-window", "Graph context window"],
   ["chat", "Chat, streaming, async"],
+  ["result", "Reading the result"],
+  ["fastapi", "FastAPI"],
   ["evaluation", "Evaluation"],
   ["security", "Security & privacy"],
   ["scaling", "Scaling"],
@@ -244,6 +246,55 @@ result = await rag.aquery("...", session_id=request.user_id)       # FastAPI etc
           <p className="muted">
             One <code>RAG</code> instance is thread-safe: give each chat window its own <code>session_id</code>. Trace every stage
             with <code>on_event=lambda e: print(e.stage, e.latency_ms)</code>.
+          </p>
+        </Doc>
+
+        <Doc id="result" title="Reading the result">
+          <p>Every rag_type returns a <code>GenerationResult</code>:</p>
+          <ul>
+            <li><code>answer</code>: the text, with <code>[n]</code> citation markers.</li>
+            <li><code>citations</code>: <code>index</code>, <code>source</code> (file name and page), <code>snippet</code> for each <code>[n]</code>.</li>
+            <li><code>sources</code>: every chunk the LLM saw (<code>id</code>, <code>content</code>, <code>score</code>, <code>metadata</code>).</li>
+            <li><code>reasoning_trace</code>: readable pipeline steps, e.g. <code>evaluation:correct</code>.</li>
+            <li><code>trace_events</code>: timed stages (<code>stage</code>, <code>latency_ms</code>, <code>meta</code>).</li>
+            <li><code>usage</code>: prompt and completion tokens, total latency.</li>
+            <li>
+              <code>metadata</code>: pipeline diagnostics such as <code>crag_verdict</code>, <code>agent_steps</code>,{" "}
+              <code>hop_queries</code>, <code>graph_mode</code>, <code>self_rag_llm_calls</code>, and the standalone{" "}
+              <code>search_query</code>.
+            </li>
+          </ul>
+          <p className="muted">
+            <a href="#/">The home page</a> has a snippet for each rag_type, and{" "}
+            <a href={`${LINKS.github}/blob/main/examples/rag_types_tour.py`} target="_blank" rel="noreferrer">examples/rag_types_tour.py</a>{" "}
+            runs all of them.
+          </p>
+        </Doc>
+
+        <Doc id="fastapi" title="FastAPI">
+          <p>Create one <code>RAG</code> at startup and share it. It is thread-safe; use <code>aquery</code> in async endpoints.</p>
+          <Code
+            code={`
+@app.post("/ask")
+async def ask(req: Ask):
+    r = await rag.aquery(req.question, session_id=req.session_id, filters=req.filters)
+    return {"answer": r.answer, "citations": [c.__dict__ for c in r.citations], "metadata": r.metadata}
+
+@app.post("/documents")
+async def upload(file: UploadFile):
+    ...                                                    # save the file, then index it off the event loop
+    return {"chunks_added": await run_in_threadpool(rag.add, path)}
+`}
+          />
+          <ul>
+            <li>Map <code>QuotaExceededError</code> to HTTP 429 and <code>ValueError</code> to 400.</li>
+            <li>Stream with <code>StreamingResponse(rag.stream(question, session_id=...))</code>.</li>
+            <li>Set <code>allowed_dirs</code> and validate upload names so users cannot read or write outside your folder.</li>
+            <li>Several uvicorn workers each hold their own index: use a shared vector database (e.g. Chroma server) in that case.</li>
+          </ul>
+          <p className="muted">
+            Complete, tested app with uploads, deletion, streaming and a health check:{" "}
+            <a href={`${LINKS.github}/blob/main/examples/fastapi_app.py`} target="_blank" rel="noreferrer">examples/fastapi_app.py</a>.
           </p>
         </Doc>
 

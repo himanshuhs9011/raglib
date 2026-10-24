@@ -2,7 +2,7 @@
 // PyPI with micropip and exposes the functions defined in public/playground.py.
 
 export const PYODIDE_VERSION = "0.28.3";
-export const RAGLIB_VERSION = "2.0.3";
+export const RAGLIB_VERSION = "2.0.4";
 const INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
 
 interface PyodideInterface {
