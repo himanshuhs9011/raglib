@@ -8,7 +8,7 @@ from typing import Any, List
 
 from raglib.components.planner import Planner
 from raglib.components.retriever import Retriever
-from raglib.core.fusion import reciprocal_rank_fusion
+from raglib.core.fusion import interleave
 from raglib.schemas import Document, QueryResult
 
 logger = logging.getLogger(__name__)
@@ -46,5 +46,5 @@ class MultiHopRetriever:
                 break
             queries.append(next_query)
             current = next_query
-        fused = reciprocal_rank_fusion(hop_results)
+        fused = interleave(hop_results)  # each hop answers a different sub-question
         return QueryResult(query=query, documents=fused, hop_count=len(hop_results), rewritten_query=" | ".join(queries))

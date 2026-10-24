@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.1 - 2026-10-24
+
+Fixes found by live testing every `rag_type` on OpenRouter free models.
+
+- **hybrid_web:** web results never reached the answer. Weighted RRF (0.6/0.4, k=60) ranked the best web hit below corpus hit #31. Top-k slots are now split by weight (at least 1 web slot when the web returns results) and interleaved.
+- **agentic / multi_hop:** evidence from separate steps or hops was merged with RRF, so repeated searches for one sub-question pushed out the evidence for another (the answer said the Bluefin code was "not mentioned" although step 1 found it). Steps and hops are now merged round-robin (`raglib.core.fusion.interleave`).
+- **tool:** `rag_type="tool"` with `tools=[...]` raised an error. It now runs the agentic tool loop, where the LLM chooses which tools to call.
+- **Generation prompt:** answer directly when the sources contain the answer (weaker models hedged with "not stated... however source 3 says...").
+
 ## 2.0.0 - 2026-10-24
 
 Production-hardening release with breaking changes. See README section 16 for the migration table.

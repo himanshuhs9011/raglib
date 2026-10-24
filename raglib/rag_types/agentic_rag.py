@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from raglib.components.tools import Tool
 from raglib.core.base import BaseRAG, PipelineContext
-from raglib.core.fusion import reciprocal_rank_fusion
+from raglib.core.fusion import interleave
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -103,7 +103,8 @@ class AgenticRAG(BaseRAG):
             evidence.append(tools["search_docs"].run(ctx.search_query))
         ctx.metadata["agent_steps"] = steps
         ctx.trace.insert(0, f"plan_steps:{len(steps)}")
-        return reciprocal_rank_fusion(evidence) if len(evidence) > 1 else (evidence[0] if evidence else [])
+        # Each step targets a different part of the question: round-robin keeps every step's best evidence.
+        return interleave([docs for docs in evidence if docs])
 
     def _next_action(self, question: str, tools: Dict[str, Tool], steps: List[Dict[str, Any]]):
         """Ask the LLM for the next action; returns (tool_name, input) or None."""

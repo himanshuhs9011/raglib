@@ -202,3 +202,37 @@ def test_context_window_semantic_seeding_finds_paraphrases():
     assert any(line.startswith("Seed chunk") for line in result.traversal_trace)
     # keyword-only seeding has no term in common with the paraphrase, so it finds no seed
     assert not any(line.startswith("Seed") for line in plain.build_context_window(question).traversal_trace)
+
+
+def test_interleave_keeps_each_sub_question_evidence():
+    from raglib.core.fusion import interleave, reciprocal_rank_fusion
+    from raglib.schemas import Document
+
+    def d(i):
+        return Document(id=i, content=i)
+
+    bluefin = [d("bluefin"), d("x1")]
+    generator_runs = [[d("gen"), d("gen2"), d("x2")]] * 3  # the agent searched the same thing 3 times
+    lists = [bluefin] + generator_runs
+    assert [doc.id for doc in interleave(lists)][:2] == ["bluefin", "gen"]
+    # RRF lets the repeated searches outvote the single Bluefin search (the bug seen live)
+    assert reciprocal_rank_fusion(lists)[0].id == "gen"
+
+
+def test_hybrid_web_always_includes_web_results():
+    from raglib.components.hybrid_retriever import HybridRetriever
+    from raglib.schemas import Document
+
+    class Fake:
+        def __init__(self, prefix, n):
+            self.top_k = 5
+            self.docs = [Document(id=f"{prefix}{i}", content=f"{prefix}{i}") for i in range(n)]
+
+        def retrieve(self, query, **kwargs):
+            return self.docs
+
+    hybrid = HybridRetriever(vector_retriever=Fake("corpus", 20), web_retriever=Fake("web", 4))
+    ids = [d.id for d in hybrid.retrieve("q")]
+    assert len(ids) == 5 and sum(i.startswith("web") for i in ids) == 2  # 40% of slots
+    only_web = HybridRetriever(vector_retriever=Fake("corpus", 0), web_retriever=Fake("web", 4))
+    assert [d.id for d in only_web.retrieve("q")] == ["web0", "web1", "web2", "web3"]

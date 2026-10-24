@@ -81,3 +81,23 @@ def reciprocal_rank_fusion(
             )
         )
     return results
+
+
+def interleave(ranked_lists: Sequence[Sequence[Document]]) -> List[Document]:
+    """Round-robin merge (1st of each list, then 2nd of each, ...), deduplicated.
+
+    Use when each list answers a *different* sub-question (agent steps, hops): RRF would let
+    repeated near-identical searches outvote a list that was searched only once.
+    """
+
+    merged: List[Document] = []
+    seen = set()
+    depth = max((len(items) for items in ranked_lists), default=0)
+    for position in range(depth):
+        for items in ranked_lists:
+            if position < len(items):
+                key = doc_key(items[position])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(items[position])
+    return merged

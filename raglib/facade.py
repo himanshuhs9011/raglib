@@ -414,8 +414,11 @@ class RAG:
             if self._hybrid_retriever is None:
                 raise ValueError("rag_type='hybrid_web' requires a web_search_provider")
             rag_type_kwargs.setdefault("include_web", True)
+        if tools and self._rag_type == "tool" and "tool_call_hook" not in rag_type_kwargs:
+            # rag_type='tool' + tools=[...]: let the LLM choose among the tools (agentic tool loop).
+            self._rag_type = "agentic"
         if tools and self._rag_type not in {"agentic"}:
-            raise ValueError("tools=[...] is only supported with rag_type='agentic'")
+            raise ValueError("tools=[...] is supported with rag_type='agentic' or 'tool'")
         if tools:
             rag_type_kwargs["tools"] = list(tools)
         self._rag = self._build_orchestrator(self._rag_type, rag_type_kwargs)

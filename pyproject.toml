@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "raglib-py"
-version = "2.0.0"
+version = "2.0.1"
 description = "Modular Retrieval-Augmented Generation: hybrid search, reranking, CRAG, Self-RAG, agentic and GraphRAG pipelines"
 readme = "README.md"
 license = { file = "LICENSE" }
