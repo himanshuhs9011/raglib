@@ -62,7 +62,6 @@ class ProviderSpec:
 PROVIDERS: Dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
-        # ---- native integrations
         ProviderSpec("openai", KIND_NATIVE, "gpt-4.1-mini", ("OPENAI_API_KEY",), base_url_env=("OPENAI_BASE_URL",),
                      key_prefixes=("sk-proj-", "sk-"), default_embedding_model="text-embedding-3-small",
                      supports_vision=True, description="OpenAI"),
@@ -76,7 +75,6 @@ PROVIDERS: Dict[str, ProviderSpec] = {
         ProviderSpec("ollama", KIND_NATIVE, "llama3.1", base_url="http://localhost:11434",
                      base_url_env=("OLLAMA_BASE_URL", "OLLAMA_HOST"), requires_key=False,
                      default_embedding_model="nomic-embed-text", description="Ollama (local)"),
-        # ---- OpenAI-compatible APIs
         ProviderSpec("openrouter", KIND_OPENAI_COMPATIBLE, "openai/gpt-4.1-mini", ("OPENROUTER_API_KEY",),
                      base_url="https://openrouter.ai/api/v1", key_prefixes=("sk-or-",), supports_vision=True,
                      extra_headers={"X-Title": "raglib"},
@@ -128,7 +126,6 @@ PROVIDER_ALIASES: Dict[str, str] = {
     "togetherai": "together",
 }
 
-# Order used when auto-detecting a provider from environment variables.
 ENV_DETECTION_ORDER: Tuple[str, ...] = (
     "openai", "anthropic", "openrouter", "google", "groq", "mistral", "deepseek",
     "together", "fireworks", "xai", "cerebras", "perplexity", "azure",

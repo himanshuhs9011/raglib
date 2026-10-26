@@ -52,7 +52,6 @@ class CountingLLM(BaseLLMClient):
         return self.inner.chat(messages)
 
 
-# --------------------------------------------------------------------------- intents
 @pytest.mark.parametrize("query", ["What is this?", "Which chip is high end", "Is there a canvas vs paper trend?"])
 def test_substring_bug_fixed_questions_are_not_greetings(query: str) -> None:
     """'this' must not match 'hi'; such questions must still retrieve."""
@@ -76,7 +75,6 @@ def test_global_question_detection() -> None:
     assert not is_global_question("Who paid invoice INV-2024-0042?")
 
 
-# --------------------------------------------------------------------------- unicode + hybrid
 @pytest.mark.parametrize("mode", ["sparse", "dense", "hybrid"])
 def test_non_english_retrieval_works(mode: str) -> None:
     """Hindi queries must retrieve Hindi documents in every retrieval mode."""
@@ -169,7 +167,6 @@ def test_bm25_incremental_remove() -> None:
     assert len(index) == 1
 
 
-# --------------------------------------------------------------------------- reranker
 def test_reranker_none_keeps_first_stage_order() -> None:
     """The default reranker must not destroy dense/RRF ranking (v1 lexical bug)."""
 
@@ -185,7 +182,6 @@ def test_reranker_custom_scorer_reorders() -> None:
     assert reranker.rerank("q", docs)[0].id == "long"
 
 
-# --------------------------------------------------------------------------- ingestion
 def test_add_is_idempotent_and_updates_changed_documents(tmp_path) -> None:
     """Re-adding unchanged content is a no-op; changed files replace their old chunks."""
 
@@ -245,7 +241,6 @@ def test_instances_do_not_share_chroma_collections() -> None:
     assert beta.retriever.vector_store.count() == 3
 
 
-# --------------------------------------------------------------------------- configuration
 def test_no_silent_mock_without_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without a model and without offline mode, RAG must fail loudly."""
 
@@ -264,7 +259,6 @@ def test_unknown_rag_type_and_tools_validation() -> None:
         RAG("text", rag_type="advanced", tools=[Tool("x", "y", lambda q: q)])
 
 
-# --------------------------------------------------------------------------- generation
 def test_answers_carry_citations_and_trace_events() -> None:
     """Generated answers are cited and every stage is timed."""
 
@@ -301,7 +295,6 @@ def test_stream_yields_tokens_and_returns_result() -> None:
     assert result.sources
 
 
-# --------------------------------------------------------------------------- memory
 def test_sessions_are_isolated_and_follow_ups_are_condensed() -> None:
     """Session A's history never reaches session B's prompt; follow-ups get a condense step."""
 
@@ -327,7 +320,6 @@ def test_conversation_store_token_budget() -> None:
     assert "question 19" in context and "question 0" not in context
 
 
-# --------------------------------------------------------------------------- strategies
 def test_crag_never_calls_web_without_provider() -> None:
     """Default CRAG keeps queries private: no web retriever exists unless configured."""
 
@@ -415,7 +407,6 @@ def test_self_rag_respects_llm_call_budget() -> None:
     assert result.metadata["self_rag_llm_calls"] <= 4
 
 
-# --------------------------------------------------------------------------- GraphRAG
 GRAPH_CORPUS = [
     "Marie Curie worked at the University of Paris. Marie Curie discovered Polonium with Pierre Curie.",
     "Pierre Curie was married to Marie Curie. Pierre Curie studied Piezoelectricity.",
@@ -493,7 +484,6 @@ def test_graph_not_built_for_other_rag_types() -> None:
     assert not any("knowledge graph extraction" in prompt for prompt in llm.prompts)
 
 
-# --------------------------------------------------------------------------- evaluation
 def test_retrieval_metrics() -> None:
     """hit_rate / mrr / recall are computed against gold ids."""
 

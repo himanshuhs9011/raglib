@@ -158,7 +158,6 @@ _TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
 <style>
-/* Layout: full-bleed graph canvas with a details rail on the right (stacked below on phones). */
 :root { --bg:#f5f6f4; --panel:#ffffff; --ink:#1b1d1c; --muted:#646a67; --line:#d6dad7; --edge:rgba(60,72,66,.30); --hi:#0f1311; color-scheme:light; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#111413; --panel:#1a1e1c; --ink:#e7ebe9; --muted:#9aa29e; --line:#2f3532; --edge:rgba(205,215,210,.22); --hi:#ffffff; color-scheme:dark; } }
 :root[data-theme="dark"] { --bg:#111413; --panel:#1a1e1c; --ink:#e7ebe9; --muted:#9aa29e; --line:#2f3532; --edge:rgba(205,215,210,.22); --hi:#ffffff; color-scheme:dark; }

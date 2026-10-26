@@ -92,7 +92,6 @@ class Retriever:
         self._lock = ReadWriteLock()
         self.add_documents(documents or [])
 
-    # ------------------------------------------------------------------ properties
     @property
     def embedding(self) -> Optional[BaseEmbedding]:
         """Return the embedding model (None for sparse-only retrieval)."""
@@ -118,7 +117,6 @@ class Retriever:
         with self._lock.read():
             return self._doc_index.get(doc_id)
 
-    # ------------------------------------------------------------------ ingestion
     def add_documents(self, documents: Sequence[Document]) -> List[Document]:
         """Index new documents; ids already indexed are skipped. Returns the newly added docs."""
 
@@ -189,7 +187,6 @@ class Retriever:
         logger.info("Retriever deleted %d documents (total=%d)", len(id_set), len(self._documents))
         return len(id_set)
 
-    # ------------------------------------------------------------------ retrieval
     def retrieve(
         self,
         query: str,

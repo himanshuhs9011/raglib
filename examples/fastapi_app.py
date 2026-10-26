@@ -57,7 +57,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="raglib API", lifespan=lifespan)
 
 
-# ---------------------------------------------------------------- schemas
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     session_id: Optional[str] = Field(default=None, max_length=128, description="Per-user chat memory")
@@ -98,7 +97,6 @@ def safe_filename(name: str) -> str:
     return clean
 
 
-# ---------------------------------------------------------------- endpoints
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok", **rag().stats()}
@@ -120,7 +118,7 @@ async def ask(request: AskRequest) -> AskResponse:
             for d in result.sources
         ],
         usage=result.usage,
-        metadata=result.metadata,  # pipeline, crag_verdict, agent_steps, graph_mode, ...
+        metadata=result.metadata,
     )
 
 
@@ -146,7 +144,7 @@ async def upload_document(file: UploadFile) -> Dict[str, Any]:
 async def delete_document(filename: str) -> Dict[str, Any]:
     path = DOCS_DIR / safe_filename(filename)
     try:
-        removed = await run_in_threadpool(rag().delete, str(path))  # chunks, vectors, graph entities, caches
+        removed = await run_in_threadpool(rag().delete, str(path))
     except FileNotFoundError:
         removed = 0
     if not removed and not path.exists():

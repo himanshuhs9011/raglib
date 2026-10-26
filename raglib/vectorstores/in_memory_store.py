@@ -39,7 +39,6 @@ class InMemoryVectorStore(BaseVectorStore):
         self._matrix = None  # (normalized float32 matrix, ids) snapshot, rebuilt lazily after writes
         self._lock = ReadWriteLock()
 
-    # ---------------------------------------------------------------- writes
     def clear(self) -> None:
         """Remove all stored vectors from memory."""
 
@@ -75,7 +74,6 @@ class InMemoryVectorStore(BaseVectorStore):
                 self._norms.pop(record_id, None)
             self._matrix = None
 
-    # ---------------------------------------------------------------- reads
     def count(self) -> int:
         """Return the number of stored vectors."""
 
@@ -134,7 +132,6 @@ class InMemoryVectorStore(BaseVectorStore):
                 for score, rid in scored
             ]
 
-    # ---------------------------------------------------------------- search kernels
     def _snapshot(self, np):
         """Return (normalized matrix, ids), building it once per batch of writes."""
 

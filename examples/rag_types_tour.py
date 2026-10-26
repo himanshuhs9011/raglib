@@ -20,7 +20,6 @@ DOCS = """
 
 ## Refunds
 Customers can request a refund within 30 days of purchase. Refunds are paid to the original card.
-
 ## Support
 The support team is led by Maria Chen. Maria Chen reports to the COO, David Park.
 

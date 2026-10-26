@@ -41,7 +41,6 @@ class CorrectiveRAG(BaseRAG):
         self.refine_strips = refine_strips
         self.max_strips = max_strips
 
-    # ------------------------------------------------------------------ pipeline
     def retrieve(self, ctx: PipelineContext) -> List[Document]:
         """Retrieve, grade, and route through the CRAG action paths."""
 
@@ -78,7 +77,6 @@ class CorrectiveRAG(BaseRAG):
                 merged.append(doc)
         return merged
 
-    # ------------------------------------------------------------------ evaluator
     def _grader(self) -> RelevanceGrader:
         """Return the configured grader, building a default one lazily."""
 
@@ -100,7 +98,6 @@ class CorrectiveRAG(BaseRAG):
             return VERDICT_AMBIGUOUS, ambiguous
         return VERDICT_INCORRECT, []
 
-    # ------------------------------------------------------------------ refinement
     def _knowledge_refinement(self, query: str, documents: List[Document]) -> List[Document]:
         """Decompose documents into sentence strips and keep only the relevant ones."""
 
@@ -166,7 +163,6 @@ class CorrectiveRAG(BaseRAG):
         flags = [index in chosen for index in range(len(strips))]
         return flags if any(flags) else [True] * len(strips)
 
-    # ------------------------------------------------------------------ search
     def _knowledge_search(self, ctx: PipelineContext, failed_docs: List[Document]) -> List[Document]:
         """Search external knowledge (web) or, without web, retry the corpus with a refined query."""
 

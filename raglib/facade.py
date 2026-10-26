@@ -267,7 +267,6 @@ class RAG:
         self._offline = bool(offline) if offline is not None else _env_flag(OFFLINE_ENV_VAR)
         self._top_k = top_k
 
-        # ---------------------------------------------------------------- models
         effective_chat_key = chat_api_key if chat_api_key is not None else llm_key
         self._llm_rpm = llm_rpm
         self._llm_max_retries = llm_max_retries
@@ -313,7 +312,6 @@ class RAG:
             base_url=vision_base_url,
         )
 
-        # ---------------------------------------------------------------- ingestion
         if isinstance(vector_db, str) and vector_db.strip().lower() not in SUPPORTED_VECTOR_DBS:
             raise ValueError(f"Unknown vector_db '{vector_db}'. Supported values: {sorted(SUPPORTED_VECTOR_DBS)}")
         self._loader = DocumentLoader(
@@ -346,7 +344,6 @@ class RAG:
         self._parents: Dict[str, List[str]] = {}
         self._ingest_lock = threading.RLock()  # add/update/delete are serialized; queries are not blocked
 
-        # ---------------------------------------------------------------- web
         self._web_provider = self._resolve_web_provider(
             provider_name=web_search_provider,
             api_key=web_search_api_key,
@@ -363,13 +360,11 @@ class RAG:
             else None
         )
 
-        # ---------------------------------------------------------------- graph
         self._graph_indexer = None
         self._graph_retriever = None
         if self._rag_type == "graph" or enable_graph:
             self._build_graph(graph_store=graph_store, graph_kwargs=dict(graph_kwargs or {}))
 
-        # ---------------------------------------------------------------- components
         self._evaluator = Evaluator()
         self._reranker = Reranker(
             top_k=top_k,
@@ -435,7 +430,6 @@ class RAG:
             "on" if self._graph_indexer else "off",
         )
 
-    # ================================================================== public API
     def query(
         self,
         question: str,
@@ -697,7 +691,6 @@ class RAG:
             info["graph"] = self._graph_indexer.store.stats()
         return info
 
-    # ================================================================== resolution helpers
     def _resolve_chat_llm(
         self,
         chat_llm: Optional[Union[str, BaseLLMClient, Any]],

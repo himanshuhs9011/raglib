@@ -325,7 +325,6 @@ class ChunkSplitter:
             if not chunk_text:
                 continue
             if self._count_tokens(chunk_text) > self._chunk_size * 2:
-                # Guard against oversized LLM groups.
                 chunks.extend(self._split_recursive(chunk_text))
             else:
                 chunks.append(chunk_text)

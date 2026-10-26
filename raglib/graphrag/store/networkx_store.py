@@ -34,7 +34,6 @@ class NetworkXGraphStore(BaseGraphStore):
         if path and os.path.exists(path):
             self.load(path)
 
-    # ---------------------------------------------------------------- writes
     def upsert_entities(self, entities: Sequence[Entity]) -> List[str]:
         """Insert or merge entities; returns ids whose embedding text changed."""
 
@@ -142,7 +141,6 @@ class NetworkXGraphStore(BaseGraphStore):
                     if entity is not None:
                         entity.community_ids[str(community.level)] = community.id
 
-    # ---------------------------------------------------------------- reads
     def get_entities(self, ids: Iterable[str]) -> List[Entity]:
         """Return entities by id."""
 
@@ -227,7 +225,6 @@ class NetworkXGraphStore(BaseGraphStore):
         with self._lock:
             return self._communities.get(community_id)
 
-    # ---------------------------------------------------------------- persistence
     def save(self, path: Optional[str] = None) -> None:
         """Write the graph to a JSON file (atomic replace)."""
 

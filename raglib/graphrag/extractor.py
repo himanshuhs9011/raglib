@@ -90,7 +90,6 @@ class GraphExtractor:
             self.cache[cache_key] = result.to_dict()
         return self._attach_chunk(result, chunk.id)
 
-    # ------------------------------------------------------------------ internals
     def forget(self, chunk_ids) -> None:
         """Remove cached extractions for deleted chunks (unless another live chunk has the same text)."""
 

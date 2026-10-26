@@ -48,7 +48,6 @@ class MultiQueryRetriever:
             ranked_lists = [self.retriever.retrieve(variants[0], top_k=k, **kwargs)]
         else:
             ranked_lists = parallel_map(lambda v: self.retriever.retrieve(v, top_k=k, **kwargs), variants, self.max_workers)
-        # The original query gets a higher weight than paraphrases.
         weights = [1.5] + [1.0] * (len(ranked_lists) - 1)
         fused = reciprocal_rank_fusion(ranked_lists, weights=weights)
         if self.deduplicator is not None:

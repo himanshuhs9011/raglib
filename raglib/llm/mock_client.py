@@ -88,7 +88,6 @@ class MockLLMClient(BaseLLMClient):
             return "I do not have any messages to respond to."
         return self.complete(prompt="\n".join(message.get("content", "") for message in messages))
 
-    # ------------------------------------------------------------------ handlers
     def _extract_query(self, prompt: str) -> str:
         """Extract the user query from a prompt."""
 

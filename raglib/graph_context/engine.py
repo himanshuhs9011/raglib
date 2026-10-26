@@ -81,7 +81,6 @@ class GraphContextWindow:
             llm_client=llm_client,
         )
 
-        # Central node store & fast metadata inverted indexes
         self.nodes: Dict[str, GraphNode] = {}
         self.type_index: Dict[str, List[str]] = defaultdict(list)
         self.entity_index: Dict[str, Set[str]] = defaultdict(set)
@@ -90,10 +89,6 @@ class GraphContextWindow:
         self._term_cache: Dict[str, Tuple[Set[str], Set[str]]] = {}
         self.doc_to_chunks: Dict[str, List[str]] = defaultdict(list)
         self._turn_counter: int = 0
-
-    # ------------------------------------------------------------------
-    # 1. Document Graph Ingestion (Document -> Section -> Chunk)
-    # ------------------------------------------------------------------
 
     def add_documents(self, documents: Sequence[Document]) -> List[GraphNode]:
         """Parse documents into hierarchical Document, Section, and Chunk nodes and wire links."""
@@ -161,7 +156,6 @@ class GraphContextWindow:
                 section_nodes.append(sec_node)
                 created_nodes.append(sec_node)
 
-                # Connect Section <-> Document
                 sec_node.add_connection(
                     node_id=doc_id,
                     relation="PART_OF",
@@ -213,7 +207,6 @@ class GraphContextWindow:
                     created_nodes.append(chunk_node)
                     self.doc_to_chunks[doc_id].append(chunk_id)
 
-                    # Connect Chunk <-> Section
                     chunk_node.add_connection(
                         node_id=sec_id,
                         relation="PART_OF",
@@ -231,7 +224,6 @@ class GraphContextWindow:
                         target_type="chunk",
                     )
 
-            # Finalize Document summary from its sections
             doc_keywords = self._extract_keywords(doc.content, limit=10)
             doc_entities = self._extract_entities(doc.content)
             doc_summary_parts = [s.summary for s in section_nodes[:3] if s.summary]
@@ -255,7 +247,6 @@ class GraphContextWindow:
                     target_type="document",
                 )
 
-            # Wire PREV_SECTION / NEXT_SECTION with neighbor summaries
             for idx, sec_node in enumerate(section_nodes):
                 if idx > 0:
                     prev_sec = section_nodes[idx - 1]
@@ -278,7 +269,6 @@ class GraphContextWindow:
                         target_type="section",
                     )
 
-            # Wire PREV_CHUNK / NEXT_CHUNK across the document with neighbor summaries
             for idx, chunk_node in enumerate(doc_chunk_nodes):
                 if idx > 0:
                     prev_chunk = doc_chunk_nodes[idx - 1]
@@ -301,7 +291,6 @@ class GraphContextWindow:
                         target_type="chunk",
                     )
 
-        # Wire cross-section and cross-document SHARED_ENTITY connections
         self._wire_shared_entity_links(new_chunk_nodes)
         if self._embedding is not None and new_chunk_nodes:
             vectors = self._embedding.embed_documents([node.content for node in new_chunk_nodes])
@@ -341,10 +330,6 @@ class GraphContextWindow:
             scores = {ids[i]: float(sims[i]) for i in range(len(ids))}
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]
         return {node_id: score for node_id, score in ranked if score > 0}
-
-    # ------------------------------------------------------------------
-    # 2. Chat Context Graph (Conversational Turns + Links to Doc Chunks)
-    # ------------------------------------------------------------------
 
     def add_chat_turn(
         self,
@@ -388,7 +373,6 @@ class GraphContextWindow:
         existing_turn_ids = list(self.type_index.get("chat_turn", []))
         self._register_node(turn_node)
 
-        # 1) Temporal link to immediate previous turn (PREV_TURN <-> NEXT_TURN)
         if existing_turn_ids:
             prev_turn = self.nodes.get(existing_turn_ids[-1])
             if prev_turn is not None:
@@ -409,7 +393,6 @@ class GraphContextWindow:
                     target_type="chat_turn",
                 )
 
-        # 2) Semantic topic link to older turns sharing entities/keywords (SAME_TOPIC_TURN)
         turn_terms = set(entities) | set(keywords[:6])
         for old_turn_id in existing_turn_ids:
             old_turn = self.nodes.get(old_turn_id)
@@ -438,7 +421,6 @@ class GraphContextWindow:
                     target_type="chat_turn",
                 )
 
-        # 3) Bridge links between Chat Turn and Cited Document Chunks
         for cited_id in cited_ids:
             chunk_node = self.nodes.get(cited_id)
             if chunk_node is None:
@@ -461,10 +443,6 @@ class GraphContextWindow:
             )
 
         return turn_node
-
-    # ------------------------------------------------------------------
-    # 3. Graph Navigation & Context Window Assembly
-    # ------------------------------------------------------------------
 
     def build_context_window(
         self,
@@ -489,7 +467,6 @@ class GraphContextWindow:
         wants_section = bool(raw_lower_words & _SECTION_CUES)
         is_followup = bool(raw_lower_words & _FOLLOWUP_CUES)
 
-        # Step 1: Score and select seed nodes (chunks + chat turns)
         # Only nodes sharing at least one term with the query can score > 0, so look them up in
         # the inverted index instead of scanning every node (query cost ~ matches, not graph size).
         seed_scores: Dict[str, float] = {}
@@ -513,7 +490,6 @@ class GraphContextWindow:
                     seed_scores[node_id] = seed_scores.get(node_id, 0.0) + self._semantic_weight * similarity * scale
             traversal_trace.append(f"Semantic seeding over {len(self._chunk_vectors)} embedded chunks")
 
-        # If conversational follow-up, also seed from the most recent chat turn
         chat_turn_ids = self.type_index.get("chat_turn", [])
         if include_chat_history and chat_turn_ids and (is_followup or not seed_scores):
             latest_turn_id = chat_turn_ids[-1]
@@ -536,7 +512,6 @@ class GraphContextWindow:
                 f"Seed {node_obj.node_type} '{node_id}' (score={score:.2f}, summary='{node_obj.summary}')"
             )
 
-        # Step 2: Multi-hop lookahead movement guided by ConnectedNodeRef summaries
         for hop in range(1, max_hops + 1):
             next_frontier: List[Tuple[str, float]] = []
             for current_id, current_score in frontier:
@@ -579,7 +554,6 @@ class GraphContextWindow:
             if not frontier:
                 break
 
-        # Step 3: Separate selected chat nodes and document/chunk/section nodes, then pack into token budget
         selected_doc_nodes: List[GraphNode] = []
         selected_chat_nodes: List[GraphNode] = []
 
@@ -592,13 +566,11 @@ class GraphContextWindow:
             elif node.node_type in ("chunk", "section"):
                 selected_doc_nodes.append(node)
 
-        # Fallback: if no chunk matched lexically, include top chunks from document graph
         if not selected_doc_nodes and self.type_index.get("chunk"):
             for fallback_id in self.type_index["chunk"][:top_k_seeds]:
                 selected_doc_nodes.append(self.nodes[fallback_id])
                 visited_scores[fallback_id] = 0.1
 
-        # Reserve up to 35% of budget for relevant chat turns (if any), 65%+ for document chunks
         chat_budget = int(budget * 0.35) if selected_chat_nodes else 0
         used_tokens = 0
 
@@ -668,10 +640,6 @@ class GraphContextWindow:
         result = self.build_context_window(query=query, top_k_seeds=top_k)
         return result.documents[:top_k]
 
-    # ------------------------------------------------------------------
-    # Internal Helpers: Section Extraction, LLM Chunking, Scoring
-    # ------------------------------------------------------------------
-
     def _extract_sections(self, text: str, default_title: str) -> List[Tuple[str, str]]:
         """Extract logical sections from headings or paragraphs."""
 
@@ -721,13 +689,11 @@ class GraphContextWindow:
         if not section_text.strip():
             return []
 
-        # Try enriched LLM graph chunking if strategy is 'llm' and client is provided
         if self._chunking_strategy in ("llm", "semantic", "llm_semantic") and self._llm_client is not None:
             llm_specs = self._try_llm_structured_chunks(section_title, section_text)
             if llm_specs:
                 return llm_specs
 
-        # Otherwise use ChunkSplitter (which itself supports fixed/recursive/llm) + fast summary extraction
         temp_doc = Document(id=sec_id, content=section_text, metadata={"doc_id": doc_id})
         split_docs = self._splitter.split([temp_doc])
         if not split_docs:
@@ -801,7 +767,6 @@ class GraphContextWindow:
         if not parsed_items:
             return []
 
-        # Ensure full sentence coverage
         parsed_items.sort(key=lambda item: item[0])
         covered: List[Tuple[int, int, str, List[str]]] = []
         cursor = 1
@@ -874,7 +839,6 @@ class GraphContextWindow:
                 if not shared:
                     continue
 
-                # Higher weight for cross-document entity bridges
                 cross_doc_bonus = 0.15 if other.metadata.get("doc_id") != chunk.metadata.get("doc_id") else 0.0
                 weight = min(0.9, 0.55 + 0.1 * len(shared) + cross_doc_bonus)
                 candidate_scores.append((other, shared, weight))
@@ -916,7 +880,6 @@ class GraphContextWindow:
         overlap = sorted(query_tokens & ref_terms)
         overlap_ratio = len(overlap) / max(1, len(query_tokens)) if query_tokens else 0.0
 
-        # 1) Explicit directional navigation (e.g. "what happens in the next step/chunk?")
         if wants_next and ref.relation in ("NEXT_CHUNK", "NEXT_SECTION", "NEXT_TURN"):
             return 0.55 + overlap_ratio * 0.3, f"directional NEXT cue + {ref.relation}"
         if wants_prev and ref.relation in ("PREV_CHUNK", "PREV_SECTION", "PREV_TURN"):
@@ -924,14 +887,12 @@ class GraphContextWindow:
         if wants_section and ref.relation in ("PART_OF", "HAS_CHUNK"):
             return 0.45 + overlap_ratio * 0.3, f"hierarchical section cue + {ref.relation}"
 
-        # 2) Chat-to-Document or Chat-to-Earlier-Topic bridge
         if source_node.node_type == "chat_turn":
             if ref.relation == "CITED_CHUNK" and (is_followup or overlap):
                 return 0.5 + overlap_ratio * 0.35, "chat turn cited chunk bridge"
             if ref.relation == "SAME_TOPIC_TURN" and overlap:
                 return 0.5 + overlap_ratio * 0.35, f"same-topic chat turn match ({', '.join(overlap[:3])})"
 
-        # 3) Neighbor summary / keyword match (complementary information in neighbor!)
         if overlap:
             source_terms = set(source_node.metadata.get("keywords", [])) | set(
                 source_node.metadata.get("entities", [])
@@ -942,7 +903,6 @@ class GraphContextWindow:
             reason = f"neighbor summary matched {overlap[:4]}"
             return score, reason
 
-        # 4) Immediate structural continuity when source chunk is strongly matched and adjacent
         if ref.relation == "NEXT_CHUNK" and is_followup:
             return 0.28 * ref.weight, "adjacent NEXT_CHUNK follow-up lookahead"
 
@@ -973,7 +933,6 @@ class GraphContextWindow:
             return 0.0
 
         normalized = total_hits / (len(query_tokens) * 2.5)
-        # Phrase bonus if exact 2-word query phrase appears in content or summary
         if len(raw_query_lower) > 5 and raw_query_lower in node.content.lower():
             normalized += 0.35
 

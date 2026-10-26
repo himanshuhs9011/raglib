@@ -136,7 +136,6 @@ class BaseRAG:
         self.skip_retrieval_for_smalltalk = skip_retrieval_for_smalltalk
         self.on_event = on_event
 
-    # ================================================================== entry points
     def run(
         self,
         query: str,
@@ -188,7 +187,6 @@ class BaseRAG:
         result = self.post_generate(result)
         return self._finish(ctx, result)
 
-    # ================================================================== pipeline steps
     def answer(self, ctx: PipelineContext) -> GenerationResult:
         """Default pipeline: retrieve -> process -> generate."""
 
@@ -273,7 +271,6 @@ class BaseRAG:
             meta.update(result.usage)
         return result
 
-    # ================================================================== hooks
     def pre_retrieve(self, query: str) -> str:
         """Hook executed before retrieval starts."""
 
@@ -294,7 +291,6 @@ class BaseRAG:
 
         return result
 
-    # ================================================================== helpers
     def candidate_k(self) -> Optional[int]:
         """How many candidates to retrieve: more when a real reranker will cut them down."""
 

@@ -77,7 +77,6 @@ class Generator:
         self.reorder = reorder
         self.min_doc_tokens = min_doc_tokens
 
-    # ------------------------------------------------------------------ public API
     def generate(
         self,
         query: str,
@@ -124,7 +123,6 @@ class Generator:
 
         return self._result(answer, context_docs, list(trace or []), prompt="")
 
-    # ------------------------------------------------------------------ internals
     def _result(self, answer: str, context_docs: List[Document], trace: List[str], prompt: str) -> GenerationResult:
         """Assemble the result with parsed citations and token usage."""
 

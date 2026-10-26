@@ -49,7 +49,6 @@ def test_hierarchical_document_graph_and_connected_summaries():
     )
     graph.add_documents([Document(id="arch_doc", content=doc_text, source="architecture.md")])
 
-    # Verify DocumentNode, SectionNodes, and ChunkNodes exist
     assert "arch_doc" in graph.nodes
     doc_node = graph.nodes["arch_doc"]
     assert doc_node.node_type == "document"
@@ -63,13 +62,11 @@ def test_hierarchical_document_graph_and_connected_summaries():
     assert sec1.node_type == "section"
     assert sec2.node_type == "section"
 
-    # Section 1 should link to Section 2 via NEXT_SECTION with Section 2's summary
     next_sec_refs = sec1.get_connections("NEXT_SECTION")
     assert len(next_sec_refs) == 1
     assert next_sec_refs[0].node_id == sec2.id
     assert next_sec_refs[0].summary == sec2.summary
 
-    # Chunks should link to parent section (PART_OF) and neighbors (NEXT_CHUNK / PREV_CHUNK) with summaries
     chunk_ids = graph.doc_to_chunks["arch_doc"]
     assert len(chunk_ids) >= 2
 
@@ -203,12 +200,10 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
         ),
     ]
 
-    # --- 1. Traditional Linear Chunking + Bounded FIFO Memory (max_turns=2) ---
     linear_splitter = ChunkSplitter(chunk_size=22, overlap=3, strategy="recursive")
     linear_chunks = linear_splitter.split(corpus)
     fifo_memory = MemoryModule(max_turns=2)
 
-    # --- 2. Standalone GraphContextWindow ---
     graph = GraphContextWindow(
         llm_client=MockLLMClient(),
         chunking_strategy="recursive",
@@ -221,7 +216,6 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
     crag_chunk_2 = graph.nodes[graph.doc_to_chunks["doc_crag"][1]]
     chroma_chunk_1 = graph.nodes[graph.doc_to_chunks["doc_chroma"][0]]
 
-    # Turn 1 & Turn 2: User asks about Topic A (CorrectiveRAG)
     t1_q = "What is the Evaluator threshold in CorrectiveRAG?"
     t1_a = "CorrectiveRAG uses an Evaluator threshold of 0.75 to filter retrieved documents."
     fifo_memory.add(t1_q, t1_a, [ Document(id=crag_chunk_1.id, content=crag_chunk_1.content) ])
@@ -232,7 +226,6 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
     fifo_memory.add(t2_q, t2_a, [ Document(id=crag_chunk_1.id, content=crag_chunk_1.content) ])
     graph.add_chat_turn(t2_q, t2_a, cited_documents=[Document(id=crag_chunk_1.id, content=crag_chunk_1.content)])
 
-    # Turn 3 & Turn 4: User switches to Topic B (ChromaVectorStore)
     t3_q = "How does ChromaVectorStore store embeddings?"
     t3_a = "ChromaVectorStore persists embeddings on disk using HNSW segments."
     fifo_memory.add(t3_q, t3_a, [ Document(id=chroma_chunk_1.id, content=chroma_chunk_1.content) ])
@@ -243,7 +236,6 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
     fifo_memory.add(t4_q, t4_a, [ Document(id=chroma_chunk_1.id, content=chroma_chunk_1.content) ])
     graph.add_chat_turn(t4_q, t4_a, cited_documents=[Document(id=chroma_chunk_1.id, content=chroma_chunk_1.content)])
 
-    # Turn 5: User returns to Topic A and asks what happens NEXT after the Evaluator check fails
     followup_query = "Going back to CorrectiveRAG, what happens next after that Evaluator threshold check fails?"
 
     # Check FIFO Memory: Turn 1 and Turn 2 were evicted by Turn 3 and Turn 4!
@@ -251,7 +243,6 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
     assert "CorrectiveRAG" not in fifo_context
     assert "ChromaVectorStore" in fifo_context
 
-    # Check Flat Linear Chunk: linear_chunks[0] has no link or summary of linear_chunks[1]
     assert "connected_nodes" not in linear_chunks[0].metadata
 
     # Check GraphContextWindow:

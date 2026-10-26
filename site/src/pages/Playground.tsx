@@ -139,7 +139,6 @@ export function Playground() {
       </div>
 
       <div className="pg">
-        {/* ------------------------------------------------------------ input */}
         <div className="panel">
           <div className="panel-head">
             <span className="label">1 · Document</span>
@@ -216,7 +215,6 @@ export function Playground() {
           </div>
         </div>
 
-        {/* ------------------------------------------------------------ output */}
         <div className="panel">
           <div className="panel-head">
             <span className="label">2 · Ask</span>

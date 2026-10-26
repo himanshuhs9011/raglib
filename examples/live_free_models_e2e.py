@@ -47,7 +47,6 @@ def make_rag(**kw):
     return RAG(llm=CHAT, llm_fallbacks=FALLBACKS or None, embedding_llm=EMBED, llm_timeout=120, llm_max_retries=3, **kw)
 
 
-# ------------------------------------------------------------------ haystack
 NEEDLES = {
     "bluefin": "Project Bluefin's launch authorization code is 7-Kestrel-42 and it is stored only in the vault ledger.",
     "reykjavik": "For conferences held in Reykjavik, the maximum travel reimbursement is 1,840 euros per trip.",
@@ -100,7 +99,6 @@ def build_haystack(path):
                              f"confirm with their manager, and record completion in the HR system within {rnd.randint(2, 20)} days. "
                              f"Questions go to the {rnd.choice(['people', 'IT', 'facilities', 'finance'])} help desk."))
     rnd.shuffle(sections)
-    # Needles at different depths (10%, 35%, 60%, 90%).
     for depth, key in zip([0.1, 0.35, 0.6, 0.9], NEEDLES):
         title = {"bluefin": "Project Bluefin", "reykjavik": "Travel policy - Reykjavik",
                  "generator": "Facilities - Building C", "okafor": "Staff profile - Dr. Amara Okafor"}[key]
@@ -223,7 +221,6 @@ def stage_context():
                       "tokens": result.total_tokens}
     print("graph build ms:", build_ms, "nodes:", len(gcw.nodes) if hasattr(gcw, "nodes") else "?")
     print("needle in context window:", json.dumps(ranks))
-    # One real answer: question -> graph context window -> free LLM.
     from raglib.facade import RAG as _RAG
 
     llm = _RAG(llm=CHAT, llm_fallbacks=FALLBACKS or None, embedding_llm="none", llm_timeout=120, llm_max_retries=3)._llm

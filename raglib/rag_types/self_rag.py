@@ -92,7 +92,6 @@ class SelfRAG(BaseRAG):
     def _state(self, value: Optional[RunState]) -> None:
         self._local.state = value
 
-    # ------------------------------------------------------------------ state machine
     def answer(self, ctx: PipelineContext) -> GenerationResult:
         """Execute the Self-RAG graph."""
 
@@ -143,7 +142,6 @@ class SelfRAG(BaseRAG):
             state.trace.append("END")
             return self._finalize(ctx, state)
 
-    # ------------------------------------------------------------------ nodes
     def _retrieve(self, ctx: PipelineContext, state: RunState) -> None:
         """Retrieve for the active query."""
 
@@ -236,7 +234,6 @@ class SelfRAG(BaseRAG):
         self._state = None
         return self.post_generate(result)
 
-    # ------------------------------------------------------------------ judges
     def _call(self, prompt: str) -> Optional[str]:
         """Call the judge LLM within the per-run budget; None when unavailable/exhausted/failed."""
 
@@ -348,7 +345,6 @@ class SelfRAG(BaseRAG):
             return self.refiner.refine(query, [])
         return query
 
-    # ------------------------------------------------------------------ utilities
     def _lexical_relevance(self, query: str, documents: Sequence[Document]) -> str:
         """Fallback relevance verdict without an LLM."""
 

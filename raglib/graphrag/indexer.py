@@ -71,7 +71,6 @@ class GraphIndexer:
         self._dirty = False
         self._lock = threading.RLock()
 
-    # ------------------------------------------------------------------ ingestion
     def add_chunks(self, chunks: Sequence[Document]) -> Dict[str, int]:
         """Extract and merge graph fragments for chunks not yet indexed."""
 
@@ -164,7 +163,6 @@ class GraphIndexer:
             ]
         )
 
-    # ------------------------------------------------------------------ communities
     @property
     def is_dirty(self) -> bool:
         """True when the graph changed since communities were last built."""
@@ -192,7 +190,6 @@ class GraphIndexer:
             self._chunks_since_rebuild = 0
             return communities
 
-    # ------------------------------------------------------------------ query-time helpers
     def entity_search(self, query: str, top_k: int = 8) -> List[Tuple[Entity, float]]:
         """Find the entities most related to the query (vector search, else lexical match)."""
 
@@ -213,7 +210,6 @@ class GraphIndexer:
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored[:top_k]
 
-    # ------------------------------------------------------------------ persistence
     def save(self, directory: str) -> None:
         """Persist graph, extraction cache, indexed chunk ids and entity vectors."""
 

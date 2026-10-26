@@ -1,4 +1,3 @@
-/** Square, pixel-grid "R" mark (retro, black and white). */
 export function Logo({ size = 28, className }: { size?: number; className?: string }) {
   return (
     <svg

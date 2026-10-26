@@ -18,7 +18,6 @@ class BaseGraphStore(ABC):
     (union of source chunk ids, merged descriptions, summed relation weights).
     """
 
-    # ---------------------------------------------------------------- writes
     @abstractmethod
     def upsert_entities(self, entities: Sequence[Entity]) -> List[str]:
         """Insert or merge entities; returns ids whose embedding text changed."""
@@ -35,7 +34,6 @@ class BaseGraphStore(ABC):
     def set_communities(self, communities: Sequence[Community]) -> None:
         """Replace all communities (and the entity -> community assignments)."""
 
-    # ---------------------------------------------------------------- reads
     @abstractmethod
     def get_entities(self, ids: Iterable[str]) -> List[Entity]:
         """Return entities by id (missing ids are skipped)."""
@@ -64,7 +62,6 @@ class BaseGraphStore(ABC):
     def degree(self, entity_id: str) -> int:
         """Return the number of relations touching an entity."""
 
-    # ---------------------------------------------------------------- lifecycle
     def get_entity(self, entity_id: str) -> Optional[Entity]:
         """Return one entity or None."""
 

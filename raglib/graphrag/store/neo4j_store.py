@@ -59,7 +59,6 @@ class Neo4jGraphStore(BaseGraphStore):
         with self._driver.session(database=self._database) as session:
             return [record.data() for record in session.run(query, namespace=self.namespace, **params)]
 
-    # ---------------------------------------------------------------- writes
     def upsert_entities(self, entities: Sequence[Entity]) -> List[str]:
         """Merge entities; descriptions are merged client-side to keep them bounded."""
 
@@ -171,7 +170,6 @@ class Neo4jGraphStore(BaseGraphStore):
                 rows=rows,
             )
 
-    # ---------------------------------------------------------------- reads
     @staticmethod
     def _entity(row: Dict[str, Any]) -> Entity:
         """Build an Entity from a Cypher row."""
