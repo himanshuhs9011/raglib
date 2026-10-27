@@ -41,6 +41,8 @@ class GraphRAG(BaseRAG):
         mode = self.graph_retriever.resolve_mode(ctx.search_query, self.search_mode)
         ctx.trace.append(f"graph_mode:{mode}")
         ctx.metadata["graph_mode"] = mode
+        
+        
         graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode)
         if mode == "global":
             ctx.trace.append(f"global_points:{len(graph_docs)}")
