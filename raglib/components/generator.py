@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import ntpath
 import re
 from dataclasses import replace
 from typing import Iterator, List, Optional, Tuple
@@ -22,7 +22,7 @@ def source_label(doc: Document) -> str:
     meta = doc.metadata or {}
     label = meta.get("title") or meta.get("source")
     if not label and meta.get("file"):
-        label = os.path.basename(str(meta["file"]))
+        label = ntpath.basename(str(meta["file"]))  # splits on / and \ on every OS
     label = str(label or meta.get("url") or doc.source or doc.id)
     if meta.get("page") is not None:
         label = f"{label} p.{meta['page']}"
