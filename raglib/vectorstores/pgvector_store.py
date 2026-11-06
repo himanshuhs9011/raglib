@@ -62,11 +62,11 @@ def filter_to_sql(filters: Optional[MetadataFilter]) -> Tuple[str, List[Any]]:
                 symbol = _COMPARISONS[operator]
                 if isinstance(expected, (int, float)) and not isinstance(expected, bool):
                     clauses.append(
-                        f"(CASE WHEN jsonb_typeof(metadata -> %s) = 'number' THEN (metadata ->> %s)::numeric END) {symbol} %s"
+                        f"(CASE WHEN jsonb_typeof(metadata -> %s::text) = 'number' THEN (metadata ->> %s::text)::numeric END) {symbol} %s::numeric"
                     )
                     params.extend([key, key, expected])
                 else:
-                    clauses.append(f"(metadata ->> %s) {symbol} %s")
+                    clauses.append(f"(metadata ->> %s::text) {symbol} %s::text")
                     params.extend([key, str(expected)])
             else:
                 raise ValueError(f"Unsupported metadata filter operator '{operator}'")
@@ -127,7 +127,7 @@ class PGVectorStore(BaseVectorStore):
         """Read the vector size of an existing table."""
 
         row = self._execute(
-            "SELECT atttypmod FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = 'embedding'",
+            "SELECT atttypmod FROM pg_attribute WHERE attrelid = to_regclass(%s::text) AND attname = 'embedding'",
             [self._table],
         ).fetchone()
         return int(row[0]) if row and row[0] and row[0] > 0 else None
@@ -190,7 +190,7 @@ class PGVectorStore(BaseVectorStore):
 
         id_list = list(ids)
         if id_list and self._dimension is not None:
-            self._execute(f"DELETE FROM {self._table} WHERE id = ANY(%s)", [id_list])
+            self._execute(f"DELETE FROM {self._table} WHERE id = ANY(%s::text[])", [id_list])
 
     def count(self) -> int:
         """Return the number of stored vectors."""
@@ -205,7 +205,7 @@ class PGVectorStore(BaseVectorStore):
         id_list = list(ids)
         if not id_list or self._dimension is None:
             return set()
-        return {row[0] for row in self._execute(f"SELECT id FROM {self._table} WHERE id = ANY(%s)", [id_list])}
+        return {row[0] for row in self._execute(f"SELECT id FROM {self._table} WHERE id = ANY(%s::text[])", [id_list])}
 
     def get_embeddings(self, ids: Iterable[str]) -> Dict[str, List[float]]:
         """Return stored vectors by id."""
@@ -213,7 +213,7 @@ class PGVectorStore(BaseVectorStore):
         id_list = list(ids)
         if not id_list or self._dimension is None:
             return {}
-        rows = self._execute(f"SELECT id, embedding::text FROM {self._table} WHERE id = ANY(%s)", [id_list])
+        rows = self._execute(f"SELECT id, embedding::text FROM {self._table} WHERE id = ANY(%s::text[])", [id_list])
         return {row[0]: [float(value) for value in row[1].strip("[]").split(",") if value] for row in rows}
 
     def query(self, query_embedding: List[float], top_k: int, filters: Optional[MetadataFilter] = None) -> List[VectorHit]:
@@ -230,7 +230,7 @@ class PGVectorStore(BaseVectorStore):
         vector = _vector_literal(query_embedding)
         rows = self._execute(
             f"SELECT id, content, metadata, 1 - (embedding <=> %s::vector) AS score FROM {self._table} "
-            f"WHERE {where} ORDER BY embedding <=> %s::vector LIMIT %s",
+            f"WHERE {where} ORDER BY embedding <=> %s::vector LIMIT %s::integer",
             [vector, *params, vector, int(top_k)],
         )
         hits = []
