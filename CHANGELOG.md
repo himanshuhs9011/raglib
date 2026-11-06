@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (2.1.0)
+## 2.1.0 - 2026-11-06
 
 Fixes and improvements from a full library review.
 
