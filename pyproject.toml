@@ -54,6 +54,8 @@ cohere = ["cohere>=5.0.0"]
 fast = ["numpy>=1.24", "tiktoken>=0.5.0"]
 # storage
 chroma = ["chromadb>=0.5.0"]
+qdrant = ["qdrant-client>=1.10.0"]
+pgvector = ["psycopg[binary]>=3.1"]
 graph = ["networkx>=3.0"]
 leiden = ["networkx>=3.0", "graspologic>=3.3"]
 neo4j = ["neo4j>=5.0", "networkx>=3.0"]
@@ -61,6 +63,7 @@ neo4j = ["neo4j>=5.0", "networkx>=3.0"]
 pdf = ["PyMuPDF>=1.23.0"]
 docx = ["python-docx>=1.0.0"]
 pptx = ["python-pptx>=0.6.21"]
+xlsx = ["openpyxl>=3.1"]
 ocr = ["pytesseract>=0.3.10", "Pillow>=10.0.0"]
 # web search
 web = ["ddgs>=6.0.0"]
@@ -91,6 +94,7 @@ all = [
   "PyMuPDF>=1.23.0",
   "python-docx>=1.0.0",
   "python-pptx>=0.6.21",
+  "openpyxl>=3.1",
   "ddgs>=6.0.0",
 ]
 dev = [
@@ -100,6 +104,7 @@ dev = [
   "build>=1.0.0",
   "twine>=4.0.0",
   "networkx>=3.0",
+  "mypy>=1.8",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -112,6 +117,24 @@ include = [
   "LICENSE",
   "pyproject.toml",
 ]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 130
+extend-exclude = ["site", "dist"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle errors, import sorting, bugbear-lite. Pyupgrade (UP) rules are off:
+# typing.List/Optional are kept deliberately for Python 3.9 support.
+select = ["E", "F", "I", "B006", "B008", "B904"]
+ignore = ["E501", "E731", "E741", "E402"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = false
+no_implicit_optional = false
+check_untyped_defs = false
 
 [tool.pytest.ini_options]
 markers = [

@@ -24,16 +24,23 @@ from raglib.components import (
     Reranker,
     Retriever,
     RouterRetriever,
+    SQLiteConversationStore,
+    SQLTool,
     Tool,
     WebRetriever,
 )
 from raglib.core.base import BaseRAG
 from raglib.facade import RAG
-from raglib.quick import ask
-from raglib.graph_context import ConnectedNodeRef, GraphContextResult, GraphContextWindow, GraphNode
+from raglib.graph_context import (
+    ConnectedNodeRef,
+    GraphContextResult,
+    GraphContextWindow,
+    GraphNode,
+)
 from raglib.llm.base_client import BaseLLMClient, CachedLLMClient
 from raglib.llm.mock_client import MockLLMClient
 from raglib.loaders.chunk_splitter import ChunkSplitter
+from raglib.quick import ask
 from raglib.rag_types import (
     AdvancedRAG,
     AgenticRAG,
@@ -49,7 +56,14 @@ from raglib.rag_types import (
     ToolAugmentedRAG,
     WebRAG,
 )
-from raglib.schemas import Citation, Document, GenerationResult, QueryResult, RetrievalContext, TraceEvent
+from raglib.schemas import (
+    Citation,
+    Document,
+    GenerationResult,
+    QueryResult,
+    RetrievalContext,
+    TraceEvent,
+)
 
 __all__ = [
     "RAG",
@@ -88,6 +102,8 @@ __all__ = [
     "ContextReducer",
     "Generator",
     "Tool",
+    "SQLTool",
+    "SQLiteConversationStore",
     "NaiveRAG",
     "AdvancedRAG",
     "CorrectiveRAG",

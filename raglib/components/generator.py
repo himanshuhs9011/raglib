@@ -8,6 +8,7 @@ import re
 from dataclasses import replace
 from typing import Iterator, List, Optional, Tuple
 
+from raglib.core.runtime import UsageMeter, usage_scope
 from raglib.core.text import count_tokens, truncate_to_tokens
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Citation, Document, GenerationResult
@@ -88,9 +89,10 @@ class Generator:
 
         trace = list(reasoning_trace) if reasoning_trace is not None else []
         context_docs, prompt = self.build_prompt(query, documents, memory_context)
-        answer = self.llm_client.complete(prompt=prompt, system=self.system_prompt)
+        with usage_scope() as meter:
+            answer = self.llm_client.complete(prompt=prompt, system=self.system_prompt)
         trace.append(f"generated_with_docs={len(context_docs)}")
-        return self._result(answer, context_docs, trace, prompt)
+        return self._result(answer, context_docs, trace, prompt, meter)
 
     def stream(
         self,
@@ -118,23 +120,49 @@ class Generator:
         )
         return context_docs, prompt
 
-    def finalize(self, answer: str, context_docs: List[Document], trace: Optional[List[str]] = None) -> GenerationResult:
+    def finalize(
+        self,
+        answer: str,
+        context_docs: List[Document],
+        trace: Optional[List[str]] = None,
+        meter: Optional[UsageMeter] = None,
+    ) -> GenerationResult:
         """Build a GenerationResult (with citations) from a streamed answer."""
 
-        return self._result(answer, context_docs, list(trace or []), prompt="")
+        return self._result(answer, context_docs, list(trace or []), prompt="", meter=meter)
 
-    def _result(self, answer: str, context_docs: List[Document], trace: List[str], prompt: str) -> GenerationResult:
-        """Assemble the result with parsed citations and token usage."""
+    def _result(
+        self,
+        answer: str,
+        context_docs: List[Document],
+        trace: List[str],
+        prompt: str,
+        meter: Optional[UsageMeter] = None,
+    ) -> GenerationResult:
+        """Assemble the result with parsed citations and token usage of the answer call.
 
+        ``prompt_tokens`` / ``completion_tokens`` are the provider's counts when it reports
+        them (``generation_usage_estimated`` is then False), otherwise local estimates.
+        """
+
+        if meter is not None and meter.llm_calls and not meter.estimated_calls:
+            usage = {
+                "prompt_tokens": meter.prompt_tokens,
+                "completion_tokens": meter.completion_tokens,
+                "generation_usage_estimated": False,
+            }
+        else:
+            usage = {
+                "prompt_tokens": count_tokens(prompt) + count_tokens(self.system_prompt) if prompt else 0,
+                "completion_tokens": count_tokens(answer),
+                "generation_usage_estimated": True,
+            }
         return GenerationResult(
             answer=answer,
             sources=context_docs,
             reasoning_trace=trace,
             citations=self.extract_citations(answer, context_docs),
-            usage={
-                "prompt_tokens": count_tokens(prompt) + count_tokens(self.system_prompt) if prompt else 0,
-                "completion_tokens": count_tokens(answer),
-            },
+            usage=usage,
         )
 
     @staticmethod

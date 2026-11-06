@@ -14,6 +14,7 @@ from typing import Any, List, Optional, Sequence
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.intents import is_greeting
 from raglib.core.parsing import parse_label
+from raglib.core.runtime import report_degraded
 from raglib.core.text import token_set
 from raglib.schemas import Document, GenerationResult
 
@@ -249,7 +250,7 @@ class SelfRAG(BaseRAG):
         try:
             return self.llm_client.complete(prompt)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("SelfRAG judge call failed: %s", exc)
+            report_degraded("self_rag_judge", exc, logger)
             if state is not None:
                 state.trace.append("judge_error")
             return None

@@ -25,11 +25,25 @@ class MockLLMClient(BaseLLMClient):
     """Deterministic offline LLM for tests and demos (no network, no API keys)."""
 
     def complete(self, prompt: str, system: str = "") -> str:
-        """Return a deterministic completion keyed on the prompt's purpose."""
+        """Return a deterministic completion keyed on the prompt's purpose (usage is estimated)."""
+
+        from raglib.core.runtime import record_usage
+        from raglib.core.text import count_tokens
+
+        answer = self._respond(prompt, system)
+        record_usage(count_tokens(f"{system}\n{prompt}"), count_tokens(answer), estimated=True)
+        return answer
+
+    def _respond(self, prompt: str, system: str = "") -> str:
+        """Pick the templated response for this prompt."""
 
         text = f"{system}\n{prompt}"
         lower = text.lower()
 
+        # The answer prompt embeds document text, which may contain any keyword below
+        # ("chunking", "rewrite", ...), so recognise it first by its fixed final instruction.
+        if "<sources>" in prompt and prompt.rstrip().endswith("answer with citations:"):
+            return self._answer_response(prompt)
         if "standalone question" in lower:
             return self._extract_query(prompt)
         if "grade each retrieved document" in lower:

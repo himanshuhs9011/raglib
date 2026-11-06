@@ -7,6 +7,7 @@ from typing import Any, Callable, List, Optional
 
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import reciprocal_rank_fusion
+from raglib.core.runtime import report_degraded
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class ToolAugmentedRAG(BaseRAG):
             try:
                 tool_docs = list(self.tool_call_hook(ctx.search_query, retrieved) or [])
             except Exception as exc:  # noqa: BLE001
-                logger.warning("tool_call_hook failed: %s", exc)
+                report_degraded("tool_call_hook", exc, logger)
                 ctx.trace.append("tool_hook_failed")
         ctx.trace.append(f"tool_docs:{len(tool_docs)}")
         if not tool_docs:

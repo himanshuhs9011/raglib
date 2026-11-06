@@ -6,6 +6,7 @@ import logging
 import re
 from typing import List, Optional, Sequence
 
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -33,7 +34,7 @@ class Planner:
         try:
             raw = self.llm_client.complete(prompt=prompt)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Planner failed: %s", exc)
+            report_degraded("planner", exc, logger)
             raw = ""
         sub_queries: List[str] = []
         for line in raw.splitlines():

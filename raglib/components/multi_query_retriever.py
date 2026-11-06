@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional
 
-from raglib.core.concurrency import parallel_map
 from raglib.components.deduplicator import Deduplicator
 from raglib.components.query_expander import QueryExpander
 from raglib.components.retriever import Retriever
+from raglib.core.concurrency import parallel_map
 from raglib.core.fusion import reciprocal_rank_fusion
 from raglib.schemas import Document
 

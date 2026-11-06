@@ -18,7 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from typing import Generator as GeneratorType
 
 from raglib.components.context_reducer import ContextReducer
 from raglib.components.decision import (
@@ -46,6 +47,7 @@ from raglib.components.retriever import Retriever
 from raglib.components.router_retriever import RouterRetriever
 from raglib.components.web_retriever import WebRetriever
 from raglib.core.intents import is_greeting
+from raglib.core.runtime import RunState, UsageMeter, run_scope, usage_scope
 from raglib.core.tracing import Tracer
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document, GenerationResult, TraceEvent
@@ -68,6 +70,8 @@ class PipelineContext:
     history: str = ""
     trace: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    usage: Optional[UsageMeter] = None
+    run_state: Optional[RunState] = None
 
 
 class BaseRAG:
@@ -105,8 +109,13 @@ class BaseRAG:
         use_memory: bool = False,
         skip_retrieval_for_smalltalk: bool = True,
         on_event: Optional[Callable[[TraceEvent], None]] = None,
+        strict: bool = False,
     ):
-        """Initialize optional pipeline components via dependency injection."""
+        """Initialize optional pipeline components via dependency injection.
+
+        ``strict=True`` re-raises failures of optional steps instead of degrading
+        (degradations are otherwise listed in ``result.metadata["degraded"]``).
+        """
 
         self.retriever = retriever
         self.web_retriever = web_retriever
@@ -135,6 +144,7 @@ class BaseRAG:
         self.use_memory = use_memory
         self.skip_retrieval_for_smalltalk = skip_retrieval_for_smalltalk
         self.on_event = on_event
+        self.strict = strict
 
     def run(
         self,
@@ -144,9 +154,11 @@ class BaseRAG:
     ) -> GenerationResult:
         """Execute the pipeline for one query and return the answer with sources."""
 
-        ctx = self._start(query, session_id, filters)
-        result = self.answer(ctx)
-        return self._finish(ctx, result)
+        with run_scope(self.strict) as state, usage_scope() as meter:
+            ctx = self._start(query, session_id, filters)
+            ctx.usage, ctx.run_state = meter, state
+            result = self.answer(ctx)
+            return self._finish(ctx, result)
 
     async def arun(
         self,
@@ -163,7 +175,7 @@ class BaseRAG:
         query: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
-    ) -> Iterator[str]:
+    ) -> GeneratorType[str, None, Optional[GenerationResult]]:
         """Yield answer tokens; the generator's return value is the final GenerationResult.
 
         Strategies that loop over generation (e.g. Self-RAG) yield the final answer once.
@@ -174,18 +186,22 @@ class BaseRAG:
             yield result.answer
             return result
 
-        ctx = self._start(query, session_id, filters)
-        documents = self._prepare_documents(ctx)
-        with ctx.tracer.stage("generate", streaming=True) as meta:
-            context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
-            parts: List[str] = []
-            for token in tokens:
-                parts.append(token)
-                yield token
-            meta["docs"] = len(context_docs)
-        result = self.generator.finalize("".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"])
-        result = self.post_generate(result)
-        return self._finish(ctx, result)
+        with run_scope(self.strict) as state, usage_scope() as meter:
+            ctx = self._start(query, session_id, filters)
+            ctx.usage, ctx.run_state = meter, state
+            documents = self._prepare_documents(ctx)
+            with ctx.tracer.stage("generate", streaming=True) as meta, usage_scope() as generation:
+                context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
+                parts: List[str] = []
+                for token in tokens:
+                    parts.append(token)
+                    yield token
+                meta["docs"] = len(context_docs)
+            result = self.generator.finalize(
+                "".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
+            )
+            result = self.post_generate(result)
+            return self._finish(ctx, result)
 
     def answer(self, ctx: PipelineContext) -> GenerationResult:
         """Default pipeline: retrieve -> process -> generate."""
@@ -210,7 +226,12 @@ class BaseRAG:
         return self.pre_generate(ctx.search_query, documents)
 
     def retrieve(self, ctx: PipelineContext) -> List[Document]:
-        """Default retrieval: optional decision engine routing + corrective refine loop."""
+        """Default retrieval for custom subclasses: decision-engine routing + evaluate/refine loop.
+
+        Every built-in ``rag_type`` overrides this step with its own strategy, so the
+        ``DecisionEngine`` and the lexical evaluate -> refine retry loop below only run in
+        your own ``BaseRAG`` subclasses that do not override ``retrieve``.
+        """
 
         mode = RETRIEVAL_VECTOR
         if self.uses_decision_engine and self.decision_engine is not None:
@@ -368,6 +389,11 @@ class BaseRAG:
                 memory.add(query=ctx.query, answer=result.answer, documents=result.sources)
         result.trace_events = list(ctx.tracer.events)
         result.usage = {**result.usage, "latency_ms": ctx.tracer.total_latency_ms()}
+        if ctx.usage is not None:
+            # Totals over every LLM call of the run (grading, routing, rewriting, generation, ...).
+            result.usage.update(ctx.usage.as_dict())
+        if ctx.run_state is not None and ctx.run_state.degraded:
+            ctx.metadata["degraded"] = list(ctx.run_state.degraded)
         # Pipeline diagnostics (crag_verdict, agent_steps, hop_queries, graph_mode, ...) are part of the
         # result; internal Document lists stay out so metadata remains JSON-serializable.
         diagnostics = {key: value for key, value in ctx.metadata.items() if key not in _INTERNAL_METADATA}

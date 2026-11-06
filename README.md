@@ -52,9 +52,12 @@ pip install "raglib-py[hf]"              # local HuggingFace / SentenceTransform
 pip install "raglib-py[rerank]"          # cross-encoder reranker (bge-reranker)
 pip install "raglib-py[fast]"            # numpy vector math + tiktoken token counting
 pip install "raglib-py[chroma]"          # persistent ChromaDB vector store
+pip install "raglib-py[qdrant]"          # Qdrant vector store (in-process, on-disk or server)
+pip install "raglib-py[pgvector]"        # PostgreSQL + pgvector vector store
 pip install "raglib-py[graph]"           # GraphRAG community detection (networkx)
 pip install "raglib-py[neo4j]"           # Neo4j graph store
 pip install "raglib-py[pdf,docx,pptx]"   # document loaders
+pip install "raglib-py[xlsx]"            # Excel workbooks (loader + SQLTool)
 pip install "raglib-py[web]"             # DuckDuckGo web search
 pip install "raglib-py[tavily,serpapi]"  # Tavily & SerpAPI SDKs
 ```
@@ -187,13 +190,15 @@ rag = RAG(
     offline=None,                       # True -> explicit mock models (or RAGLIB_OFFLINE=1)
     llm_cache=True,                     # LRU cache for identical (system, prompt) LLM calls
     llm_timeout=60.0, llm_max_retries=2,  # per-call timeout + exponential-backoff retries
+    llm_temperature=0.0,                # sampling temperature for models built from a provider name
+    llm_max_tokens=None,                # cap on answer length (mapped to each provider's parameter)
     # ---- pipeline
     rag_type="advanced",                # One of the 14 RAG architectures
     top_k=5,                            # Documents passed to generation
     max_context_tokens=3000,            # Generation context budget (tiktoken when installed)
     rewrite_query=False,                # LLM query rewriting before retrieval
     # ---- chunking
-    chunk_size=400, chunk_overlap=50,   # words
+    chunk_size=400, chunk_overlap=50,   # words (each Chinese/Japanese/Thai character counts as one); a hard limit
     chunking_strategy="fixed",          # "fixed" | "recursive" | "llm"
     # ---- retrieval
     retrieval_mode=None,                # "hybrid" (default with embeddings) | "dense" | "sparse"
@@ -204,11 +209,12 @@ rag = RAG(
     neighbor_window=0,                  # small-to-big: attach N neighbouring chunks to each hit
     reranker="none",                    # "none" | "cross_encoder" | "cohere" | "llm"
     reranker_model=None, reranker_api_key=None,
-    vector_db=None,                     # "memory" (default) | "chroma" | BaseVectorStore
+    vector_db=None,                     # "memory" (default) | "chroma" | "qdrant" | "pgvector" | BaseVectorStore
     vector_db_kwargs=None,              # e.g. {"persist_directory": "...", "collection_name": "...", "host": ...}
     # ---- memory
     memory=None,                        # True to enable conversation memory for any rag_type
     max_history_turns=10, max_history_tokens=1200,
+    conversation_store=None,            # e.g. SQLiteConversationStore("chats.db") to persist sessions
     # ---- web search (OFF unless configured)
     web_search_provider=None,           # "duckduckgo" | "local" | "tavily" | "serpapi" | "brave" | "bing" | "google_cse" | "exa" | "searxng"
     web_search_api_key=None, web_search_base_url=None, web_search_cse_id=None,
@@ -218,7 +224,8 @@ rag = RAG(
     graph_store=None,                   # "networkx" (default) | "neo4j" | BaseGraphStore
     graph_kwargs=None,                  # see section 8
     # ---- agents & observability
-    tools=None,                         # [Tool(...)] for rag_type="agentic"
+    tools=None,                         # [Tool(...), SQLTool(...)] for rag_type="agentic"
+    strict=False,                       # True: raise when an optional step fails instead of degrading
     on_event=None,                      # callback(TraceEvent) for every pipeline stage
     output_dir=None,                    # write each query result as JSON
     **rag_type_kwargs,                  # forwarded to the orchestrator (e.g. max_hops=3, search_mode="global")
@@ -234,7 +241,7 @@ rag = RAG(
 | `await rag.aquery(question, ...)` | Async query. |
 | `rag.add(source) -> int` | Idempotent upsert: unchanged documents are skipped, changed ones replace their old chunks. Returns new chunks indexed. |
 | `rag.update(source)` / `rag.delete(source)` | Re-ingest changed sources / remove every chunk (and graph entity) from a source. |
-| `rag.save(dir)` / `rag.load(dir)` | Persist and restore the chunk index, in-memory vectors and knowledge graph without re-embedding. |
+| `rag.save(dir)` / `rag.load(dir, allow_model_change=False)` | Persist and restore the chunk index, in-memory vectors and knowledge graph without re-embedding. Files are written atomically; `load` refuses an index built with a different embedding model (pass `allow_model_change=True` to re-embed). |
 | `rag.reset_memory(session_id=None)` | Clear one conversation (or all). |
 | `rag.evaluate(dataset, judge_llm=None)` | Retrieval + answer-quality metrics (section 13). |
 | `rag.rebuild_graph_communities()` | Re-cluster the knowledge graph and refresh changed community reports. |
@@ -253,12 +260,18 @@ rag = RAG(
 | **PDF file** (`.pdf`) | `"report.pdf"` | `PDFLoader` (one document per page; scanned pages via `vision_llm` OCR, otherwise skipped with a warning) |
 | **Word file** (`.docx`) | `"spec.docx"` | `WordLoader` |
 | **PowerPoint** (`.pptx`) | `"slides.pptx"` | `PPTXLoader` (one document per slide) |
-| **Text / Markdown** (`.txt`, `.md`) | `"notes.md"` | `TextLoader` |
-| **Web URL** (`http://`, `https://`) | `"https://example.com/docs"` | `WebLoader` (strips `<script>`/`<style>` and extracts visible text) |
+| **Text / Markdown** (`.txt`, `.md`, `.rst`, `.log`, ...) | `"notes.md"` | `TextLoader` |
+| **Source code & config** (`.py`, `.js`, `.ts`, `.java`, `.go`, `.sql`, `.yaml`, `.toml`, ...) | `"src/"` | `TextLoader` |
+| **HTML file** (`.html`, `.htm`) | `"page.html"` | `HTMLFileLoader` (headings, lists and tables kept; nav/footer dropped; title in metadata) |
+| **CSV / TSV** | `"people.csv"` | `CSVLoader` (one `column: value; ...` line per row) |
+| **JSON / JSONL** | `"items.jsonl"` | `JSONLoader` (one line per record; other JSON pretty-printed) |
+| **Excel** (`.xlsx`) | `"sales.xlsx"` | `XLSXLoader` (one document per sheet; `pip install raglib-py[xlsx]`) |
+| **EPUB** (`.epub`) | `"book.epub"` | `EPUBLoader` (one document per chapter, in reading order) |
+| **Web URL** (`http://`, `https://`) | `"https://example.com/docs"` | `WebLoader` (keeps headings, paragraphs, lists and tables; prefers `<main>`/`<article>`; drops nav/footer/sidebars; PDF responses are parsed as PDFs) |
 | **Raw text string** | `"RAG grounds LLM outputs."` | Wrapped directly as a `Document` (content-hash id) |
 | **List of mixed sources** | `["a.pdf", "https://...", "raw note"]` | Each item is routed to its matching loader |
 
-> **Safety Note:** If a string looks like a file path (e.g., `"missing_file.pdf"`) and does not exist on disk, `DocumentLoader` raises `FileNotFoundError` immediately rather than silently indexing the filename string.
+> **Safety Note:** If a string looks like a file or folder path (`"missing_file.pdf"`, `"./my_docs"`, `"data/docs"`, `"C:\docs"`) and does not exist, `DocumentLoader` raises `FileNotFoundError` instead of silently indexing the string as text. Folder scans skip `.git`, `node_modules`, virtualenvs, caches and hidden files, and binary files are skipped with a warning.
 
 ---
 
@@ -270,7 +283,9 @@ rag = RAG(
 | **`"recursive"`** | `"recursive_character"` | Splits along structural separators (`"\n\n"`, `"\n"`, `". "`, ... `""`) to keep paragraphs together, then applies overlap. | Markdown, structured reports. |
 | **`"llm"`** | `"semantic"`, `"llm_semantic"` | The LLM groups numbered sentences at topic shifts (`CHUNK: start-end`); falls back to `"recursive"` without an LLM. | High-value documents with shifting topics. |
 
-Every chunk gets a stable id `{parent_id}_chunk_{n}_{content_hash}` plus `parent_id`, `prev_id` and `next_id` metadata. That's what makes re-ingestion idempotent and neighbour expansion possible.
+`chunk_size` is a hard limit for `fixed` and `recursive`: a line or sentence longer than it is split further, so log files, one-record-per-line data and text without punctuation never end up as one giant chunk. Line breaks inside a chunk are kept. For Chinese, Japanese, Thai, Lao, Khmer and Myanmar each character counts as one unit, and `。！？` end sentences.
+
+Every chunk gets a stable id `{parent_id}_chunk_{n}_{content_hash}` plus `parent_id`, `prev_id` and `next_id` metadata. That's what makes re-ingestion idempotent and neighbour expansion possible. Consecutive PDF pages and slides are linked too, so `neighbor_window` can follow text across a page break.
 
 ```python
 from raglib import ChunkSplitter, Document, MockLLMClient
@@ -290,7 +305,7 @@ for chunk in splitter.split(docs):
 - `fusion="relative"` *(default)* scores every candidate on **both** signals, min-max normalizes each, and blends them with `hybrid_alpha`. A chunk that is decisive in one signal (e.g. the only chunk containing `INV-2024-0042`) is never out-voted by chunks that are mediocre in both.
 - `fusion="rrf"` uses classic rank-only Reciprocal Rank Fusion.
 
-Tokenization is Unicode-aware, including combining marks, so Hindi, Bengali, Tamil, Arabic, Thai, Cyrillic and accented Latin all work for BM25.
+Tokenization is Unicode-aware, including combining marks, so Hindi, Bengali, Tamil, Arabic, Cyrillic and accented Latin all work for BM25. Scripts written without spaces (Chinese, Japanese, Thai, Lao, Khmer, Myanmar) are indexed as overlapping character bigrams (`東京都` -> `東京`, `京都`), so keyword search works for them without a word segmenter.
 
 ```python
 from raglib import RAG
@@ -323,7 +338,7 @@ Select via `RAG(..., rag_type="<name>")` or import the class from `raglib`. Ever
 | `rag_type` | Class | What it actually does | LLM calls / query* | Best Use Case |
 | :--- | :--- | :--- | :--- | :--- |
 | **`"naive"`** | `NaiveRAG` | Retrieve -> generate | 1 | Baseline |
-| **`"advanced"`** *(default)* | `AdvancedRAG` | Hybrid retrieve -> rerank -> dedupe -> cited generate | 1 | Most production Q&A |
+| **`"advanced"`** *(default)* | `AdvancedRAG` | Hybrid retrieve -> rerank (when `reranker` is set; default `"none"`) -> dedupe -> cited generate | 1 | Most production Q&A |
 | **`"hybrid"`** | `HybridRAG` | Forces BM25 + dense hybrid retrieval | 1 | Keyword-heavy corpora (IDs, codes, names) |
 | **`"hybrid_web"`** | `HybridRAG(include_web=True)` | Corpus + live web, fused | 1 | Private docs + fresh public info |
 | **`"corrective"`** | `CorrectiveRAG` | Batched relevance grading -> CORRECT: keep relevant sentence strips / INCORRECT: search / AMBIGUOUS: both | 2–4 | Corpora that may not contain the answer |
@@ -338,6 +353,19 @@ Select via `RAG(..., rag_type="<name>")` or import the class from `raglib`. Ever
 | **`"graph"`** | `GraphRAG` | Knowledge-graph local/global search (section 8) | 1 local, 1 + N global | Relationship & corpus-wide questions |
 
 \* Excluding the optional rewrite/condense steps.
+
+### Counting and aggregate questions (`SQLTool`)
+
+Retrieval answers from the top-k chunks, so a question like "how many engineers are based in Tokyo?" over a 5,000-row table cannot be counted correctly: the model only ever sees a few chunks. For tabular data, give the agent an `SQLTool`. The LLM writes one read-only `SELECT`, which SQLite runs over every row:
+
+```python
+from raglib import RAG, SQLTool
+
+rag = RAG("people.csv", llm="openai", rag_type="agentic", tools=[SQLTool.from_files("people.csv")])
+print(rag.query("How many engineers are based in Tokyo?").answer)
+```
+
+`SQLTool` loads `.csv`, `.tsv`, `.xlsx`, `.json` and `.jsonl` files (or `add_rows(table, header, rows)`) into a private in-memory SQLite database. An SQLite authorizer allows only reads, so writes, `ATTACH` and `PRAGMA` are refused. Queries time out after `timeout_seconds` (default 5) and results are capped at `max_rows`.
 
 **Web search is never used unless you configure it** (`web_search_provider=...`). The exceptions are `web` and `hybrid_web`, which default to DuckDuckGo. Corrective RAG without a web provider retries the corpus with a refined query instead.
 
@@ -542,10 +570,12 @@ If `embedding_llm` is omitted, raglib uses the chat provider's embeddings (OpenA
 ### Vector Stores (`vector_db`)
 
 - **`"memory"`** *(default)*: in-RAM cosine search (numpy-accelerated when installed), persisted with `rag.save()` / `rag.load()`.
+- **`"qdrant"`**: Qdrant (`pip install raglib-py[qdrant]`). In-process by default; `vector_db_kwargs={"path": "./qdrant"}` persists to disk, `{"url": "http://localhost:6333", "api_key": ...}` uses a server or Qdrant Cloud. Filters run inside Qdrant.
+- **`"pgvector"`**: PostgreSQL with the pgvector extension (`pip install raglib-py[pgvector]`), e.g. `vector_db_kwargs={"dsn": "postgresql://user:pass@host/db", "table_name": "docs"}`. Uses an HNSW cosine index when available; filters become parameterized SQL on a JSONB column.
 - **`"chroma"`**: ChromaDB in cosine space. Each `RAG` gets its **own collection** unless you name one, so instances never see each other's data. Use `{"persist_directory": ..., "collection_name": ...}` for a durable index or `{"host": ..., "port": ...}` for a Chroma server.
 - **Your own**: subclass `BaseVectorStore` (`upsert`, `query(filters=...)`, `delete`, `count`).
 
-Initialization errors are raised. Pass `vector_db_kwargs={"fallback_to_memory": True}` to opt into a fallback.
+Initialization errors are raised. Pass `vector_db_kwargs={"fallback_to_memory": True}` to opt into a fallback. Every store refuses vectors of a different size than the ones it holds, so switching embedding models fails loudly instead of returning meaningless matches.
 
 ---
 
@@ -580,6 +610,10 @@ rag.query("What is our authentication service called?", session_id="user-42")
 rag.query("Which downstream services depend on it?", session_id="user-42")
 rag.reset_memory("user-42")
 
+# Persist conversations across restarts and worker processes
+from raglib import SQLiteConversationStore
+rag = RAG("docs/", chat_llm="openai", memory=True, conversation_store=SQLiteConversationStore("chats.db", ttl_seconds=86400))
+
 # Streaming
 for token in rag.stream("Summarize the onboarding guide"):
     print(token, end="", flush=True)
@@ -590,7 +624,8 @@ for token in rag.stream("Summarize the onboarding guide"):
 # Tracing: every stage is timed; plug in LangSmith / OpenTelemetry / logging
 rag = RAG("docs/", chat_llm="openai", on_event=lambda e: print(e.stage, e.latency_ms, e.meta))
 result = rag.query("...")
-print(result.usage)            # {"prompt_tokens": ..., "completion_tokens": ..., "latency_ms": ...}
+print(result.usage)            # answer call + totals over every LLM call of the query (see below)
+print(result.metadata.get("degraded"))  # optional steps that failed and fell back, if any
 
 rag.chat()                     # interactive terminal session with memory
 ```
@@ -652,7 +687,9 @@ result = pipeline.run("How does Corrective RAG handle low-scoring chunks?")
 print(result.answer, result.reasoning_trace)
 ```
 
-Subclass `BaseRAG` and override `retrieve(ctx)` (or `process_documents` / `generate` / `answer`) to build your own strategy. Condensation, memory, tracing, citations and streaming come for free.
+Subclass `BaseRAG` and override `retrieve(ctx)` (or `process_documents` / `generate` / `answer`) to build your own strategy. Condensation, memory, tracing, citations, streaming, token usage and degradation reporting come for free. If you keep the default `retrieve`, it routes each query with `DecisionEngine` (corpus / web / both / none) and retries poor lexical matches with `Refiner`; the built-in strategies replace that step with their own.
+
+Custom `BaseLLMClient` implementations can report token usage with `raglib.core.runtime.record_usage(prompt_tokens, completion_tokens)`, and custom steps can report fallbacks with `report_degraded("my_step", exc)` inside their `except` block.
 
 ---
 
@@ -669,8 +706,8 @@ from raglib import Document, GenerationResult, Citation, TraceEvent, QueryResult
   - `citations: List[Citation]` — `[n]` markers in the answer mapped to sources (`index`, `document_id`, `source`, `snippet`)
   - `reasoning_trace: List[str]` — human-readable pipeline steps
   - `trace_events: List[TraceEvent]` — `stage`, `latency_ms`, `meta`, `error` per stage
-  - `usage: Dict` — prompt/completion tokens and total latency
-  - `metadata: Dict` — pipeline name, standalone search query, session id, strategy details
+  - `usage: Dict` — `prompt_tokens` / `completion_tokens` of the answer call (`generation_usage_estimated` says whether they are the provider's counts or estimates), plus `llm_calls`, `total_prompt_tokens`, `total_completion_tokens`, `total_tokens` over every LLM call of the query (grading, routing, rewriting, ...), `usage_estimated`, and `latency_ms`
+  - `metadata: Dict` — pipeline name, standalone search query, session id, strategy details, and `degraded` (a list of `{component, error}` for optional steps that failed and fell back; with `RAG(strict=True)` those failures are raised instead)
 - **GraphRAG**: `raglib.graphrag.Entity`, `Relation`, `Community`
 
 ---
@@ -699,7 +736,8 @@ raglib graph papers/ --out graph.html
 | API keys | Read from env vars or arguments only, never logged. A chat key is only reused for embeddings from the same provider. | Keep keys in env vars or a secret manager. `.env.example` lists every variable. |
 | What leaves your machine | Questions, retrieved chunks and (with memory) chat history go to the LLM provider you chose. Chunks go to the embedding provider. Web search is off unless configured. | Use a local model (Ollama / LM Studio / vLLM) for confidential data. |
 | Logs | Questions, answers and document text are never logged at INFO or above. | Don't enable DEBUG logging in production if queries may contain personal data. |
-| User-supplied URLs | Private, loopback, link-local and metadata addresses are blocked (SSRF), redirects are re-checked, and responses are capped at 20 MB. | `allow_private_urls=True` only for trusted intranet sources. |
+| User-supplied URLs | Private, loopback, link-local and metadata addresses are blocked (SSRF). The host is resolved once and the connection goes to the checked address, so DNS rebinding cannot reach internal services. Redirects are re-checked and responses are capped at 20 MB. With an `HTTPS_PROXY`, the proxy resolves hosts, so only the pre-check applies. | `allow_private_urls=True` only for trusted intranet sources. |
+| `SQLTool` | Runs on a private in-memory copy of the tables; only read statements are authorized, one statement per call, with a timeout and a row cap. | Load only tables the agent may read. |
 | User-supplied file paths | `allowed_dirs=[...]` sandboxes file and folder sources (resolves `..` and symlinks). | Always set it when paths come from users. |
 | Prompt injection | Retrieved text is wrapped in `<source>` blocks with an instruction to treat it as data. | Treat answers as untrusted output; don't give agent tools destructive permissions. |
 | Multi-user | `session_id` isolates chat history. Documents are shared within one `RAG` instance. | Use one `RAG` per tenant, or `filters={"tenant": ...}` on every query. |

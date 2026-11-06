@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,7 @@ class QueryRewriter:
         try:
             return clean_llm_query(self.llm_client.complete(prompt=prompt), fallback=query)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("QueryRewriter failed: %s", exc)
+            report_degraded("query_rewriter", exc, logger)
             return query
 
 
@@ -80,5 +81,5 @@ class QueryCondenser:
         try:
             return clean_llm_query(self.llm_client.complete(prompt=prompt), fallback=query)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("QueryCondenser failed: %s", exc)
+            report_degraded("query_condenser", exc, logger)
             return query

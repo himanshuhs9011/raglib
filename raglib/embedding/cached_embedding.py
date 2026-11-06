@@ -126,3 +126,14 @@ class CachedEmbedding(BaseEmbedding):
         """Return the wrapped model's dimension."""
 
         return self.inner.dimension
+
+    @property
+    def model_name(self):
+        """Return the wrapped model's name."""
+
+        return self.inner.model_name
+
+    def fingerprint(self):
+        """Fingerprint of the wrapped model (the cache does not change vectors)."""
+
+        return self.inner.fingerprint()

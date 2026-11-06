@@ -8,7 +8,7 @@ from raglib.components.evaluator import Evaluator
 from raglib.components.generator import Generator
 from raglib.components.grader import RelevanceGrader
 from raglib.components.hybrid_retriever import HybridRetriever
-from raglib.components.memory import ConversationStore, MemoryModule
+from raglib.components.memory import ConversationStore, MemoryModule, SQLiteConversationStore
 from raglib.components.multi_hop_retriever import MultiHopRetriever
 from raglib.components.multi_query_retriever import MultiQueryRetriever
 from raglib.components.planner import Planner
@@ -19,6 +19,7 @@ from raglib.components.reflection import ReflectionModule
 from raglib.components.reranker import Reranker
 from raglib.components.retriever import Retriever
 from raglib.components.router_retriever import RouterRetriever
+from raglib.components.sql_tool import SQLTool
 from raglib.components.tools import Tool
 from raglib.components.web_retriever import WebRetriever
 
@@ -41,6 +42,8 @@ __all__ = [
     "ContextReducer",
     "MemoryModule",
     "ConversationStore",
+    "SQLiteConversationStore",
+    "SQLTool",
     "Planner",
     "ReflectionModule",
     "DecisionEngine",

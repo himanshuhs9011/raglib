@@ -6,7 +6,10 @@ import logging
 from typing import List, Optional
 
 from raglib.embedding.base_embedding import BaseEmbedding
-from raglib.llm.constants import OLLAMA_DEFAULT_BASE_URL, PROVIDER_DEFAULT_EMBEDDING_MODEL
+from raglib.llm.constants import (
+    OLLAMA_DEFAULT_BASE_URL,
+    PROVIDER_DEFAULT_EMBEDDING_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 

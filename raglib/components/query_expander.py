@@ -6,6 +6,7 @@ import logging
 import re
 from typing import List, Optional
 
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class QueryExpander:
             try:
                 raw = self.llm_client.complete(prompt=prompt)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("QueryExpander failed: %s", exc)
+                report_degraded("query_expander", exc, logger)
                 raw = ""
             for line in raw.splitlines():
                 cleaned = re.sub(r"^\s*(?:[-*•]|\d+[\).:-])\s*", "", line).strip().strip('"')

@@ -8,7 +8,12 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence
 
 from raglib.core.concurrency import parallel_map
-from raglib.graphrag.schemas import Entity, ExtractionResult, Relation, normalize_entity_key
+from raglib.graphrag.schemas import (
+    Entity,
+    ExtractionResult,
+    Relation,
+    normalize_entity_key,
+)
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 

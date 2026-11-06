@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased (2.1.0)
+
+Fixes and improvements from a full library review.
+
+**Bug fixes**
+- **Chunking ignored `chunk_size` for text without sentence punctuation.** The default `fixed` strategy put a 5,000-line file (logs, CSV-like records, one fact per line) into a single 50,000-word chunk, so the model saw only the first part after trimming. Lines are now boundaries, and anything longer than `chunk_size` is split further, for `fixed` and `recursive` alike. Chunks keep their line breaks.
+- **Chinese, Japanese and Thai text was not chunked or searchable.** Sizes were counted in space-separated words, so 7,200 characters of Japanese became one chunk, and BM25 indexed whole clauses as single tokens. Each CJK/Thai/Lao/Khmer/Myanmar character now counts as one unit, `。！？` end sentences, keyword search uses character bigrams, the token estimate counts these characters (when tiktoken is missing), and truncation no longer empties such text.
+- **A mistyped folder path was indexed as text.** `RAG("./my_docs")` with a missing folder created a document containing `"./my_docs"`. Path-like strings now raise `FileNotFoundError`.
+- **A changed embedding model gave meaningless results silently.** Stores now refuse vectors of a different size, and `save()` records the embedding model and dimension; `load()` raises on a mismatch (`allow_model_change=True` re-embeds).
+- **DNS rebinding could bypass the URL safety check.** The web loader now connects to the exact address it validated.
+- **Conversation memory could raise "deque mutated during iteration"** when one session got concurrent requests; it also kept every turn's retrieved documents (unused), which grows with thousands of sessions. History is read under the lock and documents are not stored unless `store_documents=True`.
+- **Streaming had no retries**: a 429 before the first token failed the request. Opening the stream is now retried like `complete`.
+- **`rag.chat()` left memory switched on** for later `query()` calls.
+- Folder ingestion no longer walks `.git`, `node_modules`, virtualenvs or caches, and skips binary files.
+- PyMuPDF 1.24+/2.x: imports `pymupdf` (the `fitz` name is deprecated).
+
+**New**
+- `result.usage` reports totals over every LLM call of a query (`llm_calls`, `total_prompt_tokens`, `total_completion_tokens`, `total_tokens`), using the provider's real counts when LangChain returns them.
+- `result.metadata["degraded"]` lists optional steps that failed and fell back (grader, router, reranker, rewrite, web search, tools, ...); `RAG(strict=True)` raises instead.
+- `SQLTool`: exact counting/aggregation over CSV/TSV/XLSX/JSON tables for `rag_type="agentic"` (read-only SQLite, timeout, row cap).
+- `SQLiteConversationStore` and `RAG(conversation_store=...)`: chat history that survives restarts and is shared by worker processes.
+- Vector stores: `vector_db="qdrant"` (`[qdrant]` extra) and `vector_db="pgvector"` (`[pgvector]` extra).
+- Loaders: HTML files, CSV/TSV, JSON/JSONL, XLSX (`[xlsx]` extra), EPUB, and source-code/config files. Web pages keep headings, paragraphs, lists and tables, prefer `<main>`/`<article>`, and drop navigation and footers; PDF responses are parsed as PDFs.
+- `RAG(llm_temperature=..., llm_max_tokens=...)`.
+- JSON mode for OpenAI and OpenAI-compatible providers in `complete_json` (falls back automatically when a model rejects it); the LLM cache and fallback clients keep it.
+- Consecutive PDF pages and slides are linked, so `neighbor_window` can follow text across page breaks.
+
+**Performance**
+- MMR uses numpy when available.
+- `delete` no longer blocks queries while the vector store deletes over the network.
+- Chroma queries skip the extra `count()` round trip.
+
+**Tooling**
+- GitHub Actions CI: ruff, and pytest on Python 3.9-3.13 (plus Windows, and a pgvector service job).
+- Ruff configuration in `pyproject.toml` (Python 3.9 target).
+
 ## 2.0.4 - 2026-10-24
 
 - **`result.metadata` now carries pipeline diagnostics:** `crag_verdict`, `agent_steps`, `hop_queries`, `graph_mode`, `self_rag_llm_calls` were computed but dropped before the result was returned. Internal Document lists stay out, so metadata is JSON-serializable.

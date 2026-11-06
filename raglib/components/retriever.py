@@ -12,7 +12,12 @@ from raglib.core.concurrency import ReadWriteLock
 from raglib.core.fusion import DEFAULT_RRF_K, reciprocal_rank_fusion
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.schemas import Document
-from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord, matches_filter
+from raglib.vectorstores.base_store import (
+    BaseVectorStore,
+    MetadataFilter,
+    VectorRecord,
+    matches_filter,
+)
 from raglib.vectorstores.factory import VectorStoreFactory
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,7 @@ class Retriever:
         self._documents: List[Document] = []
         self._doc_index: Dict[str, Document] = {}
         self._bm25 = BM25Index()
+        self._pending_deletes: set = set()
         # Queries read concurrently; add/delete mutate under the write side.
         self._lock = ReadWriteLock()
         self.add_documents(documents or [])
@@ -182,8 +188,15 @@ class Retriever:
                 self._bm25.remove(doc_id)
                 del self._doc_index[doc_id]
             self._documents = [doc for doc in self._documents if doc.id not in id_set]
+            self._pending_deletes |= id_set
+        # The vector store delete may be a network call: run it outside the lock so queries keep
+        # going. Until it finishes, dense hits for these ids are ignored (see ``_dense_search``).
+        try:
             if self._vector_store is not None:
                 self._vector_store.delete(list(id_set))
+        finally:
+            with self._lock.write():
+                self._pending_deletes -= id_set
         logger.info("Retriever deleted %d documents (total=%d)", len(id_set), len(self._documents))
         return len(id_set)
 
@@ -237,6 +250,8 @@ class Retriever:
         hits = self._vector_store.query(query_embedding=query_vector, top_k=limit, filters=filters)
         documents: List[Document] = []
         for hit in hits:
+            if hit.document_id in self._pending_deletes:
+                continue
             base = self._doc_index.get(hit.document_id)
             if base is None:
                 if not hit.document_text:
@@ -333,8 +348,11 @@ class Retriever:
             missing = [doc for doc in candidates if doc.id not in vectors]
             for doc, vector in zip(missing, self._embedding.embed_documents([doc.content for doc in missing])):
                 vectors[doc.id] = vector
-        query_vector = self._embedding.embed_query(query)
+        query_vector = self._embedding.embed_query(query)  # type: ignore[union-attr]
         lam = float(self.mmr_lambda if self.mmr_lambda is not None else 0.5)
+        fast = _mmr_numpy(query_vector, [vectors[doc.id] for doc in candidates], k, lam)
+        if fast is not None:
+            return [candidates[index] for index in fast]
 
         selected: List[Document] = []
         remaining = list(candidates)
@@ -372,6 +390,39 @@ class Retriever:
         if len(parts) == 1:
             return doc
         return replace(doc, content="\n".join(parts), metadata={**doc.metadata, "neighbor_expanded": True})
+
+
+def _mmr_numpy(query_vector: Sequence[float], vectors: List[Sequence[float]], k: int, lam: float) -> Optional[List[int]]:
+    """Vectorized MMR selection; returns candidate indexes, or None without numpy / on ragged input."""
+
+    try:
+        import numpy as np  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        matrix = np.asarray(vectors, dtype=np.float32)
+        query = np.asarray(query_vector, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[1] != query.shape[0]:
+            return None
+    except ValueError:
+        return None
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    matrix = matrix / norms
+    query = query / (float(np.linalg.norm(query)) or 1.0)
+    relevance = matrix @ query
+    similarity = matrix @ matrix.T
+    selected: List[int] = []
+    max_sim = np.full(len(vectors), -np.inf, dtype=np.float32)
+    available = np.ones(len(vectors), dtype=bool)
+    for _ in range(min(k, len(vectors))):
+        penalty = np.where(np.isfinite(max_sim), max_sim, 0.0)
+        scores = np.where(available, lam * relevance - (1 - lam) * penalty, -np.inf)
+        best = int(np.argmax(scores))
+        selected.append(best)
+        available[best] = False
+        max_sim = np.maximum(max_sim, similarity[best])
+    return selected
 
 
 def _min_max(scores: Dict[str, float]) -> Dict[str, float]:

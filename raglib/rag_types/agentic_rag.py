@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from raglib.components.tools import Tool
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import interleave
+from raglib.core.runtime import report_degraded
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -31,8 +32,19 @@ class AgenticRAG(BaseRAG):
         """Initialize the agent."""
 
         super().__init__(**kwargs)
-        self.extra_tools = list(tools or [])
+        self.extra_tools = [self._as_tool(tool) for tool in tools or []]
         self.max_steps = max(1, max_steps)
+
+    def _as_tool(self, tool: Any) -> Tool:
+        """Accept ``Tool`` objects and providers of one (e.g. ``SQLTool``); share the agent's LLM."""
+
+        if isinstance(tool, Tool):
+            return tool
+        if hasattr(tool, "as_tool"):
+            if getattr(tool, "llm_client", False) is None and self.llm_client is not None:
+                tool.llm_client = self.llm_client
+            return tool.as_tool()
+        raise TypeError(f"tools=[...] items must be Tool objects or provide as_tool(), got {type(tool).__name__}")
 
     def available_tools(self, ctx: PipelineContext) -> Dict[str, Tool]:
         """Return the tools for this run (built-ins + user tools)."""
@@ -91,7 +103,7 @@ class AgenticRAG(BaseRAG):
                     docs = tool.run(tool_input or ctx.search_query)
                     observation = self._summarize(docs)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Tool %s failed: %s", name, exc)
+                    report_degraded(f"tool:{name}", exc, logger)
                     docs, observation = [], f"Tool error: {exc}"
                 meta["docs"] = len(docs)
             evidence.append(docs)

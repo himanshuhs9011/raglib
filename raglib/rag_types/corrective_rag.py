@@ -9,6 +9,7 @@ from typing import Any, List, Tuple
 from raglib.components.grader import LABEL_CORRECT, LABEL_INCORRECT, RelevanceGrader
 from raglib.components.query_rewriter import clean_llm_query
 from raglib.core.base import BaseRAG, PipelineContext
+from raglib.core.runtime import report_degraded
 from raglib.core.text import token_set
 from raglib.schemas import Document
 
@@ -153,7 +154,7 @@ class CorrectiveRAG(BaseRAG):
         try:
             response = self.llm_client.complete(prompt).strip().upper()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("CRAG strip filter failed: %s - keeping all strips", exc)
+            report_degraded("crag_strip_filter", exc, logger)
             return [True] * len(strips)
         if re.search(r"\bALL\b", response):
             return [True] * len(strips)
@@ -173,7 +174,7 @@ class CorrectiveRAG(BaseRAG):
                 try:
                     web_documents = self.web_retriever.retrieve(search_query)
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("CRAG web search failed: %s", exc)
+                    report_degraded("crag_web_search", exc, logger)
                     ctx.trace.append("web_search_failed")
                     web_documents = []
                 meta["docs"] = len(web_documents)
@@ -211,5 +212,5 @@ class CorrectiveRAG(BaseRAG):
         try:
             return clean_llm_query(self.llm_client.complete(prompt), fallback=query, max_length=200)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("CRAG query rewrite failed: %s", exc)
+            report_degraded("crag_query_rewrite", exc, logger)
             return query

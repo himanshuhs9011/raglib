@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from live_free_models_e2e import CHAT, EMBED, FALLBACKS, HERE, build_haystack  # noqa: E402
+
 from raglib import RAG  # noqa: E402
 from raglib.components.tools import Tool  # noqa: E402
 

@@ -7,6 +7,7 @@ import logging
 import re
 from typing import List, Optional, Sequence
 
+from raglib.core.text import count_units, has_no_space_script, unit_spans
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -25,6 +26,15 @@ CHUNKING_STRATEGY_ALIASES = {
     "llm_semantic": "llm",
 }
 
+# Sentence boundaries: whitespace after . ! ? (or the Devanagari danda), any line break,
+# right after CJK full stops (no space follows them), and whitespace after Thai/CJK text.
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?\u0964])[ \t]+"
+    r"|\s*\n\s*"
+    r"|(?<=[\u3002\uff01\uff1f])\s*"
+    r"|(?<=[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u3400-\u9fff])[ \t]+"
+)
+
 # Prefer coarser structure first, then finer units (LangChain-style recursive split).
 DEFAULT_RECURSIVE_SEPARATORS: Sequence[str] = (
     "\n\n",
@@ -32,6 +42,9 @@ DEFAULT_RECURSIVE_SEPARATORS: Sequence[str] = (
     ". ",
     "? ",
     "! ",
+    "。",
+    "！",
+    "？",
     "; ",
     ", ",
     " ",
@@ -88,6 +101,8 @@ class ChunkSplitter:
         """
 
         chunks: List[Document] = []
+        previous_last: Optional[Document] = None
+        previous_document: Optional[Document] = None
         for document in documents:
             split_texts = self._split_document(document)
             doc_chunks: List[Document] = []
@@ -114,6 +129,13 @@ class ChunkSplitter:
                     chunk.metadata["prev_id"] = doc_chunks[position - 1].id
                 if position + 1 < len(doc_chunks):
                     chunk.metadata["next_id"] = doc_chunks[position + 1].id
+            # Consecutive pages of one file (PDF pages, slides): link the boundary chunks, so
+            # neighbour expansion (neighbor_window) can follow text across a page break.
+            if doc_chunks and previous_last is not None and self._consecutive(previous_document, document):
+                previous_last.metadata["next_id"] = doc_chunks[0].id
+                doc_chunks[0].metadata["prev_id"] = previous_last.id
+            if doc_chunks:
+                previous_last, previous_document = doc_chunks[-1], document
             chunks.extend(doc_chunks)
 
         logger.info(
@@ -123,6 +145,21 @@ class ChunkSplitter:
             len(documents),
         )
         return chunks
+
+    @staticmethod
+    def _consecutive(previous: Optional[Document], current: Document) -> bool:
+        """True when ``current`` is the next page/slide of the same file as ``previous``."""
+
+        if previous is None:
+            return False
+        file_a, file_b = previous.metadata.get("file"), current.metadata.get("file")
+        if not file_a or file_a != file_b:
+            return False
+        for key in ("page", "slide", "chapter"):
+            a, b = previous.metadata.get(key), current.metadata.get(key)
+            if isinstance(a, int) and isinstance(b, int):
+                return b == a + 1
+        return False
 
     def _split_document(self, document: Document) -> List[str]:
         """Split one document with the configured strategy."""
@@ -141,11 +178,19 @@ class ChunkSplitter:
         return self._normalize_chunks(parts)
 
     def _split_fixed(self, text: str) -> List[str]:
-        """Split text into sentence-aware fixed-size overlapping chunks."""
+        """Pack whole sentences (or lines) into chunks of at most ``chunk_size`` units, with overlap.
 
-        sentences = self._split_sentences(text)
-        if not sentences:
-            sentences = [text]
+        A sentence or line longer than ``chunk_size`` is hard-split first, so no chunk is
+        ever larger than the budget (e.g. a log, CSV or one-line-per-record file without
+        sentence punctuation). Original whitespace and line breaks are preserved.
+        """
+
+        sentences: List[str] = []
+        for sentence in self._split_sentence_segments(text) or [text]:
+            if self._count_tokens(sentence) > self._chunk_size:
+                sentences.extend(self._hard_split(sentence, overlap=0))
+            else:
+                sentences.append(sentence)
 
         sentence_token_counts = [self._count_tokens(sentence) for sentence in sentences]
         chunks: List[str] = []
@@ -168,7 +213,7 @@ class ChunkSplitter:
             if end == start:
                 end = min(start + 1, len(sentences))
 
-            chunk_text = " ".join(sentences[start:end]).strip()
+            chunk_text = "".join(sentences[start:end]).strip()
             if chunk_text:
                 chunks.append(chunk_text)
 
@@ -178,7 +223,8 @@ class ChunkSplitter:
             overlap_tokens = 0
             overlap_sentences = 0
             back = end - 1
-            while back >= start and overlap_tokens < self._overlap:
+            # Overlap whole sentences, but never so much that the next chunk would overflow.
+            while back > start and overlap_tokens + sentence_token_counts[back] <= self._overlap:
                 overlap_tokens += sentence_token_counts[back]
                 overlap_sentences += 1
                 back -= 1
@@ -190,54 +236,60 @@ class ChunkSplitter:
     def _split_recursive(self, text: str) -> List[str]:
         """Recursively split text using hierarchical separators, then apply overlap."""
 
-        raw_chunks = self._recursive_split(text, self._separators)
+        # Leave room for the overlap that is prepended afterwards, so chunks stay within chunk_size.
+        limit = max(self._chunk_size - self._overlap, 1)
+        raw_chunks = self._recursive_split(text, self._separators, limit)
         return self._apply_overlap(raw_chunks)
 
-    def _recursive_split(self, text: str, separators: Sequence[str]) -> List[str]:
+    def _recursive_split(self, text: str, separators: Sequence[str], limit: Optional[int] = None) -> List[str]:
         """Recursively split oversized text using the next available separator."""
 
+        budget: int = limit or self._chunk_size
         cleaned = text.strip()
         if not cleaned:
             return []
 
-        if self._count_tokens(cleaned) <= self._chunk_size:
+        if self._count_tokens(cleaned) <= budget:
             return [cleaned]
 
         if not separators:
-            return self._hard_token_split(cleaned)
+            return self._hard_split(cleaned, overlap=0, limit=budget)
 
         separator = separators[0]
         next_separators = separators[1:]
 
         if separator == "":
-            return self._hard_token_split(cleaned)
+            return self._hard_split(cleaned, overlap=0, limit=budget)
 
         pieces = cleaned.split(separator)
         pieces = [piece.strip() for piece in pieces if piece and piece.strip()]
         if len(pieces) <= 1:
-            return self._recursive_split(cleaned, next_separators)
+            return self._recursive_split(cleaned, next_separators, budget)
 
         merged: List[str] = []
         current: List[str] = []
         current_tokens = 0
+        sep_tokens = 1 if separator.strip() in {"。", "！", "？"} else 0
 
         for piece in pieces:
             piece_tokens = self._count_tokens(piece)
-            if piece_tokens > self._chunk_size:
+            if piece_tokens > budget:
                 if current:
                     merged.append(separator.join(current).strip())
                     current = []
                     current_tokens = 0
-                merged.extend(self._recursive_split(piece, next_separators))
+                merged.extend(self._recursive_split(piece, next_separators, budget))
                 continue
 
-            if current and (current_tokens + piece_tokens) > self._chunk_size:
+            # CJK full stops are size units themselves (". " or "\n" merge into the previous word).
+            joined_tokens = current_tokens + piece_tokens + sep_tokens if current else piece_tokens
+            if current and joined_tokens > budget:
                 merged.append(separator.join(current).strip())
                 current = [piece]
                 current_tokens = piece_tokens
             else:
                 current.append(piece)
-                current_tokens += piece_tokens
+                current_tokens = joined_tokens
 
         if current:
             merged.append(separator.join(current).strip())
@@ -245,38 +297,53 @@ class ChunkSplitter:
         return [chunk for chunk in merged if chunk]
 
     def _hard_token_split(self, text: str) -> List[str]:
-        """Force-split by whitespace tokens when no separator can reduce size."""
+        """Force-split by size units when no separator can reduce size."""
 
-        tokens = text.split()
-        if not tokens:
+        return self._hard_split(text, overlap=self._overlap)
+
+    def _hard_split(self, text: str, overlap: int, limit: Optional[int] = None) -> List[str]:
+        """Cut ``text`` into windows of ``chunk_size`` units (words, or CJK/Thai characters).
+
+        Slices the original string, so whitespace and line breaks inside a window survive.
+        """
+
+        size = limit or self._chunk_size
+        spans = unit_spans(text)
+        if not spans:
             return []
+        if len(spans) <= size:
+            return [text.strip()] if text.strip() else []
 
         chunks: List[str] = []
-        step = max(self._chunk_size - self._overlap, 1)
+        step = max(size - overlap, 1)
         start = 0
-        while start < len(tokens):
-            end = min(start + self._chunk_size, len(tokens))
-            chunk = " ".join(tokens[start:end]).strip()
-            if chunk:
-                chunks.append(chunk)
-            if end >= len(tokens):
+        while start < len(spans):
+            end = min(start + size, len(spans))
+            piece = text[spans[start][0] : spans[end - 1][1]].strip()
+            if piece:
+                chunks.append(piece)
+            if end >= len(spans):
                 break
             start += step
         return chunks
 
     def _apply_overlap(self, chunks: List[str]) -> List[str]:
-        """Add trailing-token overlap between consecutive recursive chunks."""
+        """Prefix each chunk with the last ``overlap`` units of the previous chunk."""
 
         if self._overlap <= 0 or len(chunks) <= 1:
             return chunks
 
         overlapped: List[str] = [chunks[0]]
         for index in range(1, len(chunks)):
-            previous_tokens = chunks[index - 1].split()
-            overlap_text = " ".join(previous_tokens[-self._overlap :]) if previous_tokens else ""
+            previous = chunks[index - 1]
+            spans = unit_spans(previous)
+            overlap_text = previous[spans[-self._overlap][0] :].strip() if spans else ""
+            if len(spans) <= self._overlap:
+                overlap_text = previous.strip()
             current = chunks[index].strip()
             if overlap_text and not current.startswith(overlap_text):
-                current = f"{overlap_text} {current}".strip()
+                joiner = "" if has_no_space_script(overlap_text[-1:]) and has_no_space_script(current[:1]) else " "
+                current = f"{overlap_text}{joiner}{current}".strip()
             overlapped.append(current)
         return overlapped
 
@@ -322,6 +389,8 @@ class ChunkSplitter:
         chunks: List[str] = []
         for start, end in ranges:
             chunk_text = " ".join(sentences[start - 1 : end]).strip()
+            if has_no_space_script(chunk_text):
+                chunk_text = "".join(sentences[start - 1 : end]).strip()
             if not chunk_text:
                 continue
             if self._count_tokens(chunk_text) > self._chunk_size * 2:
@@ -391,15 +460,35 @@ class ChunkSplitter:
         return normalized
 
     def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentence-like units while preserving punctuation."""
+        """Split text into sentence-like units (stripped)."""
 
-        pieces = re.split(r"(?<=[.!?])\s+", text)
-        return [piece.strip() for piece in pieces if piece and piece.strip()]
+        return [segment.strip() for segment in self._split_sentence_segments(text) if segment.strip()]
+
+    def _split_sentence_segments(self, text: str) -> List[str]:
+        """Split text at sentence/line boundaries, keeping each segment's trailing whitespace.
+
+        ``"".join(segments)`` reproduces the text, so chunks keep their line breaks.
+        """
+
+        segments: List[str] = []
+        position = 0
+        for match in _SENTENCE_BOUNDARY_RE.finditer(text):
+            end = match.end()
+            if end <= position:
+                continue
+            if text[position:end].strip():
+                segments.append(text[position:end])
+            elif segments:
+                segments[-1] += text[position:end]
+            position = end
+        if text[position:].strip():
+            segments.append(text[position:])
+        return segments
 
     def _count_tokens(self, text: str) -> int:
-        """Estimate token count using whitespace-separated words."""
+        """Count size units: whitespace words, with each CJK/Thai character counted as one."""
 
-        return len(text.split())
+        return count_units(text)
 
     @staticmethod
     def _normalize_strategy(strategy: str) -> str:

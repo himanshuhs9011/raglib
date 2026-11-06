@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional
 
-from raglib.core.concurrency import parallel_map
 from raglib.components.retriever import Retriever
 from raglib.components.web_retriever import WebRetriever
+from raglib.core.concurrency import parallel_map
 from raglib.core.fusion import interleave
 from raglib.schemas import Document
 

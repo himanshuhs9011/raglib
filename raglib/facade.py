@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import importlib
-import threading
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,9 +45,13 @@ from raglib.core.text import token_set
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.embedding.embedding_factory import EmbeddingFactory
-from raglib.llm.base_client import BaseLLMClient, CachedLLMClient, FallbackLLMClient, unwrap_llm
+from raglib.llm.base_client import (
+    BaseLLMClient,
+    CachedLLMClient,
+    FallbackLLMClient,
+    unwrap_llm,
+)
 from raglib.llm.mock_client import MockLLMClient
-from raglib.llm.resilience import shared_limiter
 from raglib.llm.provider_detector import LLMProviderDetector
 from raglib.llm.providers import (
     PROVIDERS,
@@ -58,6 +62,7 @@ from raglib.llm.providers import (
     parse_model_string,
     provider_table,
 )
+from raglib.llm.resilience import shared_limiter
 from raglib.loaders.chunk_splitter import ChunkSplitter
 from raglib.loaders.document_loader import DocumentLoader, SourceInput
 from raglib.providers.base_provider import BaseSearchProvider
@@ -244,6 +249,10 @@ class RAG:
         llm: Optional[Union[str, BaseLLMClient, Any]] = None,
         allowed_dirs: Optional[Sequence[str]] = None,
         allow_private_urls: bool = False,
+        llm_temperature: float = 0.0,
+        llm_max_tokens: Optional[int] = None,
+        conversation_store: Optional[ConversationStore] = None,
+        strict: bool = False,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -254,10 +263,20 @@ class RAG:
         ``llm_rpm`` caps requests per minute to the provider (chat + embeddings share the budget;
         OpenRouter ``:free`` models default to 20, ``0`` disables). ``llm_fallbacks`` lists
         ``"provider/model"`` strings tried in order when the primary model fails.
+
+        ``llm_temperature`` / ``llm_max_tokens`` apply to models raglib builds from a provider name.
+        ``conversation_store`` replaces the in-memory session history (e.g.
+        ``SQLiteConversationStore("chats.db")``). ``strict=True`` raises when an optional step
+        (grader, router, reranker, query rewrite, web search, ...) fails, instead of degrading
+        and listing the failure in ``result.metadata["degraded"]``.
         """
 
         if top_k <= 0:
             raise ValueError("top_k must be greater than zero")
+        if llm_max_tokens is not None and llm_max_tokens <= 0:
+            raise ValueError("llm_max_tokens must be greater than zero")
+        self._llm_temperature = llm_temperature
+        self._llm_max_tokens = llm_max_tokens
         if llm is not None:
             if chat_llm is not None:
                 raise ValueError("Pass either llm=... or chat_llm=..., not both")
@@ -360,8 +379,8 @@ class RAG:
             else None
         )
 
-        self._graph_indexer = None
-        self._graph_retriever = None
+        self._graph_indexer: Optional[Any] = None
+        self._graph_retriever: Optional[Any] = None
         if self._rag_type == "graph" or enable_graph:
             self._build_graph(graph_store=graph_store, graph_kwargs=dict(graph_kwargs or {}))
 
@@ -373,7 +392,9 @@ class RAG:
             llm_client=self._llm if reranker == "llm" else None,
             api_key=reranker_api_key,
         )
-        self._conversations = ConversationStore(max_turns=max_history_turns, max_tokens=max_history_tokens)
+        self._conversations = conversation_store or ConversationStore(
+            max_turns=max_history_turns, max_tokens=max_history_tokens
+        )
         self._generator = Generator(llm_client=self._llm, max_context_tokens=max_context_tokens)
         self._router_retriever = RouterRetriever(
             vector_retriever=self._retriever,
@@ -404,6 +425,7 @@ class RAG:
             "condenser": QueryCondenser(llm_client=self._llm),
             "use_memory": bool(memory) if memory is not None else self._rag_type == "memory",
             "on_event": on_event,
+            "strict": strict,
         }
         if self._rag_type == "hybrid_web":
             if self._hybrid_retriever is None:
@@ -477,8 +499,12 @@ class RAG:
 
         from raglib.session.interactive import InteractiveSession
 
+        previous = self._rag.use_memory
         self._rag.use_memory = True
-        InteractiveSession(rag=self, session_id=session_id).start()
+        try:
+            InteractiveSession(rag=self, session_id=session_id).start()
+        finally:
+            self._rag.use_memory = previous  # later rag.query() calls keep their own setting
 
     def add(
         self,
@@ -616,28 +642,51 @@ class RAG:
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         chunks = [asdict(document) for document in self._retriever.documents]
-        (path / "chunks.json").write_text(
-            json.dumps({"version": 2, "parents": self._parents, "chunks": chunks}, ensure_ascii=False),
-            encoding="utf-8",
-        )
         store = self._retriever.vector_store
+        payload = {"version": 3, "index": self._index_fingerprint(), "parents": self._parents, "chunks": chunks}
+        # Write each file atomically, so a crash mid-save never leaves a half-written index.
         if isinstance(store, InMemoryVectorStore):
             records = [asdict(record) for record in store.records()]
-            (path / "vectors.json").write_text(json.dumps(records), encoding="utf-8")
+            _atomic_write(path / "vectors.json", json.dumps(records))
+        _atomic_write(path / "chunks.json", json.dumps(payload, ensure_ascii=False))
         if self._graph_indexer is not None:
             self._graph_indexer.save(str(path / "graph"))
         logger.info("Saved RAG index to %s", path)
 
-    def load(self, directory: str) -> "RAG":
-        """Load an index written by ``save`` (embeddings are reused, not recomputed)."""
+    def load(self, directory: str, allow_model_change: bool = False) -> "RAG":
+        """Load an index written by ``save`` (embeddings are reused, not recomputed).
+
+        Raises ``ValueError`` when the index was built with a different embedding model:
+        its stored vectors are not comparable with this model's query vectors. Pass
+        ``allow_model_change=True`` to load the chunks anyway and re-embed them.
+        """
 
         path = Path(directory)
         payload = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
+        saved = payload.get("index") or {}
+        current = self._index_fingerprint()
+        changed = [
+            key
+            for key in ("embedding_model", "dimension")
+            if saved.get(key) is not None and current.get(key) is not None and saved[key] != current[key]
+        ]
+        reembed = False
+        if changed:
+            detail = ", ".join(f"{key}: saved={saved[key]!r} current={current[key]!r}" for key in changed)
+            if not allow_model_change:
+                raise ValueError(
+                    f"Index in {directory} was built with a different embedding model ({detail}). "
+                    "Use the same embedding_llm/embedding_model, or load(..., allow_model_change=True) to re-embed."
+                )
+            logger.warning("Embedding model changed (%s); re-embedding the loaded chunks", detail)
+            reembed = True
         store = self._retriever.vector_store
         vectors_path = path / "vectors.json"
-        if isinstance(store, InMemoryVectorStore) and vectors_path.exists():
+        if isinstance(store, InMemoryVectorStore) and vectors_path.exists() and not reembed:
             store.upsert([VectorRecord(**record) for record in json.loads(vectors_path.read_text(encoding="utf-8"))])
         documents = [Document(**item) for item in payload.get("chunks", [])]
+        if reembed and store is not None and not isinstance(store, InMemoryVectorStore):
+            store.delete([document.id for document in documents])  # drop vectors from the old model
         self._retriever.add_documents(documents)
         self._parents.update({key: list(value) for key, value in payload.get("parents", {}).items()})
         if self._graph_indexer is not None and (path / "graph").exists():
@@ -763,6 +812,8 @@ class RAG:
             api_key=key,
             model_name=model_name,
             base_url=base_url,
+            temperature=getattr(self, "_llm_temperature", 0.0),
+            max_tokens=getattr(self, "_llm_max_tokens", None),
             timeout=timeout,
             max_retries=max_retries,
         )
@@ -932,7 +983,13 @@ class RAG:
     def _build_graph(self, graph_store: Optional[Any], graph_kwargs: Dict[str, Any]) -> None:
         """Create the GraphRAG indexer and retriever."""
 
-        from raglib.graphrag import GlobalSearch, GraphIndexer, GraphRetriever, LocalSearch, build_graph_store
+        from raglib.graphrag import (
+            GlobalSearch,
+            GraphIndexer,
+            GraphRetriever,
+            LocalSearch,
+            build_graph_store,
+        )
 
         unknown = set(graph_kwargs) - GRAPH_INDEXER_OPTIONS - GRAPH_LOCAL_OPTIONS - GRAPH_GLOBAL_OPTIONS - {
             "store_options", "global_level", "default_mode",
@@ -973,6 +1030,21 @@ class RAG:
         components = dict(self._components)
         components.update(kwargs)
         return rag_class(**components)
+
+    def _index_fingerprint(self) -> Dict[str, Any]:
+        """Describe how the index was built (embedding model + vector size), stored by ``save``."""
+
+        info: Dict[str, Any] = {"embedding_class": None, "embedding_model": None, "dimension": None}
+        if self._embedding is not None:
+            info.update(self._embedding.fingerprint())
+            try:
+                info["dimension"] = int(self._embedding.dimension) or None  # 0 = not known until first call
+            except Exception:  # noqa: BLE001 - custom embeddings may not know their size
+                info["dimension"] = None
+        store = self._retriever.vector_store
+        if isinstance(store, InMemoryVectorStore) and store.dimension:
+            info["dimension"] = store.dimension
+        return info
 
     def _purge_caches(self) -> None:
         """Deleted text must not survive in caches (LLM responses, embeddings) - privacy requirement."""
@@ -1061,6 +1133,14 @@ class RAG:
         }
         target = output_path / f"result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
         target.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def _atomic_write(target: Path, text: str) -> None:
+    """Write ``text`` to ``target`` via a temp file + rename (never leaves a partial file)."""
+
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
 
 
 def unwrap_embedding(embedding: Optional[BaseEmbedding]) -> Optional[BaseEmbedding]:

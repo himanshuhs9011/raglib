@@ -18,9 +18,14 @@ class TextLoader:
     def load(self, path: str) -> List[Document]:
         """Load a text-like file into one Document object."""
 
+        with open(path, "rb") as handle:
+            head = handle.read(8192)
+        if b"\x00" in head:
+            raise ValueError(f"{path} looks like a binary file; it was not indexed")
+
         content = ""
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8-sig") as handle:
                 content = handle.read().strip()
         except UnicodeDecodeError:
             with open(path, "r", encoding="latin-1") as handle:

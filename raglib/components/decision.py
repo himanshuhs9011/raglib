@@ -7,6 +7,7 @@ from typing import Optional
 
 from raglib.core.intents import is_comparison, is_greeting, needs_fresh_information
 from raglib.core.parsing import parse_label
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ class DecisionEngine:
             try:
                 label = parse_label(self.llm_client.complete(prompt=prompt), sorted(ALLOWED_RETRIEVAL_TYPES))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("DecisionEngine LLM call failed: %s", exc)
+                report_degraded("decision_engine", exc, logger)
                 label = None
             if label is not None:
                 if not self.allow_web and label in {RETRIEVAL_WEB, RETRIEVAL_HYBRID}:

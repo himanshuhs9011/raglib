@@ -12,7 +12,12 @@ Set DRY=1 to run every stage offline with the mock LLM (no key, no quota).
     python examples/live_free_models_e2e.py quota
     python examples/live_free_models_e2e.py needle
 """
-import json, os, random, sys, time, urllib.request
+import json
+import os
+import random
+import sys
+import time
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # run from a source checkout
 from raglib import RAG  # noqa: E402

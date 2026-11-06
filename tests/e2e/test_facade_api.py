@@ -10,8 +10,7 @@ import pytest
 from raglib import RAG
 from raglib.components.web_retriever import WebRetriever
 from raglib.providers.base_provider import BaseSearchProvider
-from raglib.schemas import Document
-from raglib.schemas import GenerationResult
+from raglib.schemas import Document, GenerationResult
 
 pytestmark = pytest.mark.e2e
 

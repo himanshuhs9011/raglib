@@ -7,7 +7,12 @@ import logging
 import uuid
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorHit, VectorRecord
+from raglib.vectorstores.base_store import (
+    BaseVectorStore,
+    MetadataFilter,
+    VectorHit,
+    VectorRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,19 +135,25 @@ class ChromaVectorStore(BaseVectorStore):
 
         if not query_embedding or top_k <= 0:
             return []
-        total_count = self.count()
-        if total_count <= 0:
-            return []
 
         kwargs: Dict[str, Any] = {
             "query_embeddings": [query_embedding],
-            "n_results": min(top_k, total_count),
+            "n_results": top_k,
             "include": ["distances", "documents", "metadatas"],
         }
         where = self._to_chroma_where(filters)
         if where:
             kwargs["where"] = where
-        result = self._collection.query(**kwargs)
+        # Query directly (current Chroma clamps n_results itself); only on an error - older
+        # versions reject n_results larger than the collection - pay for the count() round trip.
+        try:
+            result = self._collection.query(**kwargs)
+        except Exception:  # noqa: BLE001
+            total_count = self.count()
+            if total_count <= 0:
+                return []
+            kwargs["n_results"] = min(top_k, total_count)
+            result = self._collection.query(**kwargs)
 
         ids = (result.get("ids") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]

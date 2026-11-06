@@ -7,6 +7,7 @@ from typing import List, Optional, Sequence
 
 from raglib.components.evaluator import Evaluator
 from raglib.core.parsing import parse_json, parse_label, parse_label_map
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -72,7 +73,7 @@ class RelevanceGrader:
         try:
             raw = self.llm_client.complete(prompt=prompt, system="You are a strict retrieval relevance grader.")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("RelevanceGrader LLM call failed: %s", exc)
+            report_degraded("relevance_grader", exc, logger)
             return None
 
         data = parse_json(raw)

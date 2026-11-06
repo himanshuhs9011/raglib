@@ -8,8 +8,13 @@ from typing import Any, List, Optional
 from raglib.components.hybrid_retriever import HybridRetriever
 from raglib.components.retriever import Retriever
 from raglib.components.web_retriever import WebRetriever
-from raglib.core.intents import is_comparison, is_global_question, needs_fresh_information
+from raglib.core.intents import (
+    is_comparison,
+    is_global_question,
+    needs_fresh_information,
+)
 from raglib.core.parsing import parse_label
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -73,7 +78,7 @@ class RouterRetriever:
             try:
                 label = parse_label(self.llm_client.complete(prompt=prompt), routes)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("RouterRetriever LLM call failed: %s", exc)
+                report_degraded("router", exc, logger)
                 label = None
             if label is not None:
                 logger.info("RouterRetriever route selected by LLM: %s", label)

@@ -26,9 +26,12 @@ class PDFLoader:
         """Load a PDF and return one Document per page containing extracted text."""
 
         try:
-            import fitz  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise ImportError("PDF loading requires PyMuPDF. Install with: pip install raglib-py[pdf]") from exc
+            import pymupdf as fitz  # type: ignore[import-not-found]  # PyMuPDF >= 1.24
+        except ImportError:
+            try:
+                import fitz  # type: ignore[import-not-found,no-redef]  # older PyMuPDF
+            except ImportError as exc:
+                raise ImportError("PDF loading requires PyMuPDF. Install with: pip install raglib-py[pdf]") from exc
 
         documents: List[Document] = []
         base_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]

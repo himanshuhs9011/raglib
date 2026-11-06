@@ -1,4 +1,8 @@
-"""Advanced RAG: hybrid retrieval -> rerank -> dedupe -> budgeted, cited generation."""
+"""Advanced RAG: hybrid retrieval -> optional rerank -> dedupe -> budgeted, cited generation.
+
+Reranking runs only when a reranker is configured (``reranker="cross_encoder" | "cohere" |
+"llm"``); the default ``"none"`` keeps the hybrid retrieval order.
+"""
 
 from __future__ import annotations
 

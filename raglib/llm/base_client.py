@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()  # sentinel: "no JSON value" (distinct from a parsed null)
+
 
 class BaseLLMClient(ABC):
     """Defines the contract for language model clients.
@@ -77,10 +79,31 @@ class CachedLLMClient(BaseLLMClient):
                 self._cache.move_to_end(key)
                 self.hits += 1
                 return self._cache[key]
-        self.misses += 1
+            self.misses += 1
         value = self.inner.complete(prompt=prompt, system=system)
         with self._lock:
             self._cache[key] = value
+            if len(self._cache) > self.max_entries:
+                self._cache.popitem(last=False)
+        return value
+
+    def complete_json(self, prompt: str, system: str = "", default: Any = None) -> Any:
+        """Cached JSON completion that keeps the wrapped client's JSON mode."""
+
+        import json
+
+        key = hashlib.sha256(f"json\x00{system}\x00{prompt}".encode("utf-8")).hexdigest()
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self.hits += 1
+                return json.loads(self._cache[key])
+            self.misses += 1
+        value = self.inner.complete_json(prompt, system=system, default=_MISSING)
+        if value is _MISSING:
+            return default
+        with self._lock:
+            self._cache[key] = json.dumps(value)
             if len(self._cache) > self.max_entries:
                 self._cache.popitem(last=False)
         return value
@@ -148,6 +171,19 @@ class FallbackLLMClient(BaseLLMClient):
         """Chat with the first client that succeeds."""
 
         return self._try("chat", messages)
+
+    def complete_json(self, prompt: str, system: str = "", default: Any = None) -> Any:
+        """JSON completion with the first client that returns parseable JSON."""
+
+        for client in self.clients:
+            try:
+                value = client.complete_json(prompt, system=system, default=_MISSING)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LLM %s JSON call failed (%s)", getattr(client, "model_name", type(client).__name__), exc)
+                continue
+            if value is not _MISSING:
+                return value
+        return default
 
     def stream(self, prompt: str, system: str = "") -> Iterator[str]:
         """Stream from the first client that produces a first chunk."""

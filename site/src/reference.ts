@@ -57,6 +57,8 @@ export const PARAM_GROUPS: ParamGroup[] = [
       { name: "llm_rpm", default: "None", text: "Maximum requests per minute, shared by chat and embedding calls to the same provider and key. OpenRouter :free models default to 20; 0 disables." },
       { name: "llm_fallbacks", default: "None", text: 'Backup models tried in order when the main one fails, e.g. ["openrouter/anthropic/claude-haiku-5-5"].' },
       { name: "llm_cache", default: "True", text: "Caches identical LLM calls (query rewriting, grading, graph extraction). Cleared when documents are deleted." },
+      { name: "llm_temperature", default: "0.0", text: "Sampling temperature for models raglib builds from a provider name." },
+      { name: "llm_max_tokens", default: "None", text: "Cap on answer length, mapped to each provider's own parameter (max_tokens, max_output_tokens, num_predict)." },
     ],
   },
   {
@@ -95,6 +97,7 @@ export const PARAM_GROUPS: ParamGroup[] = [
       { name: "memory", default: "auto", text: "Per-session chat history. On by default only for rag_type=\"memory\"; True enables it for any type." },
       { name: "max_history_turns", default: "10", text: "Conversation turns kept per session." },
       { name: "max_history_tokens", default: "1200", text: "Token cap for history included in the prompt." },
+      { name: "conversation_store", default: "None", text: 'Where session history lives. Default: in memory. SQLiteConversationStore("chats.db") keeps it across restarts and worker processes.' },
     ],
   },
   {
@@ -115,8 +118,8 @@ export const PARAM_GROUPS: ParamGroup[] = [
     title: "Vector store",
     intro: "Where embeddings live.",
     params: [
-      { name: "vector_db", default: '"memory"', text: '"memory" (in RAM, save with rag.save()) or "chroma" (persistent / client-server). A BaseVectorStore instance also works.' },
-      { name: "vector_db_kwargs", default: "None", text: 'Store options, e.g. {"persist_directory": "./chroma", "collection_name": "docs"} or {"host": ..., "port": ...}.' },
+      { name: "vector_db", default: '"memory"', text: '"memory" (in RAM, save with rag.save()), "chroma", "qdrant" or "pgvector". A BaseVectorStore instance also works. Vectors of a different size are refused, so a changed embedding model fails loudly.' },
+      { name: "vector_db_kwargs", default: "None", text: 'Store options, e.g. {"persist_directory": "./chroma", "collection_name": "docs"}, {"url": "http://localhost:6333"} (Qdrant) or {"dsn": "postgresql://..."} (pgvector).' },
     ],
   },
   {
@@ -127,7 +130,7 @@ export const PARAM_GROUPS: ParamGroup[] = [
       { name: "enable_graph", default: "False", text: "Build the knowledge graph for non-graph types too, so agentic and routing gain a graph_search tool / route." },
       { name: "graph_store", default: '"networkx"', text: '"networkx" (in memory, saved as JSON) or "neo4j".' },
       { name: "graph_kwargs", default: "None", text: "entity_types, max_workers, gleanings, max_levels, max_community_size, community_rebuild_threshold, resolve_with_embeddings, resolution_threshold, min_llm_report_size, top_k_entities, hops, max_neighbors, max_relations, max_reports, top_communities, max_points, global_level, store_options." },
-      { name: "tools", default: "None", text: "Your own Tool(name, description, func) objects for rag_type agentic or tool." },
+      { name: "tools", default: "None", text: "Your own Tool(name, description, func) objects, or SQLTool.from_files(\"data.csv\") for exact counts and sums over tables, for rag_type agentic or tool." },
     ],
   },
   {
@@ -137,6 +140,7 @@ export const PARAM_GROUPS: ParamGroup[] = [
     params: [
       { name: "allowed_dirs", default: "None", text: "File and folder sources must be inside these directories (.. and symlinks resolved). Always set it when paths come from users." },
       { name: "allow_private_urls", default: "False", text: "Allow URLs pointing to private / localhost / cloud-metadata addresses. Keep False unless the source is a trusted intranet." },
+      { name: "strict", default: "False", text: "Raise when an optional step (grader, router, reranker, query rewrite, web search) fails, instead of falling back and listing it in result.metadata[\"degraded\"]." },
       { name: "on_event", default: "None", text: "Callback receiving a TraceEvent(stage, latency_ms, meta) for every stage: send to logs, OpenTelemetry, LangSmith." },
       { name: "offline", default: "None", text: "True: mock LLM + hash embeddings, no network. For tests and demos only (see below). None: reads RAGLIB_OFFLINE." },
     ],

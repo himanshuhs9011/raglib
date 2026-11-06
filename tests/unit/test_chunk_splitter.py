@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from raglib.loaders.chunk_splitter import ChunkSplitter
 from raglib.llm.mock_client import MockLLMClient
+from raglib.loaders.chunk_splitter import ChunkSplitter
 from raglib.schemas import Document
 
 

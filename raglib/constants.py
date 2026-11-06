@@ -25,7 +25,9 @@ SUPPORTED_EMBEDDING_PROVIDERS: Set[str] = {
     "mock",
 }
 SUPPORTED_VISION_PROVIDERS: Set[str] = {"openai", "anthropic", "google", "mock"}
-SUPPORTED_VECTOR_DBS: Set[str] = {"chroma", "chromadb", "memory", "in_memory", "inmemory", "mock"}
+SUPPORTED_VECTOR_DBS: Set[str] = {
+    "chroma", "chromadb", "memory", "in_memory", "inmemory", "mock", "qdrant", "pgvector", "postgres", "postgresql",
+}
 SUPPORTED_RETRIEVAL_MODES: Set[str] = {"dense", "sparse", "hybrid"}
 SUPPORTED_RERANKERS: Set[str] = {"none", "cross_encoder", "cohere", "llm"}
 SUPPORTED_WEB_PROVIDERS: Set[str] = {

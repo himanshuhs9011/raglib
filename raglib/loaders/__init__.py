@@ -13,6 +13,13 @@ from raglib.loaders.chunk_splitter import (
 from raglib.loaders.document_loader import DocumentLoader, SourceInput
 from raglib.loaders.pdf_loader import PDFLoader
 from raglib.loaders.pptx_loader import PPTXLoader
+from raglib.loaders.structured_loaders import (
+    CSVLoader,
+    EPUBLoader,
+    HTMLFileLoader,
+    JSONLoader,
+    XLSXLoader,
+)
 from raglib.loaders.text_loader import TextLoader
 from raglib.loaders.web_loader import WebLoader
 from raglib.loaders.word_loader import WordLoader
@@ -31,4 +38,9 @@ __all__ = [
     "PPTXLoader",
     "PDFLoader",
     "WebLoader",
+    "HTMLFileLoader",
+    "CSVLoader",
+    "JSONLoader",
+    "XLSXLoader",
+    "EPUBLoader",
 ]

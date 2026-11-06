@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -94,9 +95,12 @@ def parallel_map(fn: Callable[[T], R], items: Sequence[T], max_workers: int) -> 
     workers = min(max_workers, len(items))
     if workers <= 1 or not THREADS_AVAILABLE:
         return [fn(item) for item in items]
+    # Each task runs in a copy of the caller's context, so per-request state held in
+    # context variables (token usage, degradation log, strict mode) reaches worker threads.
+    contexts = [contextvars.copy_context() for _ in items]
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(fn, items))
+            return list(pool.map(lambda pair: pair[0].run(fn, pair[1]), zip(contexts, items)))
     except RuntimeError as exc:
         if "thread" not in str(exc).lower():
             raise

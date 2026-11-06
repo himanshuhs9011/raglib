@@ -6,7 +6,10 @@ import logging
 import os
 from typing import Any, Dict, Optional, Sequence
 
-from raglib.providers.base_provider import BaseSearchProvider, ProviderNotConfiguredError
+from raglib.providers.base_provider import (
+    BaseSearchProvider,
+    ProviderNotConfiguredError,
+)
 
 logger = logging.getLogger(__name__)
 

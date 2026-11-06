@@ -6,6 +6,7 @@ import logging
 from typing import List, Optional
 
 from raglib.components.query_rewriter import clean_llm_query
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -35,7 +36,7 @@ class Refiner:
         try:
             refined = clean_llm_query(self.llm_client.complete(prompt=prompt), fallback=query)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Refiner failed: %s", exc)
+            report_degraded("refiner", exc, logger)
             return query
         logger.debug("Refiner produced a refined query (changed=%s)", refined != query)
         return refined

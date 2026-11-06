@@ -7,6 +7,7 @@ import threading
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -74,7 +75,7 @@ class Reranker:
             texts = [doc.content[: self.max_chars_per_doc] for doc in documents]
             scores = list(self._score(query, texts))
         except Exception as exc:  # noqa: BLE001 - reranking must degrade to first-stage order
-            logger.warning("Reranker backend=%s failed (%s); keeping retrieval order", self.backend, exc)
+            report_degraded(f"reranker:{self.backend}", exc, logger)
             return list(documents[:k])
         rescored = [
             replace(doc, score=float(score), metadata={**doc.metadata, "rerank_score": float(score), "first_stage_score": doc.score})

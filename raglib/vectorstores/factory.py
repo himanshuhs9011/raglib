@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 CHROMA_ALIASES = {"chroma", "chromadb"}
 MEMORY_ALIASES = {"memory", "in_memory", "inmemory", "mock"}
+QDRANT_ALIASES = {"qdrant"}
+PGVECTOR_ALIASES = {"pgvector", "postgres", "postgresql"}
 
 
 class VectorStoreFactory:
@@ -40,18 +42,24 @@ class VectorStoreFactory:
         if backend in MEMORY_ALIASES:
             return InMemoryVectorStore()
 
+        # The backend's client library is imported inside its constructor, so a missing
+        # extra raises ImportError below (and honours fallback_to_memory).
+        store_class: Any
         if backend in CHROMA_ALIASES:
-            try:
-                from raglib.vectorstores.chroma_store import ChromaVectorStore
-
-                return ChromaVectorStore(**options)
-            except Exception as exc:  # noqa: BLE001
-                if not fallback_to_memory:
-                    raise
-                logger.warning("Chroma unavailable (%s); fallback_to_memory=True so using InMemoryVectorStore", exc)
-                return InMemoryVectorStore()
-
-        raise ValueError(
-            f"Unknown vector_db '{backend}'. Supported values: ['chroma', 'memory'] "
-            "or pass a BaseVectorStore instance."
-        )
+            from raglib.vectorstores.chroma_store import ChromaVectorStore as store_class
+        elif backend in QDRANT_ALIASES:
+            from raglib.vectorstores.qdrant_store import QdrantVectorStore as store_class
+        elif backend in PGVECTOR_ALIASES:
+            from raglib.vectorstores.pgvector_store import PGVectorStore as store_class
+        else:
+            raise ValueError(
+                f"Unknown vector_db '{backend}'. Supported values: ['chroma', 'memory', 'pgvector', 'qdrant'] "
+                "or pass a BaseVectorStore instance."
+            )
+        try:
+            return store_class(**options)
+        except Exception as exc:  # noqa: BLE001
+            if not fallback_to_memory:
+                raise
+            logger.warning("%s unavailable (%s); fallback_to_memory=True so using InMemoryVectorStore", backend, exc)
+            return InMemoryVectorStore()

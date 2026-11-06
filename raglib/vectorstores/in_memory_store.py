@@ -37,7 +37,14 @@ class InMemoryVectorStore(BaseVectorStore):
         self._payload: Dict[str, Tuple[str, Dict]] = {}  # id -> (text, metadata)
         self._norms: Dict[str, float] = {}
         self._matrix = None  # (normalized float32 matrix, ids) snapshot, rebuilt lazily after writes
+        self._dimension: Optional[int] = None
         self._lock = ReadWriteLock()
+
+    @property
+    def dimension(self) -> Optional[int]:
+        """Vector size held by the store (None while empty)."""
+
+        return self._dimension
 
     def clear(self) -> None:
         """Remove all stored vectors from memory."""
@@ -47,16 +54,32 @@ class InMemoryVectorStore(BaseVectorStore):
             self._payload.clear()
             self._norms.clear()
             self._matrix = None
+            self._dimension = None
 
     def upsert(self, records: List[VectorRecord]) -> None:
-        """Insert or replace vector records keyed by document id."""
+        """Insert or replace vector records keyed by document id.
+
+        Every vector must have the same size: mixing sizes means the embedding model
+        changed, and comparing such vectors would silently return meaningless scores.
+        """
 
         prepared = []
+        sizes = {len(record.embedding) for record in records}
+        if len(sizes) > 1:
+            raise ValueError(f"Embedding dimension mismatch inside one batch: {sorted(sizes)}")
         for record in records:
             vector = array("f", record.embedding)
             norm = math.sqrt(sum(value * value for value in vector))
             prepared.append((record, vector, norm))
         with self._lock.write():
+            if prepared:
+                size = len(prepared[0][1])
+                if self._dimension is not None and self._vectors and size != self._dimension:
+                    raise ValueError(
+                        f"Embedding dimension mismatch: the store holds {self._dimension}-d vectors but got {size}-d. "
+                        "The embedding model changed; re-index with the new model (or keep using the old one)."
+                    )
+                self._dimension = size
             for record, vector, norm in prepared:
                 self._vectors[record.document_id] = vector
                 self._payload[record.document_id] = (record.document_text, dict(record.metadata))
@@ -73,6 +96,8 @@ class InMemoryVectorStore(BaseVectorStore):
                 self._payload.pop(record_id, None)
                 self._norms.pop(record_id, None)
             self._matrix = None
+            if not self._vectors:
+                self._dimension = None
 
     def count(self) -> int:
         """Return the number of stored vectors."""
@@ -114,6 +139,11 @@ class InMemoryVectorStore(BaseVectorStore):
         with self._lock.read():
             if not self._vectors:
                 return []
+            if self._dimension is not None and len(query_embedding) != self._dimension:
+                raise ValueError(
+                    f"Query embedding has {len(query_embedding)} dimensions but the index holds "
+                    f"{self._dimension}-d vectors: the query uses a different embedding model than the index."
+                )
             allowed: Optional[Set[str]] = None
             if filters:
                 allowed = {rid for rid, (_, meta) in self._payload.items() if matches_filter(meta, filters)}

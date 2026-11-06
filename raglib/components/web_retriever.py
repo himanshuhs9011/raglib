@@ -6,6 +6,7 @@ import logging
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
+from raglib.core.runtime import report_degraded
 from raglib.providers.base_provider import BaseSearchProvider, ProviderError
 from raglib.providers.duckduckgo_provider import DuckDuckGoProvider
 from raglib.providers.factory import build_search_provider
@@ -62,7 +63,7 @@ class WebRetriever:
         try:
             docs = self.provider.search(query=query, num_results=self.top_k)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("WebRetriever provider failed: %s", exc)
+            report_degraded(f"web_search:{self.provider.name}", exc, logger)
             fallback_docs = self._retrieve_from_fallback(query=query, cause=exc)
             if fallback_docs:
                 return fallback_docs
@@ -88,7 +89,7 @@ class WebRetriever:
         try:
             docs = self.fallback_provider.search(query=query, num_results=self.top_k)
         except Exception as fallback_exc:  # noqa: BLE001
-            logger.warning("WebRetriever fallback provider failed: %s", fallback_exc)
+            report_degraded(f"web_search:{self.fallback_provider.name}", fallback_exc, logger)
             if self.fail_silently:
                 return []
             raise ProviderError(

@@ -12,7 +12,6 @@ from raglib.llm.constants import (
     OLLAMA_DEFAULT_BASE_URL,
     PROVIDER_DEFAULT_CHAT_MODEL,
 )
-
 from raglib.llm.resilience import RateLimiter, is_retryable, retry_call
 
 logger = logging.getLogger(__name__)
@@ -40,6 +39,7 @@ class LangChainAdapter(BaseLLMClient):
         self._retry_base_delay = retry_base_delay
         self.model_name = model_name or getattr(langchain_model, "model_name", None) or getattr(langchain_model, "model", None)
         self.rate_limiter = rate_limiter
+        self._json_mode: Optional[bool] = None  # None = not yet known for this model
 
     @property
     def provider(self) -> str:
@@ -52,7 +52,68 @@ class LangChainAdapter(BaseLLMClient):
 
         payload = self._build_payload(prompt=prompt, system=system)
         response = self._invoke_with_retry(payload)
-        return self._coerce_content(getattr(response, "content", response))
+        text = self._coerce_content(getattr(response, "content", response))
+        self._record_usage(response, f"{system}\n{prompt}", text)
+        return text
+
+    def complete_json(self, prompt: str, system: str = "", default: Any = None) -> Any:
+        """Complete in the provider's JSON mode when supported, else parse JSON from free text.
+
+        JSON mode (``response_format={"type": "json_object"}``) is used for OpenAI and
+        OpenAI-compatible providers. If the model rejects it, raglib remembers that and
+        falls back to plain completion for this client.
+        """
+
+        from raglib.core.parsing import parse_json
+
+        if self._json_mode_supported():
+            payload = self._build_payload(prompt=prompt, system=system)
+            try:
+                bound = self._model.bind(response_format={"type": "json_object"})
+                response = retry_call(
+                    bound.invoke,
+                    payload,
+                    max_retries=self._max_retries,
+                    base_delay=self._retry_base_delay,
+                    limiter=self.rate_limiter,
+                    label=f"{self._provider}:{self.model_name}:json",
+                )
+            except Exception as exc:  # noqa: BLE001 - unsupported parameter: remember and fall back
+                if is_retryable(exc):
+                    logger.warning("JSON-mode call failed (%s); retrying without JSON mode", exc)
+                else:
+                    logger.info("Model %s rejected JSON mode (%s); using plain completions", self.model_name, exc)
+                    self._json_mode = False
+            else:
+                text = self._coerce_content(getattr(response, "content", response))
+                self._record_usage(response, f"{system}\n{prompt}", text)
+                parsed = parse_json(text, default=None)
+                if parsed is not None:
+                    return parsed
+        return super().complete_json(prompt, system=system, default=default)
+
+    def _json_mode_supported(self) -> bool:
+        """Whether to try the provider's JSON mode for this client."""
+
+        if self._json_mode is not None:
+            return self._json_mode
+        from raglib.llm.providers import KIND_OPENAI_COMPATIBLE, PROVIDERS
+
+        spec = PROVIDERS.get(self._provider)
+        supported = self._provider in {"openai", "azure"} or (spec is not None and spec.kind == KIND_OPENAI_COMPATIBLE)
+        return supported and hasattr(self._model, "bind")
+
+    def _record_usage(self, response: Any, prompt_text: str, completion: str) -> None:
+        """Report token usage: the provider's counts when present, else an estimate."""
+
+        from raglib.core.runtime import record_usage
+        from raglib.core.text import count_tokens
+
+        usage = getattr(response, "usage_metadata", None)
+        if isinstance(usage, dict) and (usage.get("input_tokens") or usage.get("output_tokens")):
+            record_usage(int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0), estimated=False)
+        else:
+            record_usage(count_tokens(prompt_text), count_tokens(completion), estimated=True)
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Execute a multi-turn chat completion from role/content dictionaries."""
@@ -78,22 +139,55 @@ class LangChainAdapter(BaseLLMClient):
                 f"{message.get('role', 'user')}: {message.get('content', '')}" for message in messages
             )
         response = self._invoke_with_retry(payload)
-        return self._coerce_content(getattr(response, "content", response))
+        text = self._coerce_content(getattr(response, "content", response))
+        self._record_usage(response, "\n".join(str(message.get("content", "")) for message in messages), text)
+        return text
 
     def stream(self, prompt: str, system: str = "") -> Iterator[str]:
-        """Stream tokens when the underlying model supports ``.stream``."""
+        """Stream tokens when the underlying model supports ``.stream``.
+
+        Opening the stream and receiving the first chunk are retried like ``complete``
+        (rate limits, timeouts, 5xx); once tokens are flowing, errors propagate, because
+        a retry would repeat text the caller has already received.
+        """
 
         payload = self._build_payload(prompt=prompt, system=system)
         stream_fn = getattr(self._model, "stream", None)
         if stream_fn is None:
             yield self.complete(prompt=prompt, system=system)
             return
-        if self.rate_limiter is not None:
-            self.rate_limiter.acquire()
-        for chunk in stream_fn(payload):
+
+        def open_stream():
+            iterator = iter(stream_fn(payload))
+            return iterator, next(iterator, None)
+
+        iterator, first = retry_call(
+            open_stream,
+            max_retries=self._max_retries,
+            base_delay=self._retry_base_delay,
+            limiter=self.rate_limiter,
+            label=f"{self._provider}:{self.model_name}:stream",
+        )
+        parts: List[str] = []
+        usage: Optional[Dict[str, int]] = None
+        chunk = first
+        while chunk is not None:
+            chunk_usage = getattr(chunk, "usage_metadata", None)
+            if isinstance(chunk_usage, dict) and (chunk_usage.get("input_tokens") or chunk_usage.get("output_tokens")):
+                usage = {
+                    "input_tokens": (usage or {}).get("input_tokens", 0) + int(chunk_usage.get("input_tokens") or 0),
+                    "output_tokens": (usage or {}).get("output_tokens", 0) + int(chunk_usage.get("output_tokens") or 0),
+                }
             text = self._coerce_content(getattr(chunk, "content", chunk))
             if text:
+                parts.append(text)
                 yield text
+            chunk = next(iterator, None)
+
+        class _Usage:
+            usage_metadata = usage
+
+        self._record_usage(_Usage, f"{system}\n{prompt}", "".join(parts))
 
     async def acomplete(self, prompt: str, system: str = "") -> str:
         """Use native ``ainvoke`` when available, else a worker thread."""
@@ -107,7 +201,9 @@ class LangChainAdapter(BaseLLMClient):
 
             await asyncio.to_thread(self.rate_limiter.acquire)
         response = await ainvoke(payload)
-        return self._coerce_content(getattr(response, "content", response))
+        text = self._coerce_content(getattr(response, "content", response))
+        self._record_usage(response, f"{system}\n{prompt}", text)
+        return text
 
     def _build_payload(self, prompt: str, system: str) -> Any:
         """Build LangChain messages, or a plain string when langchain-core is missing."""
@@ -145,10 +241,20 @@ class LangChainAdapter(BaseLLMClient):
         temperature: float = 0.0,
         timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_LLM_MAX_RETRIES,
+        max_tokens: Optional[int] = None,
     ) -> "LangChainAdapter":
-        """Build a provider-specific LangChain chat model and wrap it with this adapter."""
+        """Build a provider-specific LangChain chat model and wrap it with this adapter.
 
-        from raglib.llm.providers import KIND_AZURE, KIND_OPENAI_COMPATIBLE, get_provider
+        ``max_tokens`` caps the answer length (mapped to each provider's parameter name).
+        """
+
+        limit: Dict[str, Any] = {"max_tokens": max_tokens} if max_tokens else {}
+
+        from raglib.llm.providers import (
+            KIND_AZURE,
+            KIND_OPENAI_COMPATIBLE,
+            get_provider,
+        )
 
         spec = get_provider(provider)
         normalized_provider = spec.name
@@ -167,6 +273,7 @@ class LangChainAdapter(BaseLLMClient):
                 base_url=base_url,
                 temperature=temperature,
                 timeout=timeout,
+                limit=limit,
             )
             logger.info("Built LangChainAdapter provider='%s' model='%s'", normalized_provider, resolved_model)
             return cls(langchain_model=lc_model, provider_name=normalized_provider, max_retries=max_retries, model_name=resolved_model)
@@ -189,6 +296,7 @@ class LangChainAdapter(BaseLLMClient):
                 temperature=temperature,
                 timeout=timeout,
                 max_retries=0,
+                **limit,
             )
             logger.info("Built LangChainAdapter provider='azure' deployment='%s'", resolved_model)
             return cls(langchain_model=lc_model, provider_name="azure", max_retries=max_retries, model_name=resolved_model)
@@ -205,6 +313,7 @@ class LangChainAdapter(BaseLLMClient):
                 temperature=temperature,
                 timeout=timeout,
                 max_retries=0,
+                **limit,
             )
         elif normalized_provider == "anthropic":
             try:
@@ -217,6 +326,7 @@ class LangChainAdapter(BaseLLMClient):
                 temperature=temperature,
                 timeout=timeout,
                 max_retries=0,
+                **limit,
             )
         elif normalized_provider == "groq":
             try:
@@ -229,6 +339,7 @@ class LangChainAdapter(BaseLLMClient):
                 temperature=temperature,
                 timeout=timeout,
                 max_retries=0,
+                **limit,
             )
         elif normalized_provider == "google":
             try:
@@ -241,6 +352,7 @@ class LangChainAdapter(BaseLLMClient):
                 temperature=temperature,
                 timeout=timeout,
                 max_retries=0,
+                **({"max_output_tokens": max_tokens} if max_tokens else {}),
             )
         elif normalized_provider == "ollama":
             try:
@@ -251,6 +363,7 @@ class LangChainAdapter(BaseLLMClient):
                 model=resolved_model,
                 base_url=base_url or OLLAMA_DEFAULT_BASE_URL,
                 temperature=temperature,
+                **({"num_predict": max_tokens} if max_tokens else {}),
             )
         else:
             raise ValueError(
@@ -268,6 +381,7 @@ class LangChainAdapter(BaseLLMClient):
         base_url: Optional[str],
         temperature: float,
         timeout: float,
+        limit: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """ChatOpenAI pointed at an OpenAI-compatible endpoint (OpenRouter, DeepSeek, vLLM, ...)."""
 
@@ -297,6 +411,7 @@ class LangChainAdapter(BaseLLMClient):
             timeout=timeout,
             max_retries=0,
             default_headers=headers or None,
+            **(limit or {}),
         )
 
     @classmethod

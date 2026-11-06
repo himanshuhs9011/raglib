@@ -5,11 +5,19 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Union
 
 from raglib.loaders.pdf_loader import PDFLoader
 from raglib.loaders.pptx_loader import PPTXLoader
+from raglib.loaders.structured_loaders import (
+    CSVLoader,
+    EPUBLoader,
+    HTMLFileLoader,
+    JSONLoader,
+    XLSXLoader,
+)
 from raglib.loaders.text_loader import TextLoader
 from raglib.loaders.web_loader import WebLoader
 from raglib.loaders.word_loader import WordLoader
@@ -20,11 +28,29 @@ logger = logging.getLogger(__name__)
 
 SourceInput = Union[str, os.PathLike[str], Document, Sequence[Union[str, os.PathLike[str], Document]], None]
 
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".adoc", ".tex", ".log", ".org",
+    # source code and configuration (loaded as plain text)
+    ".py", ".pyi", ".ipynb", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".java", ".kt", ".scala", ".go", ".rs",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift", ".m", ".r", ".lua", ".pl", ".sh",
+    ".bash", ".ps1", ".bat", ".sql", ".graphql", ".proto", ".css", ".scss", ".vue", ".svelte",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
+}
+# Directories that never hold documents (VCS internals, dependencies, caches, virtualenvs).
+SKIPPED_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".idea", ".vscode", "dist", "build", ".next", ".cache",
+}
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
 
 class DocumentLoader:
     """Dispatch source input to the correct format loader."""
 
-    SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".pptx"}
+    SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | {
+        ".pdf", ".docx", ".pptx", ".html", ".htm", ".xhtml", ".csv", ".tsv", ".json", ".jsonl", ".ndjson",
+        ".xlsx", ".epub",
+    }
 
     def __init__(
         self,
@@ -34,6 +60,11 @@ class DocumentLoader:
         pptx_loader: Optional[PPTXLoader] = None,
         text_loader: Optional[TextLoader] = None,
         web_loader: Optional[WebLoader] = None,
+        html_loader: Optional[HTMLFileLoader] = None,
+        csv_loader: Optional[CSVLoader] = None,
+        json_loader: Optional[JSONLoader] = None,
+        xlsx_loader: Optional[XLSXLoader] = None,
+        epub_loader: Optional[EPUBLoader] = None,
         allow_private_urls: bool = False,
         allowed_dirs: Optional[Sequence[Union[str, os.PathLike]]] = None,
     ):
@@ -49,7 +80,12 @@ class DocumentLoader:
         self.word_loader = word_loader or WordLoader()
         self.pptx_loader = pptx_loader or PPTXLoader()
         self.text_loader = text_loader or TextLoader()
-        self.web_loader = web_loader or WebLoader(allow_private_hosts=allow_private_urls)
+        self.web_loader = web_loader or WebLoader(allow_private_hosts=allow_private_urls, pdf_loader=self.pdf_loader)
+        self.html_loader = html_loader or HTMLFileLoader()
+        self.csv_loader = csv_loader or CSVLoader()
+        self.json_loader = json_loader or JSONLoader()
+        self.xlsx_loader = xlsx_loader or XLSXLoader()
+        self.epub_loader = epub_loader or EPUBLoader()
 
     def load(self, source: SourceInput) -> List[Document]:
         """Load input source(s) into a list of normalized Document objects."""
@@ -102,15 +138,24 @@ class DocumentLoader:
         if is_explicit_path or self._looks_like_missing_file_path(normalized):
             raise FileNotFoundError(f"Source file or directory not found: '{normalized}'")
 
+        if "\n" not in normalized and len(normalized) < 200:
+            logger.info("Source %r is not an existing file or URL; indexing it as raw text", normalized[:60])
         stable_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
         yield [Document(f"raw-{stable_id}", normalized, {"loader": "raw_text"}, 0.0, "text")]
 
     def iter_files(self, folder_path: str) -> Iterator[str]:
-        """Yield supported file paths under a folder (sorted, recursive)."""
+        """Yield supported file paths under a folder (sorted, recursive).
+
+        Hidden and tooling directories (``.git``, ``node_modules``, virtualenvs, caches) are
+        skipped. Files without an extension (README, LICENSE, ...) are included and are
+        dropped later if they turn out to be binary.
+        """
 
         for root, dirs, filenames in os.walk(folder_path):
-            dirs.sort()
+            dirs[:] = sorted(d for d in dirs if d not in SKIPPED_DIRS and not d.startswith("."))
             for filename in sorted(filenames):
+                if filename.startswith("."):
+                    continue
                 file_path = os.path.join(root, filename)
                 extension = Path(file_path).suffix.lower()
                 if extension and extension not in self.SUPPORTED_EXTENSIONS:
@@ -140,14 +185,22 @@ class DocumentLoader:
         raise PermissionError(f"Source path is outside allowed_dirs: {path}")
 
     def _looks_like_missing_file_path(self, value: str) -> bool:
-        """Detect single-line strings that clearly refer to a missing file path."""
+        """Detect single-line strings that clearly refer to a file or folder path.
+
+        A typo such as ``RAG("./my_docs")`` must raise ``FileNotFoundError`` instead of
+        indexing the string ``"./my_docs"`` as a document.
+        """
 
         if "\n" in value or "\r" in value or len(value) > 260:
             return False
-        if " " in value and not any(sep in value for sep in ("/", "\\")):
+        has_separator = "/" in value or "\\" in value
+        if Path(value).suffix.lower() in self.SUPPORTED_EXTENSIONS and (has_separator or " " not in value):
+            return True
+        if any(char.isspace() for char in value):
             return False
-        suffix = Path(value).suffix.lower()
-        return suffix in self.SUPPORTED_EXTENSIONS
+        if value.startswith(("./", ".\\", "../", "..\\", "/", "\\", "~")) or _DRIVE_RE.match(value):
+            return True
+        return has_separator
 
     def _load_folder(self, folder_path: str) -> List[Document]:
         """Load all supported files recursively from a folder path."""
@@ -164,10 +217,20 @@ class DocumentLoader:
             return self.word_loader.load(path)
         if extension == ".pptx":
             return self.pptx_loader.load(path)
-        if extension in {".txt", ".md"}:
+        if extension in {".html", ".htm", ".xhtml"}:
+            return self.html_loader.load(path)
+        if extension in {".csv", ".tsv"}:
+            return self.csv_loader.load(path)
+        if extension in {".json", ".jsonl", ".ndjson"}:
+            return self.json_loader.load(path)
+        if extension == ".xlsx":
+            return self.xlsx_loader.load(path)
+        if extension == ".epub":
+            return self.epub_loader.load(path)
+        if extension in TEXT_EXTENSIONS:
             return self.text_loader.load(path)
 
-        logger.warning("Unknown extension '%s' for file=%s; attempting text loader fallback", extension, path)
+        logger.info("No dedicated loader for '%s' (file=%s); reading it as text", extension or "(no extension)", path)
         return self.text_loader.load(path)
 
     def _is_url(self, value: str) -> bool:
