@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from raglib.core.concurrency import parallel_map
 from raglib.graphrag.schemas import (
@@ -55,6 +55,9 @@ class GraphExtractor:
         self.cache: Dict[str, Dict[str, Any]] = cache if cache is not None else {}
         self._lock = threading.Lock()
         self.llm_calls = 0
+        # Chunks whose extraction call failed (rate limit, timeout, unparsable reply). They are NOT
+        # cached, so the next add / retry extracts them again instead of keeping an empty fragment.
+        self.failed_chunk_ids: Set[str] = set()
         self.chunk_cache_keys: Dict[str, str] = {}  # chunk id -> cache key (so deletion can purge the cache)
 
     def extract(self, chunks: Sequence[Document]) -> Dict[str, ExtractionResult]:
@@ -79,9 +82,14 @@ class GraphExtractor:
         raw_entities: List[Dict[str, Any]] = []
         raw_relations: List[Dict[str, Any]] = []
         data = self._call(self._prompt(text))
-        if isinstance(data, dict):
-            raw_entities.extend(data.get("entities") or [])
-            raw_relations.extend(data.get("relations") or [])
+        if not isinstance(data, dict):
+            with self._lock:
+                self.failed_chunk_ids.add(chunk.id)
+            return self._attach_chunk(ExtractionResult(entities=[], relations=[]), chunk.id)
+        with self._lock:
+            self.failed_chunk_ids.discard(chunk.id)
+        raw_entities.extend(data.get("entities") or [])
+        raw_relations.extend(data.get("relations") or [])
         for _ in range(self.gleanings):
             known = ", ".join(str(item.get("name", "")) for item in raw_entities if isinstance(item, dict))
             more = self._call(self._prompt(text, already_found=known))
@@ -116,7 +124,9 @@ class GraphExtractor:
             "Task: knowledge graph extraction.\n"
             f"Extract the important entities (types: {', '.join(self.entity_types)}) and the relations between them "
             "from the text. Use the exact entity names as written in the text. Each relation must connect two "
-            "extracted entities. Describe each entity and relation in one sentence, based only on the text.\n"
+            "extracted entities. Describe each entity and relation in one sentence, based only on the text. "
+            f"Return at most {self.max_entities_per_chunk} entities and {self.max_entities_per_chunk * 2} relations, "
+            "the most important first, and stop after the closing brace.\n"
             f"{extra}"
             'Return JSON: {"entities": [{"name": "...", "type": "...", "description": "..."}], '
             '"relations": [{"source": "...", "target": "...", "type": "SHORT_VERB_PHRASE", '

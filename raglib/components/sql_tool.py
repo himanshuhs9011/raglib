@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -36,6 +37,12 @@ logger = logging.getLogger(__name__)
 # SQLite authorizer action codes allowed: SELECT (21), READ (20), FUNCTION (31), RECURSIVE (33).
 _READ_ACTIONS = {21, 20, 31, 33}
 _FENCE_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _allow_all(*_: Any) -> int:
+    """Authorizer that permits everything (SQLITE_OK); clears a read-only authorizer on Python < 3.11."""
+
+    return 0
 
 
 def _identifier(name: str, fallback: str) -> str:
@@ -261,7 +268,10 @@ class SQLTool:
                     raise TimeoutError(f"SQL query exceeded {self.timeout_seconds}s") from exc
                 raise
             finally:
-                self._conn.set_authorizer(None)
+                if sys.version_info >= (3, 11):
+                    self._conn.set_authorizer(None)
+                else:  # before 3.11 None is not "no authorizer": it denied every later statement
+                    self._conn.set_authorizer(_allow_all)
                 self._conn.set_progress_handler(None, 0)
         return {"columns": columns, "rows": rows[: self.max_rows], "truncated": len(rows) > self.max_rows}
 

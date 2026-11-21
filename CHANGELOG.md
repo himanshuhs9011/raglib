@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.2.0 - 2026-11-21
+
+**Benchmark.** raglib's RAG types are now measured on MultiHop-RAG, a public third-party dataset: method, code and every answer are in `benchmarks/multihop_rag/`, and results are on the website's Benchmarks page.
+
+**Fixes found by benchmarking on MultiHop-RAG** (see `benchmarks/multihop_rag/`).
+- **Corrective RAG answered from an empty context.** Its grader asked whether each chunk *answers* the question, so for questions whose evidence spans several documents every chunk was graded irrelevant. Without web search the INCORRECT path then had nothing to use: on 30 unseen questions, 9 answers were generated with zero sources. The grader now counts a chunk about any one of the entities, sources or events the question names as partially relevant. Without web search, Corrective RAG falls back to the retrieved chunks instead of an empty context (`result.metadata["crag_fallback"]`). Empty-context answers went from 9/30 to 0/30.
+- **Multi-query retrieval lost parts of compound questions.** The expander only paraphrased the whole question, and RRF fusion rewards chunks found by many queries, so for "does source A say X while source B says Y" one article took every slot. It now writes one focused query per entity, source or claim, and the fusion keeps each query's best hit before filling by RRF.
+- **GraphContextWindow:** entity detection no longer joins words across line breaks (junk `SHARED_ENTITY` links), and `retrieve()` returns chunks before section summaries, with a `title` on every result.
+- **GraphRAG kept holes in the graph after provider errors.** When an extraction call failed (rate limit, timeout, unparsable reply), the chunk was cached and marked indexed with no entities, so a temporary 429 permanently removed its facts from the graph. Failed chunks are now neither cached nor marked indexed. `rag.stats()["graph"]["failed_extractions"]` counts them, `rag.retry_graph_extraction()` extracts them again, and loading a saved index retries them automatically.
+- **`graph_llm`:** build the GraphRAG graph with a cheaper or faster model than the answers.
+- **GraphRAG answers saw half the evidence.** The entity, relation and community summaries were packed first into the 3,000-token context budget and used about 60% of it, so answers got 2.6 article chunks instead of 5. Questions that name two articles then failed with "the second source is not provided". Documents marked `metadata["supplementary"]` (GraphRAG's summaries) now have their own budget (`Generator(max_supplementary_tokens=1200)`) and can no longer push evidence out of the context.
+- **Bounded extraction retries.** A chunk whose extraction keeps failing (some small models loop until `max_tokens` and return an empty reply) was retried, and paid for, on every add and every load. It is now retried at most `graph_kwargs={"max_extraction_attempts": 3}` times in total, then skipped. Its text stays searchable and `stats()["graph"]["skipped_extractions"]` counts it. `retry_graph_extraction(include_skipped=True)` tries again, for example with another model.
+- **Truncated JSON is salvaged.** `parse_json` keeps every complete item of a reply cut off at `max_tokens` (`{"entities": [{...}, {...}, {"na` keeps the first two entities) instead of discarding the whole reply. It also no longer returns an inner list when the outer object is truncated.
+- **Extraction replies are capped** at `graph_kwargs={"extraction_max_tokens": 4096}`, and the prompt states the entity and relation limits, so a looping model cannot run for minutes on one chunk.
+- **Indexes load in seconds.** In-memory vectors (chunks and GraphRAG entities) are saved as binary float32 (`vectors.f32` + `vectors.meta.json`) instead of JSON numbers. A 609-article GraphRAG index went from 1.7 GB and an 81 s load to 402 MB and 2–5 s, with identical search results. Indexes saved by older versions still load, and the next `save()` converts them.
+- **Background graph builds.** `RAG(rag_type="graph", graph_build="background")` returns from `add()` and `load()` as soon as chunks are searchable. Queries are answered immediately from hybrid search plus the part of the graph built so far, while one worker extracts in batches and builds community reports when the queue is empty. `rag.graph_status()` reports progress and `rag.wait_for_graph(timeout)` blocks until it is ready. Graph reads now use a read-write lock: queries run concurrently with each other and with community report generation, and are only paused for the short merge of each batch. Entity embedding calls no longer run while the graph is locked.
+- **Per-model `json_mode`.** `models=[{"id": "...", "json_mode": False}]` on a custom provider stops raglib from sending `response_format` to models that accept JSON mode but then loop in it. JSON is parsed from the plain reply instead.
+
+- **`SQLTool` broke after its first query on Python 3.9 and 3.10.** Clearing the read-only SQLite authorizer with `None` only works from Python 3.11. Before that, every later statement, `schema()` included, failed with "not authorized".
+- **Packaging:** the source distribution no longer picks up README and LICENSE files from `site/node_modules`.
+- **Citation labels no longer leak full Windows paths on Linux** (`C:\Users\...\report.pdf` is shown as `report.pdf`).
+
+**LangChain is no longer used to call providers.**
+- New native clients in `raglib.llm.clients` speak the three wire protocols directly with the standard library (`urllib`): `OpenAICompatibleClient` (OpenAI, Azure OpenAI, Groq, Ollama, OpenRouter, DeepSeek, Mistral, Together, Fireworks, xAI, Perplexity, Cerebras, LM Studio, vLLM), `AnthropicClient` and `GeminiClient`. They support SSE streaming, JSON mode (OpenAI-compatible and Gemini), provider token usage, retries and rate limiting. `build_chat_client(provider, ...)` builds one.
+- Embeddings (OpenAI / Azure / compatible, Gemini, Ollama) call the REST APIs directly; `huggingface` uses `sentence-transformers` without `langchain-huggingface`. Class names are unchanged, so saved indexes still load.
+- Vision OCR (OpenAI, Anthropic, Gemini) reuses the native chat clients. DuckDuckGo search uses `ddgs` directly.
+- Retries use the HTTP status when there is one (408/409/425/429/5xx), not only the error text. An error event at the start of a stream (e.g. Anthropic `overloaded_error`) is retried.
+- Importing raglib and building a client no longer loads LangChain: creating a `RAG` with a hosted provider went from about 4.3 s to 0.45 s.
+- The `[openai]`, `[anthropic]`, `[groq]`, `[google]`, `[ollama]`, `[openrouter]` and `[all-llm]` extras are now empty (kept so existing install commands work); `[hf]` is just `sentence-transformers`. New `[langchain]` extra for wrapping your own LangChain model.
+**Custom providers.**
+- `register_provider("myprovider", api="openai" | "anthropic" | "gemini", base_url=..., api_key="{env:NAME}", headers=..., models=[{"id", "name", "reasoning", "image"}], embedding_model=...)` makes `RAG(llm="myprovider/model")` work for any third-party or self-hosted API. The key is optional (auth can go in headers), and `{env:NAME}` is expanded in keys and header values.
+- `load_providers("providers.json")`, the `RAGLIB_PROVIDERS_FILE` environment variable, and `raglib ... --providers FILE` register providers from JSON. `raglib providers` lists them with their models.
+- Model flags: `reasoning` stops sending `temperature`; `image` enables OCR of scanned pages with that model. A leading `<think>...</think>` block from reasoning models is removed from answers and streams.
+- Custom providers get embeddings through their own API (OpenAI and Gemini protocols) and keep the key-isolation rule: a key is never sent to a different provider.
+
+**NVIDIA NIM.** New built-in provider `nvidia` (alias `nim`, key prefix `nvapi-`, `NVIDIA_API_KEY`), for build.nvidia.com or a self-hosted NIM via `NVIDIA_BASE_URL`. Chat defaults to `nvidia/nemotron-3.5-lightning-30b-a3b`, embeddings to `nvidia/nemotron-3-embed-1b` (with the `input_type` passage/query fields these models require), and OCR of scanned pages to `nvidia/nemotron-3.5-super-vl-120b-a12b`. Tested live: cited answers, streaming with real usage, Corrective RAG grading in JSON mode, hybrid search, and OCR of a scanned PDF.
+- Custom providers also accept `extra_body`, `embedding_input_types`, `embedding_params` and `stream_usage`. `vision_llm` works for any built-in provider whose models accept images (e.g. `vision_llm="openrouter/<model>"`).
+
+- `LangChainAdapter` still wraps a LangChain chat model you pass in (`RAG(chat_llm=ChatOpenAI(...))`). `LangChainAdapter.build()` is deprecated and now returns the native client.
+
 ## 2.1.0 - 2026-11-06
 
 Fixes and improvements from a full library review.

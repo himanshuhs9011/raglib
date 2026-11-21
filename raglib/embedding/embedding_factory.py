@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional, Sequence
 
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.embedding.google_embedding import GoogleEmbedding
@@ -24,8 +24,15 @@ class EmbeddingFactory:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         base_url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        input_types: Optional[Sequence[str]] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> BaseEmbedding:
-        """Return the configured embedding implementation for a provider name."""
+        """Return the configured embedding implementation for a provider name.
+
+        ``headers`` are extra HTTP headers (custom providers) for the OpenAI-style and Google APIs;
+        ``input_types`` / ``extra_params`` are passed to OpenAI-style embeddings (see ``OpenAIEmbedding``).
+        """
 
         provider_name = (provider or "mock").strip().lower()
 
@@ -45,7 +52,15 @@ class EmbeddingFactory:
             if not base_url or not model_name:
                 raise ValueError("openai_compatible embeddings require base_url and model_name")
             logger.info("EmbeddingFactory selected provider='openai_compatible' (%s)", base_url)
-            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, compatible=True)
+            return OpenAIEmbedding(
+                api_key=api_key,
+                model_name=model_name,
+                base_url=base_url,
+                compatible=True,
+                extra_headers=headers,
+                input_types=input_types,
+                extra_params=extra_params,
+            )
 
         if provider_name == "azure":
             if not base_url or not model_name:
@@ -54,7 +69,7 @@ class EmbeddingFactory:
 
         if provider_name == "google":
             logger.info("EmbeddingFactory selected provider='google'")
-            return GoogleEmbedding(api_key=api_key, model_name=model_name)
+            return GoogleEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, extra_headers=headers)
 
         if provider_name == "ollama":
             logger.info("EmbeddingFactory selected provider='ollama'")

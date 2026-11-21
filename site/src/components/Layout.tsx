@@ -7,6 +7,7 @@ const NAV: { route: Route; label: string }[] = [
   { route: "home", label: "Home" },
   { route: "reference", label: "API" },
   { route: "docs", label: "Docs" },
+  { route: "benchmarks", label: "Benchmarks" },
   { route: "playground", label: "Playground" },
 ];
 

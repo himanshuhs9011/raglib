@@ -349,9 +349,8 @@ def test_cached_client_caches_json() -> None:
 
 
 def test_llm_max_tokens_reaches_the_model() -> None:
-    pytest.importorskip("langchain_openai")
     rag = RAG(["Doc."], llm="openai/gpt-4.1-mini", chat_api_key="sk-test", embedding_llm="mock", llm_max_tokens=77)
-    assert rag._llm_raw._model.max_tokens == 77
+    assert rag._llm_raw.max_tokens == 77
 
 
 class _BrokenLLM(BaseLLMClient):

@@ -92,9 +92,19 @@ def shared_limiter(provider: str, api_key: Optional[str], rpm: float) -> RateLim
         return limiter
 
 
-def is_retryable(exc: BaseException) -> bool:
-    """Return True for transient provider errors."""
+_RETRYABLE_STATUS = {408, 409, 425, 429}
 
+
+def is_retryable(exc: BaseException) -> bool:
+    """Return True for transient provider errors (429, 5xx, timeouts, dropped connections).
+
+    An HTTP status on the exception decides when present; otherwise the error text is matched,
+    which covers SDK and LangChain exceptions.
+    """
+
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status in _RETRYABLE_STATUS or status >= 500
     text = f"{type(exc).__name__} {exc}".lower()
     return any(marker in text for marker in _RETRYABLE_MARKERS)
 

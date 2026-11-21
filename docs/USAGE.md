@@ -47,7 +47,8 @@ pip install raglib-py
 pip install "raglib-py[all]"
 
 # Or pick what you need:
-pip install "raglib-py[openai]"          # also: anthropic, groq, google, ollama
+# Chat and embedding providers (OpenAI, Anthropic, Gemini, OpenRouter, Groq, Ollama, ...) need no extra:
+# raglib calls their HTTP APIs directly. The [openai], [anthropic], ... extras still install (as no-ops).
 pip install "raglib-py[hf]"              # local HuggingFace / SentenceTransformers embeddings
 pip install "raglib-py[rerank]"          # cross-encoder reranker (bge-reranker)
 pip install "raglib-py[fast]"            # numpy vector math + tiktoken token counting
@@ -407,6 +408,35 @@ rag.save("./graph_index")             # graph + extraction cache + vectors
 
 Neo4j: `RAG(..., rag_type="graph", graph_store="neo4j", graph_kwargs={"store_options": {"uri": "bolt://localhost:7687", "user": "neo4j", "password": "...", "namespace": "papers"}})`.
 
+**Indexing cost.** Building the graph takes one LLM call per chunk, plus one per community report. That is thousands of calls for a few hundred long documents, and indexing is the dominant GraphRAG cost. Use a cheaper or faster model for it with `graph_llm`; answers still use `llm`:
+
+```python
+rag = RAG("docs/", rag_type="graph", llm="openai/gpt-4.1", graph_llm="openai/gpt-4.1-nano")
+```
+
+`graph_llm` builds the graph (entity extraction, community reports, the global-search map step). Its key comes from `chat_api_key` only when it is the same provider, otherwise from its environment variable. With a reasoning model, turning thinking off for extraction is about 10× faster (see *Custom Providers*, `extra_body`).
+
+**Build once, load in seconds.** The graph is built once and saved. `load()` makes no LLM calls, and vectors are stored as binary float32, so a 609-article graph (33k entities, 60k relations) loads in about 2–5 s. Only new or changed documents are extracted again.
+
+```python
+rag = RAG("docs/", rag_type="graph", graph_llm="...")   # once
+rag.save("my_index")
+rag = RAG(rag_type="graph").load("my_index")             # every start: seconds, no LLM calls
+```
+
+**Answer while the graph builds.** With `graph_build="background"`, `add()` and `load()` return as soon as chunks are searchable. Queries are answered right away from hybrid search plus however much of the graph exists so far (`result.metadata["graph_building"]`). A single worker extracts chunks in batches (`graph_kwargs={"build_batch_size": 64}`), retries failed ones once, and builds the community reports when the queue is empty:
+
+```python
+rag = RAG("docs/", rag_type="graph", graph_llm="...", graph_build="background")
+rag.query("...")            # works immediately
+rag.graph_status()          # {"state": "building", "phase": "extracting", "pending_chunks": 812, ...}
+rag.wait_for_graph()        # optional: block until "ready"
+```
+
+`save()` during a build stores what is done, and the next `load()` queues the rest. Deleting a document removes it from the queue.
+
+**Robust extraction.** A chunk whose extraction fails (rate limit, timeout, or an empty or looping reply) is retried at most `graph_kwargs={"max_extraction_attempts": 3}` times, then skipped. Its text stays searchable, and `stats()["graph"]["skipped_extractions"]` counts it. A reply cut off at `extraction_max_tokens` keeps its complete entities. GraphRAG's entity, relation and community summaries have their own token budget (`max_supplementary_tokens`, 1,200 by default), so they never push the evidence chunks out of the context.
+
 To give **agentic** or **routing** pipelines a `graph_search` tool / route, pass `enable_graph=True`.
 
 ---
@@ -527,11 +557,13 @@ Hosted OpenAI-compatible APIs only need `pip install "raglib-py[openai]"`.
 | **xAI Grok** | `"xai"` / `"grok"` | `grok-3-mini` | `XAI_API_KEY` | – |
 | **Perplexity** | `"perplexity"` | `sonar` | `PERPLEXITY_API_KEY` | – |
 | **Cerebras** | `"cerebras"` | `llama-3.3-70b` | `CEREBRAS_API_KEY` | – |
+| **NVIDIA NIM** (build.nvidia.com or self-hosted via `NVIDIA_BASE_URL`) | `"nvidia"` / `"nim"` | `nvidia/nemotron-3.5-lightning-30b-a3b` | `NVIDIA_API_KEY` | yes (`nvidia/nemotron-3-embed-1b`); OCR with `nvidia/nemotron-3.5-super-vl-120b-a12b` |
 | **Azure OpenAI** | `"azure/<deployment>"` | – | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | yes (deployment) |
 | **Ollama** (local) | `"ollama"` | `llama3.1` | – | yes |
 | **LM Studio** (local) | `"lmstudio/<model>"` | – | – | with `embedding_model` |
 | **vLLM** (self-hosted) | `"vllm/<model>"` + `chat_base_url` | – | – | with `embedding_model` |
 | **Any OpenAI-compatible API** | `"openai_compatible/<model>"` + `chat_base_url` | – | `OPENAI_COMPATIBLE_API_KEY` | with `embedding_model` |
+| **Your own provider** (`register_provider` / JSON file) | `"<id>/<model>"` | first listed model | your choice | with `embedding_model` |
 | **Any LangChain chat model / `BaseLLMClient`** | the object | – | – | – |
 | **Mock (offline)** | `"mock"` or `offline=True` | templated | – | mock |
 
@@ -550,6 +582,73 @@ rag = RAG("docs/", llm="vllm/Qwen/Qwen2.5-7B-Instruct", chat_base_url="http://gp
 ```
 
 All provider calls get a timeout (`llm_timeout`), retries with jittered exponential backoff on rate limits / 5xx (`llm_max_retries`) and an LRU response cache (`llm_cache`).
+
+raglib needs no SDK and no LangChain for any of these providers. `raglib.llm.clients` speaks the three wire protocols directly with the Python standard library: **OpenAI Chat Completions** (OpenAI, Azure, Groq, Ollama, OpenRouter and every other compatible API), **Anthropic Messages** and **Gemini `generateContent`**, including SSE streaming, JSON mode and real token usage. Build one directly with `from raglib.llm import build_chat_client; llm = build_chat_client("anthropic")`. A LangChain chat model you already have still works: pass it as `chat_llm=` and raglib wraps it with its retries and usage tracking.
+
+### Custom Providers (any third-party or self-hosted API)
+
+Register any provider that speaks one of the three supported APIs (`openai` Chat Completions, `anthropic` Messages, `gemini` generateContent), then use it like a built-in one:
+
+```python
+from raglib import RAG, register_provider
+
+register_provider(
+    "myprovider",                              # lowercase letters, numbers, - or _
+    name="My AI Provider",                     # shown by `raglib providers`
+    api="openai",                              # "openai" | "anthropic" | "gemini"
+    base_url="https://api.myprovider.com/v1",
+    api_key="{env:MYPROVIDER_API_KEY}",        # optional; leave out when auth is in headers
+    headers={"X-Team": "{env:MY_TEAM_ID}"},    # optional extra headers ({env:NAME} is expanded)
+    models=[
+        {"id": "model-id", "name": "Display Name"},
+        {"id": "model-r1", "name": "Reasoner", "reasoning": True},
+        {"id": "model-vl", "name": "Vision", "image": True},
+    ],
+    embedding_model="embed-v1",                # optional: semantic search through the same provider
+)
+
+rag = RAG("docs/", llm="myprovider/model-id")   # or llm="myprovider" for the first listed model
+```
+
+| Model flag | Effect |
+| :--- | :--- |
+| `reasoning: true` | No `temperature` is sent (many reasoning endpoints reject it). A leading `<think>...</think>` block is removed from answers and streams for every model, so citations and JSON parsing keep working. |
+| `image: true` | The model can read scanned PDF pages: it is used for OCR when it is the chat model, or with `vision_llm="myprovider/model-vl"`. |
+
+Models you don't list still work (`llm="myprovider/any-model"`). The list sets the default model and the flags.
+
+Reasoning models spend completion tokens on thinking before they answer. A small `llm_max_tokens` can be used up entirely by the thinking, which leaves the answer empty, so leave it unset or generous for these models.
+
+More options for servers with their own conventions:
+
+| Option | Example | Use |
+| :--- | :--- | :--- |
+| `extra_body` | `{"chat_template_kwargs": {"enable_thinking": False}}` | Extra JSON fields for every chat request (vLLM / NVIDIA NIM sampling or template options). Turning thinking off for NVIDIA Nemotron cut a lookup answer from 357 to 10 completion tokens and from 2.7 s to 0.5 s in testing. |
+| `embedding_input_types` | `["passage", "query"]` | Asymmetric embedding models that require an `input_type` field: documents get the first value, search queries the second. |
+| `embedding_params` | `{"truncate": "END"}` | Extra JSON fields for embedding requests. |
+| `stream_usage` | `true` | The server accepts `stream_options.include_usage`, so streamed answers report real token counts. |
+
+**From a JSON file** (no code). Use `load_providers("providers.json")`, set `RAGLIB_PROVIDERS_FILE=providers.json`, or pass `raglib ask ... --providers providers.json`:
+
+```json
+{
+  "providers": {
+    "myprovider": {
+      "name": "My AI Provider",
+      "api": "openai",
+      "base_url": "https://api.myprovider.com/v1",
+      "api_key": "{env:MYPROVIDER_API_KEY}",
+      "headers": {"X-Team": "search"},
+      "models": {
+        "model-id": {"name": "Display Name", "reasoning": false, "image": false}
+      },
+      "embedding_model": "embed-v1"
+    }
+  }
+}
+```
+
+Keep keys out of the file with `{env:NAME}`; raglib warns when a file holds a literal key. A key given for one provider is never sent to another provider's host. Built-in provider ids can't be redefined, and `raglib providers` lists custom providers with their models.
 
 ### Supported Embedding Providers (`embedding_llm`)
 
@@ -637,13 +736,13 @@ rag.chat()                     # interactive terminal session with memory
 ```python
 from raglib import RAG
 from raglib.eval import evaluate
-from raglib.llm.langchain_adapter import LangChainAdapter
+from raglib.llm import build_chat_client
 
 rag = RAG("docs/", chat_llm="openai", embedding_llm="openai")
 dataset = [
     {"question": "What is the refund window?", "relevant_ids": ["docs/refunds.md"], "reference": "30 days"},
 ]
-judge = LangChainAdapter.build("openai", model_name="gpt-4.1")   # use a strong judge model
+judge = build_chat_client("openai", model_name="gpt-4.1")   # use a strong judge model
 report = evaluate(rag, dataset, judge_llm=judge, k=5)
 print(report)   # hit_rate@5, mrr@5, recall@5, ndcg@5, faithfulness, answer_relevance, context_precision, correctness, latency_ms
 ```
@@ -673,7 +772,7 @@ corpus = [
     Document(id="d2", content="Corrective RAG grades chunks and refines knowledge strips."),
 ]
 
-llm = MockLLMClient()                                   # use LangChainAdapter.build("openai") in production
+llm = MockLLMClient()                                   # use build_chat_client("openai") in production
 pipeline = CorrectiveRAG(
     retriever=Retriever(documents=corpus, top_k=4),     # BM25 only; pass embedding=... for hybrid
     grader=RelevanceGrader(llm_client=llm),

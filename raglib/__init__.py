@@ -38,7 +38,9 @@ from raglib.graph_context import (
     GraphNode,
 )
 from raglib.llm.base_client import BaseLLMClient, CachedLLMClient
+from raglib.llm.clients import build_chat_client
 from raglib.llm.mock_client import MockLLMClient
+from raglib.llm.providers import ModelSpec, list_models, load_providers, register_provider, unregister_provider
 from raglib.loaders.chunk_splitter import ChunkSplitter
 from raglib.quick import ask
 from raglib.rag_types import (
@@ -78,6 +80,12 @@ __all__ = [
     "BaseLLMClient",
     "CachedLLMClient",
     "MockLLMClient",
+    "build_chat_client",
+    "register_provider",
+    "unregister_provider",
+    "load_providers",
+    "list_models",
+    "ModelSpec",
     "ChunkSplitter",
     "BM25Index",
     "Retriever",
@@ -123,4 +131,4 @@ __all__ = [
     "GraphContextWindow",
 ]
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"

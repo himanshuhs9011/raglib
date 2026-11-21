@@ -14,6 +14,7 @@ USAGE_EXAMPLES = """examples:
   raglib chat docs/ --llm openrouter/deepseek/deepseek-chat
   raglib graph docs/ --out graph.html         # knowledge graph you can open in a browser
   raglib providers
+  raglib ask docs/ "Question?" --providers providers.json --llm myprovider/model-id   # custom provider
 """
 
 
@@ -27,6 +28,17 @@ def _add_common(command: argparse.ArgumentParser) -> None:
     command.add_argument("--web", help="enable web search with this provider (e.g. duckduckgo, tavily)")
     command.add_argument("--offline", action="store_true", help="use the offline mock models (no API keys)")
     command.add_argument("-v", "--verbose", action="store_true", help="show info logs")
+    _add_providers_option(command)
+
+
+def _add_providers_option(command: argparse.ArgumentParser) -> None:
+    """--providers FILE: register custom providers from a JSON file."""
+
+    command.add_argument(
+        "--providers",
+        metavar="FILE",
+        help="JSON file of custom providers (see docs; also RAGLIB_PROVIDERS_FILE)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,7 +66,8 @@ def _build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--max-nodes", type=int, default=400)
     _add_common(graph)
 
-    sub.add_parser("providers", help="list supported LLM providers")
+    providers = sub.add_parser("providers", help="list supported LLM providers (and custom ones)")
+    _add_providers_option(providers)
     return parser
 
 
@@ -79,6 +92,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point."""
 
     args = _build_parser().parse_args(argv)
+    if getattr(args, "providers", None):
+        from raglib.llm.providers import load_providers
+
+        try:
+            load_providers(args.providers)
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     if args.command == "providers":
         from raglib.llm.providers import provider_table
 

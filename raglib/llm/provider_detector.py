@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Union
 
-from raglib.constants import LLM_KEY_PREFIX_MAP, SUPPORTED_CHAT_PROVIDERS
+from raglib.constants import LLM_KEY_PREFIX_MAP
 from raglib.llm.base_client import BaseLLMClient
 from raglib.llm.mock_client import MockLLMClient
 
@@ -16,7 +16,15 @@ class LLMProviderDetector:
     """Detect and build the correct chat LLM client from user input."""
 
     KEY_PREFIX_MAP = dict(LLM_KEY_PREFIX_MAP)
-    KNOWN_PROVIDERS = set(SUPPORTED_CHAT_PROVIDERS)
+
+    @classmethod
+    def known_providers(cls) -> set:
+        """Built-in plus registered custom providers (read live, so register_provider() counts)."""
+
+        from raglib.llm.providers import PROVIDERS, normalize_provider
+
+        normalize_provider("")  # loads RAGLIB_PROVIDERS_FILE if set
+        return set(PROVIDERS)
 
     @classmethod
     def detect(
@@ -46,13 +54,13 @@ class LLMProviderDetector:
 
         if provider_hint:
             provider = provider_hint.strip().lower()
-            if provider not in cls.KNOWN_PROVIDERS:
+            if provider not in cls.known_providers():
                 raise ValueError(
                     f"Unknown provider_hint '{provider_hint}'. "
-                    f"Supported providers: {sorted(cls.KNOWN_PROVIDERS)}"
+                    f"Supported providers: {sorted(cls.known_providers())}"
                 )
             api_key: Optional[str] = None
-            if isinstance(value, str) and value.strip() and value.strip().lower() not in cls.KNOWN_PROVIDERS:
+            if isinstance(value, str) and value.strip() and value.strip().lower() not in cls.known_providers():
                 api_key = value.strip()
             logger.info("Using explicit provider hint: %s", provider)
             return cls._build_client(
@@ -73,7 +81,7 @@ class LLMProviderDetector:
             return MockLLMClient()
 
         lowered = cleaned.lower()
-        if lowered in cls.KNOWN_PROVIDERS:
+        if lowered in cls.known_providers():
             logger.info("Detected provider from explicit name: %s", lowered)
             return cls._build_client(
                 provider=lowered,
@@ -96,7 +104,7 @@ class LLMProviderDetector:
 
         raise ValueError(
             "Could not detect an LLM provider from the value you provided.\n"
-            f"Supported providers: {sorted(cls.KNOWN_PROVIDERS)}\n"
+            f"Supported providers: {sorted(cls.known_providers())}\n"
             f"Supported key prefixes: {list(cls.KEY_PREFIX_MAP.keys())}\n"
             "To use an unsupported provider, pass a BaseLLMClient instance directly."
         )
@@ -111,7 +119,7 @@ class LLMProviderDetector:
 
         if provider_hint:
             candidate = provider_hint.strip().lower()
-            if candidate in cls.KNOWN_PROVIDERS:
+            if candidate in cls.known_providers():
                 return candidate
             return None
 
@@ -126,7 +134,7 @@ class LLMProviderDetector:
             return None
 
         lowered = cleaned.lower()
-        if lowered in cls.KNOWN_PROVIDERS:
+        if lowered in cls.known_providers():
             return lowered
 
         return cls._detect_from_key(cleaned)
@@ -135,10 +143,9 @@ class LLMProviderDetector:
     def _detect_from_key(cls, key: str) -> Optional[str]:
         """Detect a provider from API key prefix with deterministic priority order."""
 
-        for prefix, provider in cls.KEY_PREFIX_MAP.items():
-            if key.startswith(prefix):
-                return provider
-        return None
+        from raglib.llm.providers import detect_provider_from_key
+
+        return detect_provider_from_key(key)
 
     @classmethod
     def _build_client(
@@ -149,11 +156,11 @@ class LLMProviderDetector:
         base_url: Optional[str] = None,
         temperature: float = 0.0,
     ) -> BaseLLMClient:
-        """Import and instantiate the provider-specific LangChain adapter."""
+        """Instantiate the native client for the provider."""
 
-        from raglib.llm.langchain_adapter import LangChainAdapter
+        from raglib.llm.clients import build_chat_client
 
-        return LangChainAdapter.build(
+        return build_chat_client(
             provider=provider,
             api_key=api_key,
             model_name=model_name,

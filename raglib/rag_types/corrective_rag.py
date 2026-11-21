@@ -76,6 +76,14 @@ class CorrectiveRAG(BaseRAG):
             if doc.id not in seen:
                 seen.add(doc.id)
                 merged.append(doc)
+        if not merged and documents and self.web_retriever is None:
+            # Without web search the INCORRECT path has nowhere to look. Answering from an empty
+            # context throws away partial evidence (multi-hop questions often grade every single
+            # chunk as insufficient), so fall back to the retrieved chunks; the answer prompt still
+            # makes the model decline when they do not contain the answer.
+            ctx.trace.append("fallback:retrieved_documents")
+            ctx.metadata["crag_fallback"] = True
+            return list(documents)
         return merged
 
     def _grader(self) -> RelevanceGrader:

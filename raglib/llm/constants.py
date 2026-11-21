@@ -31,6 +31,7 @@ PROVIDER_DEFAULT_VISION_MODEL: Dict[str, str] = {
     "openai": "gpt-4.1-mini",
     "anthropic": "claude-sonnet-5-5",
     "google": "gemini-2.5-flash",
+    "nvidia": "nvidia/nemotron-3.5-super-vl-120b-a12b",
 }
 
 OLLAMA_DEFAULT_BASE_URL: str = "http://localhost:11434"

@@ -25,7 +25,15 @@ def parse_json(text: str, default: Any = None) -> Any:
             return json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
             pass
-        for opener, closer in (("{", "}"), ("[", "]")):
+        # The outermost bracket first: for '{"a": [1], "b": [2, ...' the inner '[1]' is not the answer.
+        pairs = sorted((("{", "}"), ("[", "]")), key=lambda pair: (candidate.find(pair[0]) % (len(candidate) + 1)))
+        for position, (opener, closer) in enumerate(pairs):
+            if position == 1:
+                # A reply cut off at max_tokens (or a model that loops until the limit): keep its complete items.
+                salvaged = _salvage_truncated(candidate)
+                if salvaged is not None:
+                    logger.info("parse_json salvaged the complete part of a truncated JSON reply")
+                    return salvaged
             start = candidate.find(opener)
             end = candidate.rfind(closer)
             if start != -1 and end > start:
@@ -35,6 +43,52 @@ def parse_json(text: str, default: Any = None) -> Any:
                     continue
     logger.debug("parse_json could not parse LLM output: %.120s", text)
     return default
+
+
+def _salvage_truncated(text: str, max_attempts: int = 25) -> Any:
+    """Parse JSON that was cut off mid-way, keeping every object/array that was closed.
+
+    ``{"entities": [{"a": 1}, {"b": 2}, {"c"`` becomes ``{"entities": [{"a": 1}, {"b": 2}]}``.
+    Returns None when the text is not truncated JSON or nothing complete can be kept.
+    """
+
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        return None
+    start = min(starts)
+    stack: list = []
+    cuts: list = []  # (end index after a closed nested value, open brackets at that point)
+    in_string = escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or stack[-1] != ("{" if char == "}" else "["):
+                return None  # malformed, not merely truncated
+            stack.pop()
+            if not stack:
+                return None  # the outer value is complete: the problem is not truncation
+            cuts.append((index + 1, tuple(stack)))
+    if not stack:
+        return None
+    for end, open_brackets in reversed(cuts[-max_attempts:]):
+        closing = "".join("}" if bracket == "{" else "]" for bracket in reversed(open_brackets))
+        try:
+            return json.loads(text[start:end] + closing)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
 
 
 def parse_label(text: str, labels: Sequence[str], default: Optional[str] = None) -> Optional[str]:

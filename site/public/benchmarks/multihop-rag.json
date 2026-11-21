@@ -1,0 +1,942 @@
+{
+  "benchmark": "MultiHop-RAG",
+  "dataset": {
+    "name": "MultiHop-RAG",
+    "authors": "Yixuan Tang and Yi Yang",
+    "year": 2024,
+    "paper": "https://arxiv.org/abs/2401.15391",
+    "source": "https://huggingface.co/datasets/yixuantt/MultiHopRAG",
+    "license": "ODC-BY",
+    "corpus_articles": 609
+  },
+  "sample": {
+    "questions": 30,
+    "seed": 42,
+    "by_type": {
+      "inference_query": 8,
+      "comparison_query": 8,
+      "temporal_query": 7,
+      "null_query": 7
+    }
+  },
+  "models": {
+    "generator": "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "embedding": "nvidia/nemotron-3-embed-1b",
+    "judge": "nvidia/nemotron-3-ultra-550b-a55b",
+    "endpoint": "https://integrate.api.nvidia.com/v1",
+    "graph_builder": "inclusionai/ling-3.0-flash"
+  },
+  "correctness_prompt": "You grade a question-answering system against a reference answer.\n\nQuestion: {question}\nReference answer: {gold}\nSystem response: {response}\n\nRules:\n- If the reference answer is \"Insufficient information\", the response is correct only if it says the\n  documents do not contain the answer (declining), and wrong if it gives a substantive answer.\n- Otherwise the response is correct if its final answer means the same as the reference (aliases,\n  short forms and paraphrases count; \"does not contradict\" answers \"no\" to \"does it contradict\").\n- A response that declines, hedges between options, or gives a different answer is wrong.\n\nReturn JSON only: {{\"correct\": true or false, \"reason\": \"<one sentence>\"}}",
+  "excluded": {
+    "hybrid": "same retrieval as advanced (BM25 + dense) when an embedding model is configured",
+    "web / hybrid_web": "live web search is not reproducible and can leak answers from the internet",
+    "routing": "routes between corpus, web and graph; with web and graph off it reduces to advanced",
+    "memory": "built for multi-turn chat; single-turn questions make it equal to advanced",
+    "tool": "needs application-specific tools"
+  },
+  "generated_at": "2026-11-21",
+  "configs": [
+    {
+      "name": "naive",
+      "rag_type": "naive",
+      "settings": {
+        "retrieval_mode": "dense"
+      },
+      "about": "Dense vector search -> answer (textbook baseline)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7333,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 0.875,
+        "comparison_query": 0.25,
+        "temporal_query": 0.8571,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          7,
+          8
+        ],
+        "comparison_query": [
+          2,
+          8
+        ],
+        "temporal_query": [
+          6,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.5667,
+      "evidence_recall": 0.6449,
+      "latency_s_median": 19.22,
+      "llm_calls_mean": 1,
+      "tokens_mean": 6444.1667,
+      "judge": {}
+    },
+    {
+      "name": "advanced",
+      "rag_type": "advanced",
+      "settings": {},
+      "about": "Library default: BM25 + dense hybrid search -> dedupe -> cited answer",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.375,
+        "temporal_query": 0.7143,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          3,
+          8
+        ],
+        "temporal_query": [
+          5,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6333,
+      "evidence_recall": 0.6993,
+      "latency_s_median": 19.51,
+      "llm_calls_mean": 1,
+      "tokens_mean": 6096.3,
+      "judge": {}
+    },
+    {
+      "name": "advanced_rerank",
+      "rag_type": "advanced",
+      "settings": {
+        "reranker": "cross_encoder",
+        "reranker_model": "BAAI/bge-reranker-base",
+        "fetch_k": 20
+      },
+      "about": "Default + cross-encoder reranking of 20 candidates (bge-reranker-base, local)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.8,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 0.875,
+        "comparison_query": 0.625,
+        "temporal_query": 0.7143,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          7,
+          8
+        ],
+        "comparison_query": [
+          5,
+          8
+        ],
+        "temporal_query": [
+          5,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6333,
+      "evidence_recall": 0.6957,
+      "latency_s_median": 22.2,
+      "llm_calls_mean": 1,
+      "tokens_mean": 5627.0333,
+      "judge": {}
+    },
+    {
+      "name": "multi_query",
+      "rag_type": "multi_query",
+      "settings": {},
+      "about": "LLM paraphrases the question, retrieves for each, fuses with RRF",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.8,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.5,
+        "temporal_query": 0.7143,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          4,
+          8
+        ],
+        "temporal_query": [
+          5,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6667,
+      "evidence_recall": 0.7862,
+      "latency_s_median": 36.62,
+      "llm_calls_mean": 1.9667,
+      "tokens_mean": 8779.2333,
+      "judge": {}
+    },
+    {
+      "name": "multi_hop",
+      "rag_type": "multi_hop",
+      "settings": {},
+      "about": "Retrieve, ask what is still missing, retrieve again (bridge entities)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.8,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.375,
+        "temporal_query": 0.8571,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          3,
+          8
+        ],
+        "temporal_query": [
+          6,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.7,
+      "evidence_recall": 0.7138,
+      "latency_s_median": 47.22,
+      "llm_calls_mean": 2.7333,
+      "tokens_mean": 10187.5,
+      "judge": {}
+    },
+    {
+      "name": "corrective",
+      "rag_type": "corrective",
+      "settings": {},
+      "about": "CRAG: grade retrieved chunks, keep relevant strips (no web fallback in this run)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.8,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.5,
+        "temporal_query": 0.8571,
+        "null_query": 0.8571
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          4,
+          8
+        ],
+        "temporal_query": [
+          6,
+          7
+        ],
+        "null_query": [
+          6,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6,
+      "evidence_recall": 0.6486,
+      "latency_s_median": 106.17,
+      "llm_calls_mean": 4.6,
+      "tokens_mean": 20033.0333,
+      "judge": {}
+    },
+    {
+      "name": "self",
+      "rag_type": "self",
+      "settings": {},
+      "about": "Self-RAG: relevance, support and usefulness checks with revision",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.6667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 0.75,
+        "comparison_query": 0.25,
+        "temporal_query": 0.7143,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          6,
+          8
+        ],
+        "comparison_query": [
+          2,
+          8
+        ],
+        "temporal_query": [
+          5,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.5667,
+      "evidence_recall": 0.6812,
+      "latency_s_median": 73.09,
+      "llm_calls_mean": 6.6,
+      "tokens_mean": 18401.7333,
+      "judge": {}
+    },
+    {
+      "name": "agentic",
+      "rag_type": "agentic",
+      "settings": {},
+      "about": "ReAct agent that searches the documents until it has enough evidence",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 0.875,
+        "comparison_query": 0.375,
+        "temporal_query": 0.8571,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          7,
+          8
+        ],
+        "comparison_query": [
+          3,
+          8
+        ],
+        "temporal_query": [
+          6,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6,
+      "evidence_recall": 0.6558,
+      "latency_s_median": 62.06,
+      "llm_calls_mean": 4.6,
+      "tokens_mean": 12195.5,
+      "judge": {}
+    },
+    {
+      "name": "graph",
+      "rag_type": "graph",
+      "settings": {
+        "graph_llm": "velona/inclusionai/ling-3.0-flash"
+      },
+      "about": "GraphRAG: LLM-extracted knowledge graph + communities, local/global search (graph built by inclusionai/ling-3.0-flash)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7333,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.5,
+        "temporal_query": 0.5714,
+        "null_query": 0.8571
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          4,
+          8
+        ],
+        "temporal_query": [
+          4,
+          7
+        ],
+        "null_query": [
+          6,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6,
+      "evidence_recall": 0.6667,
+      "latency_s_median": 12.46,
+      "llm_calls_mean": 1,
+      "tokens_mean": 8314.5667,
+      "judge": {}
+    },
+    {
+      "name": "graph_context",
+      "rag_type": "graph_context",
+      "settings": {},
+      "about": "GraphContextWindow retrieval (document/section/chunk graph, keyword + embedding seeds, 2 hops)",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.5667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 0.5,
+        "comparison_query": 0.375,
+        "temporal_query": 0.4286,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          4,
+          8
+        ],
+        "comparison_query": [
+          3,
+          8
+        ],
+        "temporal_query": [
+          3,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.5333,
+      "evidence_recall": 0.2935,
+      "latency_s_median": 15.93,
+      "llm_calls_mean": 1,
+      "tokens_mean": 6257,
+      "judge": {}
+    }
+  ],
+  "fixes": [
+    {
+      "config": "corrective",
+      "main": {
+        "before": {
+          "accuracy": 0.7,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.5399,
+          "strict_accuracy": 0.6333,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              2,
+              8
+            ],
+            "temporal_query": [
+              4,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.8,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.6486,
+          "strict_accuracy": 0.6,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              4,
+              8
+            ],
+            "temporal_query": [
+              6,
+              7
+            ],
+            "null_query": [
+              6,
+              7
+            ]
+          }
+        }
+      },
+      "heldout": {
+        "before": {
+          "accuracy": 0.6667,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.5906,
+          "strict_accuracy": 0.6667,
+          "counts_by_type": {
+            "inference_query": [
+              7,
+              8
+            ],
+            "comparison_query": [
+              4,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.8,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.5833,
+          "strict_accuracy": 0.7333,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              5,
+              8
+            ],
+            "temporal_query": [
+              4,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        }
+      }
+    },
+    {
+      "config": "multi_query",
+      "main": {
+        "before": {
+          "accuracy": 0.7667,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.6558,
+          "strict_accuracy": 0.6667,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              3,
+              8
+            ],
+            "temporal_query": [
+              6,
+              7
+            ],
+            "null_query": [
+              6,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.8,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.7862,
+          "strict_accuracy": 0.6667,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              4,
+              8
+            ],
+            "temporal_query": [
+              5,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        }
+      },
+      "heldout": {
+        "before": {
+          "accuracy": 0.7,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.7101,
+          "strict_accuracy": 0.5667,
+          "counts_by_type": {
+            "inference_query": [
+              7,
+              8
+            ],
+            "comparison_query": [
+              5,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.7333,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.7645,
+          "strict_accuracy": 0.7667,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              6,
+              8
+            ],
+            "temporal_query": [
+              1,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        }
+      }
+    },
+    {
+      "config": "graph",
+      "main": {
+        "before": {
+          "accuracy": 0.7,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.442,
+          "strict_accuracy": 0.7333,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              4,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.7333,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.6667,
+          "strict_accuracy": 0.6,
+          "counts_by_type": {
+            "inference_query": [
+              8,
+              8
+            ],
+            "comparison_query": [
+              4,
+              8
+            ],
+            "temporal_query": [
+              4,
+              7
+            ],
+            "null_query": [
+              6,
+              7
+            ]
+          }
+        }
+      },
+      "heldout": null
+    },
+    {
+      "config": "graph_context",
+      "main": {
+        "before": {
+          "accuracy": 0.5,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.2645,
+          "strict_accuracy": 0.5,
+          "counts_by_type": {
+            "inference_query": [
+              4,
+              8
+            ],
+            "comparison_query": [
+              2,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.5667,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.2935,
+          "strict_accuracy": 0.5333,
+          "counts_by_type": {
+            "inference_query": [
+              4,
+              8
+            ],
+            "comparison_query": [
+              3,
+              8
+            ],
+            "temporal_query": [
+              3,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        }
+      },
+      "heldout": {
+        "before": {
+          "accuracy": 0.4,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.3659,
+          "strict_accuracy": 0.5333,
+          "counts_by_type": {
+            "inference_query": [
+              3,
+              8
+            ],
+            "comparison_query": [
+              0,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        },
+        "after": {
+          "accuracy": 0.5,
+          "accuracy_judged_n": 30,
+          "evidence_recall": 0.3768,
+          "strict_accuracy": 0.5667,
+          "counts_by_type": {
+            "inference_query": [
+              5,
+              8
+            ],
+            "comparison_query": [
+              1,
+              8
+            ],
+            "temporal_query": [
+              2,
+              7
+            ],
+            "null_query": [
+              7,
+              7
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "heldout_reference": 0.7,
+  "answer_model": {
+    "config": "advanced",
+    "free": {
+      "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "cost_inr_30": 0
+    },
+    "paid": {
+      "model": "anthropic/claude-haiku-5.5",
+      "cost_inr_30": 3.03,
+      "cost_inr_per_answer": 0.1
+    },
+    "free_result": {
+      "name": "advanced",
+      "rag_type": "advanced",
+      "settings": {},
+      "about": "Library default: BM25 + dense hybrid search -> dedupe -> cited answer",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.375,
+        "temporal_query": 0.7143,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          3,
+          8
+        ],
+        "temporal_query": [
+          5,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.6333,
+      "evidence_recall": 0.6993,
+      "latency_s_median": 19.51,
+      "llm_calls_mean": 1,
+      "tokens_mean": 6096.3,
+      "judge": {}
+    },
+    "paid_result": {
+      "name": "advanced__haiku",
+      "rag_type": "advanced",
+      "settings": {},
+      "about": "Library default: BM25 + dense hybrid search -> dedupe -> cited answer",
+      "questions": 30,
+      "errors": 0,
+      "accuracy": 0.7667,
+      "accuracy_judged_n": 30,
+      "accuracy_by_type": {
+        "inference_query": 1.0,
+        "comparison_query": 0.5,
+        "temporal_query": 0.5714,
+        "null_query": 1.0
+      },
+      "counts_by_type": {
+        "inference_query": [
+          8,
+          8
+        ],
+        "comparison_query": [
+          4,
+          8
+        ],
+        "temporal_query": [
+          4,
+          7
+        ],
+        "null_query": [
+          7,
+          7
+        ]
+      },
+      "strict_accuracy": 0.5667,
+      "evidence_recall": 0.6993,
+      "latency_s_median": 5.14,
+      "llm_calls_mean": 1,
+      "tokens_mean": 5151.7,
+      "judge": {}
+    }
+  },
+  "graph_build": {
+    "model": "inclusionai/ling-3.0-flash",
+    "via": "an OpenAI-compatible gateway (paid, INR billing)",
+    "cost_inr": 95,
+    "note": "includes about ₹5 lost to double-billed timeouts and model tests, before the extraction fixes in the changelog",
+    "nvidia_free_tier": "The same build on NVIDIA's free tier ran at about 2.5 successful calls/min (rate limited): ~17 h for the corpus",
+    "llm_calls": 5120,
+    "tokens": 17030701,
+    "seconds": 10119.428005933762,
+    "entities": 32754,
+    "relations": 60522,
+    "communities": 1617,
+    "failed_extractions": 0,
+    "skipped_extractions": 331
+  },
+  "load": {
+    "json_s": 81,
+    "binary_s": 2.2,
+    "json_mb": 1700,
+    "binary_mb": 402
+  },
+  "storage": {
+    "articles": 609,
+    "chunks": 3281,
+    "embedding_dim": 2048,
+    "raw_mb": 6.5,
+    "hybrid": {
+      "disk_mb": 45,
+      "ram_mb": 340
+    },
+    "graph": {
+      "disk_mb": 402,
+      "ram_mb": 680,
+      "entity_vectors_mb": 268
+    }
+  }
+}

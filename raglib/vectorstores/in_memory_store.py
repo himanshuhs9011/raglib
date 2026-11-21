@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import heapq
+import json
 import logging
 import math
+import os
+import sys
 from array import array
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -126,6 +129,71 @@ class InMemoryVectorStore(BaseVectorStore):
                 for rid, vector in self._vectors.items()
             ]
 
+    def dump(self, directory: str, name: str = "vectors") -> None:
+        """Save to ``<name>.f32`` (raw float32 vectors) + ``<name>.meta.json`` (ids, texts, metadata).
+
+        Loading binary vectors is orders of magnitude faster than parsing them from JSON numbers
+        (a 1.5 GB JSON graph index loaded in ~70 s; the same vectors load in about a second) and the
+        files are ~4x smaller. Both files are written atomically, the metadata last.
+        """
+
+        with self._lock.read():
+            ids = list(self._vectors.keys())
+            buffer = array("f")
+            for rid in ids:
+                buffer.extend(self._vectors[rid])
+            meta = {
+                "format": "raglib-vectors",
+                "version": 1,
+                "dtype": "float32",
+                "byteorder": sys.byteorder,
+                "dimension": self._dimension,
+                "count": len(ids),
+                "ids": ids,
+                "texts": [self._payload[rid][0] for rid in ids],
+                "metadata": [self._payload[rid][1] for rid in ids],
+                "norms": [self._norms.get(rid, 0.0) for rid in ids],
+            }
+        base = os.path.join(directory, name)
+        _atomic_write_bytes(base + ".f32", buffer.tobytes())
+        _atomic_write_bytes(base + ".meta.json", json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+
+    @staticmethod
+    def has_dump(directory: str, name: str = "vectors") -> bool:
+        """True when ``dump(directory, name)`` files exist."""
+
+        base = os.path.join(directory, name)
+        return os.path.exists(base + ".meta.json") and os.path.exists(base + ".f32")
+
+    def restore(self, directory: str, name: str = "vectors") -> int:
+        """Load vectors written by ``dump`` (replacing records with the same ids); returns the count."""
+
+        base = os.path.join(directory, name)
+        with open(base + ".meta.json", "r", encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if meta.get("format") != "raglib-vectors" or meta.get("dtype") != "float32":
+            raise ValueError(f"{base}.meta.json is not a raglib vector dump")
+        buffer = array("f")
+        with open(base + ".f32", "rb") as handle:
+            buffer.frombytes(handle.read())
+        if meta.get("byteorder") != sys.byteorder:
+            buffer.byteswap()
+        count, size = int(meta["count"]), int(meta.get("dimension") or 0)
+        if len(buffer) != count * size:
+            raise ValueError(f"{base}.f32 holds {len(buffer)} values, expected {count} x {size}: the dump is incomplete")
+        if not count:
+            return 0
+        with self._lock.write():
+            if self._dimension is not None and self._vectors and size != self._dimension:
+                raise ValueError(f"Embedding dimension mismatch: the store holds {self._dimension}-d vectors, the dump {size}-d")
+            self._dimension = size
+            for index, rid in enumerate(meta["ids"]):
+                self._vectors[rid] = buffer[index * size : (index + 1) * size]
+                self._payload[rid] = (meta["texts"][index], dict(meta["metadata"][index] or {}))
+                self._norms[rid] = float(meta["norms"][index])
+            self._matrix = None
+        return count
+
     def query(
         self,
         query_embedding: List[float],
@@ -211,3 +279,12 @@ class InMemoryVectorStore(BaseVectorStore):
             score = sum(query[i] * vector[i] for i in range(length)) / (query_norm * norm) if norm else 0.0
             scored.append((score, rid))
         return heapq.nlargest(top_k, scored)
+
+
+def _atomic_write_bytes(target: str, data: bytes) -> None:
+    """Write ``data`` to ``target`` via a temp file + rename (never leaves a partial file)."""
+
+    tmp = f"{target}.{os.getpid()}.tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, target)

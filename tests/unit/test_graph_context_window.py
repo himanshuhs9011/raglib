@@ -262,3 +262,24 @@ def test_side_by_side_graph_context_vs_linear_chunks_and_fifo_memory():
     assert crag_chunk_2.id in selected_doc_ids
     assert "Refiner" in graph_result.formatted_context
     assert "WebRetriever" in graph_result.formatted_context
+
+
+def test_entities_do_not_span_line_breaks() -> None:
+    from raglib.graph_context.engine import GraphContextWindow
+
+    entities = GraphContextWindow._extract_entities("Source: TechCrunch\n\nFlexport CEO Ryan Petersen spoke.")
+    assert "techcrunch" in entities
+    assert not any("\n" in entity for entity in entities)
+
+
+def test_retrieve_returns_chunks_before_section_summaries() -> None:
+    from raglib import Document, GraphContextWindow
+
+    graph = GraphContextWindow(chunking_strategy="fixed", chunk_size=60, chunk_overlap=0)
+    graph.add_documents([
+        Document(id="a", content="Flexport CEO Ryan Petersen returned in 2023 after Dave Clark left.", metadata={"title": "Flexport"}),
+        Document(id="b", content="The FTX trial of Sam Bankman-Fried began in October in New York.", metadata={"title": "FTX"}),
+    ])
+    documents = graph.retrieve("Who is the Flexport CEO and when did the FTX trial begin?", top_k=2)
+    assert [doc.metadata["node_type"] for doc in documents] == ["chunk", "chunk"]
+    assert {doc.metadata["title"] for doc in documents} == {"Flexport", "FTX"}

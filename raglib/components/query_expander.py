@@ -27,8 +27,12 @@ class QueryExpander:
         variants = [query]
         if self.llm_client is not None:
             prompt = (
-                f"Write {self.max_variants - 1} alternative search queries for the question below. "
-                "Use different wording and synonyms; keep the same meaning and all constraints.\n"
+                f"Write up to {self.max_variants - 1} search queries for finding documents that answer the question below.\n"
+                "- If the question involves several entities, sources, events or claims (it compares them, asks whether "
+                "both or all do something, or relates events in time), write one focused query for EACH part, keeping "
+                "its names, sources and dates, so that every part gets its own search.\n"
+                "- Otherwise, rephrase the question with different wording and synonyms.\n"
+                "Keep the meaning and all constraints.\n"
                 f"Question: {query}\n"
                 "Return one query per line, no numbering, no explanations."
             )

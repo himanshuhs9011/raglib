@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, List
 
 from raglib.core.base import BaseRAG, PipelineContext
@@ -41,6 +42,10 @@ class GraphRAG(BaseRAG):
         mode = self.graph_retriever.resolve_mode(ctx.search_query, self.search_mode)
         ctx.trace.append(f"graph_mode:{mode}")
         ctx.metadata["graph_mode"] = mode
+        if getattr(self.graph_retriever.indexer, "building", False):
+            # graph_build="background": hybrid search answers fully; the graph adds what is built so far
+            ctx.trace.append("graph_building:partial_graph")
+            ctx.metadata["graph_building"] = True
         
         
         graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode)
@@ -51,7 +56,13 @@ class GraphRAG(BaseRAG):
             ctx.trace.append("global_empty:fallback_local")
             graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode="local")
 
-        context_docs = [doc for doc in graph_docs if doc.metadata.get("graph") != "chunk"]
+        # Entity/relation/community summaries get their own token budget (Generator.max_supplementary_tokens),
+        # so they add structure without pushing the evidence chunks out of the context.
+        context_docs = [
+            replace(doc, metadata={**doc.metadata, "supplementary": True})
+            for doc in graph_docs
+            if doc.metadata.get("graph") != "chunk"
+        ]
         graph_chunks = [doc for doc in graph_docs if doc.metadata.get("graph") == "chunk"]
         chunks = graph_chunks
         if self.fuse_with_chunks and self.retriever is not None:

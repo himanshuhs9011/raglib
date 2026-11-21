@@ -36,9 +36,9 @@ class VisionFactory:
             return OpenAIVisionClient(api_key=api_key, model_name=model_name, base_url=base_url)
         if provider_name == "anthropic":
             logger.info("VisionFactory selected provider='anthropic'")
-            return AnthropicVisionClient(api_key=api_key, model_name=model_name)
+            return AnthropicVisionClient(api_key=api_key, model_name=model_name, base_url=base_url)
         if provider_name == "google":
             logger.info("VisionFactory selected provider='google'")
-            return GoogleVisionClient(api_key=api_key, model_name=model_name)
+            return GoogleVisionClient(api_key=api_key, model_name=model_name, base_url=base_url)
 
         raise ValueError(f"Unknown vision provider '{provider_name}'.")

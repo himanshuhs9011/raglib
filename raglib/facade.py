@@ -51,6 +51,7 @@ from raglib.llm.base_client import (
     FallbackLLMClient,
     unwrap_llm,
 )
+from raglib.llm.constants import PROVIDER_DEFAULT_VISION_MODEL
 from raglib.llm.mock_client import MockLLMClient
 from raglib.llm.provider_detector import LLMProviderDetector
 from raglib.llm.providers import (
@@ -129,6 +130,7 @@ ORCHESTRATORS: Dict[str, str] = {
 GRAPH_INDEXER_OPTIONS = {
     "entity_types", "max_workers", "gleanings", "max_levels", "max_community_size",
     "community_rebuild_threshold", "resolve_with_embeddings", "resolution_threshold", "min_llm_report_size",
+    "max_extraction_attempts",
 }
 GRAPH_LOCAL_OPTIONS = {"top_k_entities", "hops", "max_neighbors", "max_relations", "max_reports"}
 GRAPH_GLOBAL_OPTIONS = {"top_communities", "max_points"}
@@ -239,6 +241,8 @@ class RAG:
         enable_graph: bool = False,
         graph_store: Optional[Any] = None,
         graph_kwargs: Optional[Dict[str, Any]] = None,
+        graph_llm: Optional[Union[str, BaseLLMClient, Any]] = None,
+        graph_build: str = "sync",
         tools: Optional[Sequence[Any]] = None,
         on_event: Optional[Callable[[TraceEvent], None]] = None,
         llm_cache: bool = True,
@@ -265,6 +269,11 @@ class RAG:
         ``"provider/model"`` strings tried in order when the primary model fails.
 
         ``llm_temperature`` / ``llm_max_tokens`` apply to models raglib builds from a provider name.
+        ``graph_llm`` builds the knowledge graph (entity extraction, community reports, global-search
+        map step) with a different model than the answers, e.g. a cheap fast model for the thousands
+        of indexing calls: ``RAG(..., rag_type="graph", llm="openai/gpt-4.1", graph_llm="openai/gpt-4.1-nano")``.
+        Its key comes from ``chat_api_key`` only when it is the same provider, otherwise from its env var.
+
         ``conversation_store`` replaces the in-memory session history (e.g.
         ``SQLiteConversationStore("chats.db")``). ``strict=True`` raises when an optional step
         (grader, router, reranker, query rewrite, web search, ...) fails, instead of degrading
@@ -289,6 +298,7 @@ class RAG:
         effective_chat_key = chat_api_key if chat_api_key is not None else llm_key
         self._llm_rpm = llm_rpm
         self._llm_max_retries = llm_max_retries
+        self._llm_timeout = llm_timeout
         self._llm_raw, chat_provider = self._resolve_chat_llm(
             chat_llm=chat_llm,
             api_key=effective_chat_key,
@@ -329,6 +339,8 @@ class RAG:
             chat_provider=chat_provider,
             model_name=vision_model,
             base_url=vision_base_url,
+            explicit_key=self._first_non_empty(vision_api_key, llm_key),
+            chat_api_key=chat_api_key,
         )
 
         if isinstance(vector_db, str) and vector_db.strip().lower() not in SUPPORTED_VECTOR_DBS:
@@ -381,8 +393,20 @@ class RAG:
 
         self._graph_indexer: Optional[Any] = None
         self._graph_retriever: Optional[Any] = None
+        self._graph_builder: Optional[Any] = None
+        if graph_build not in {"sync", "background"}:
+            raise ValueError("graph_build must be 'sync' or 'background'")
+        self._graph_build = graph_build
         if self._rag_type == "graph" or enable_graph:
+            self._graph_llm = self._resolve_graph_llm(
+                graph_llm, chat_provider, effective_chat_key, llm_cache,
+                max_tokens=int((graph_kwargs or {}).get("extraction_max_tokens", 4096)),
+            )
             self._build_graph(graph_store=graph_store, graph_kwargs=dict(graph_kwargs or {}))
+        elif graph_llm is not None:
+            raise ValueError("graph_llm needs rag_type='graph' or enable_graph=True")
+        elif graph_build != "sync":
+            raise ValueError("graph_build needs rag_type='graph' or enable_graph=True")
 
         self._evaluator = Evaluator()
         self._reranker = Reranker(
@@ -570,7 +594,7 @@ class RAG:
                 to_add.extend(parent_chunks)
             added = self._retriever.add_documents(to_add)
             if self._graph_indexer is not None and to_add:
-                self._graph_indexer.add_chunks(to_add)  # skips chunks it already extracted
+                self._add_to_graph(to_add)  # skips chunks it already extracted
             # Record documents only after they are really indexed, so a failed batch is retried next run.
             self._parents.update(changed)
             return len(added)
@@ -602,6 +626,19 @@ class RAG:
         """Clear conversation memory for one session (or all sessions)."""
 
         self._conversations.clear(session_id)
+
+    def retry_graph_extraction(self, include_skipped: bool = False) -> Dict[str, int]:
+        """Extract again the chunks whose graph extraction failed (e.g. after rate limits).
+
+        Failed chunks are never cached as empty, and ``stats()["graph"]["failed_extractions"]``
+        counts them. Loading a saved index also retries them, up to ``max_extraction_attempts``
+        (graph_kwargs, default 3) in total; after that a chunk is skipped
+        (``stats()["graph"]["skipped_extractions"]``). ``include_skipped=True`` retries those too.
+        """
+
+        if self._graph_indexer is None:
+            raise ValueError("Graph is not enabled (use rag_type='graph' or enable_graph=True)")
+        return self._graph_indexer.retry_failed(self._retriever.get, include_skipped=include_skipped)
 
     def rebuild_graph_communities(self) -> int:
         """Re-cluster the knowledge graph and refresh changed community reports."""
@@ -646,8 +683,10 @@ class RAG:
         payload = {"version": 3, "index": self._index_fingerprint(), "parents": self._parents, "chunks": chunks}
         # Write each file atomically, so a crash mid-save never leaves a half-written index.
         if isinstance(store, InMemoryVectorStore):
-            records = [asdict(record) for record in store.records()]
-            _atomic_write(path / "vectors.json", json.dumps(records))
+            store.dump(str(path), "vectors")  # binary float32 + metadata: loads ~50x faster than JSON
+            legacy = path / "vectors.json"
+            if legacy.exists():
+                legacy.unlink()
         _atomic_write(path / "chunks.json", json.dumps(payload, ensure_ascii=False))
         if self._graph_indexer is not None:
             self._graph_indexer.save(str(path / "graph"))
@@ -682,8 +721,11 @@ class RAG:
             reembed = True
         store = self._retriever.vector_store
         vectors_path = path / "vectors.json"
-        if isinstance(store, InMemoryVectorStore) and vectors_path.exists() and not reembed:
-            store.upsert([VectorRecord(**record) for record in json.loads(vectors_path.read_text(encoding="utf-8"))])
+        if isinstance(store, InMemoryVectorStore) and not reembed:
+            if InMemoryVectorStore.has_dump(str(path), "vectors"):
+                store.restore(str(path), "vectors")
+            elif vectors_path.exists():  # indexes saved before raglib 2.2
+                store.upsert([VectorRecord(**record) for record in json.loads(vectors_path.read_text(encoding="utf-8"))])
         documents = [Document(**item) for item in payload.get("chunks", [])]
         if reembed and store is not None and not isinstance(store, InMemoryVectorStore):
             store.delete([document.id for document in documents])  # drop vectors from the old model
@@ -693,9 +735,9 @@ class RAG:
             self._graph_indexer.load(str(path / "graph"))
             missing = [doc for doc in documents if doc.id not in self._graph_indexer.indexed_chunk_ids]
             if missing:
-                self._graph_indexer.add_chunks(missing)
+                self._add_to_graph(missing)
         elif self._graph_indexer is not None:
-            self._graph_indexer.add_chunks(documents)
+            self._add_to_graph(documents)
         logger.info("Loaded %d chunks from %s", len(documents), path)
         return self
 
@@ -737,7 +779,12 @@ class RAG:
             "reranker": self._reranker.backend,
         }
         if self._graph_indexer is not None:
-            info["graph"] = self._graph_indexer.store.stats()
+            info["graph"] = {
+                **self._graph_indexer.store.stats(),
+                "failed_extractions": len(self._graph_indexer.failed_chunk_ids),
+                "skipped_extractions": len(self._graph_indexer.skipped_chunk_ids),
+                "build": self.graph_status()["state"],
+            }
         return info
 
     def _resolve_chat_llm(
@@ -805,9 +852,9 @@ class RAG:
                 f"chat_llm='{spec.name}' requires chat_api_key (or llm_key) or one of environment variables: "
                 f"{list(spec.env_keys)}"
             )
-        from raglib.llm.langchain_adapter import LangChainAdapter
+        from raglib.llm.clients import build_chat_client
 
-        client = LangChainAdapter.build(
+        client = build_chat_client(
             provider=spec.name,
             api_key=key,
             model_name=model_name,
@@ -857,7 +904,7 @@ class RAG:
                 provider = "mock"
             elif chat_spec is not None and chat_spec.default_embedding_model:
                 provider = chat_spec.name
-            elif self._can_import("sentence_transformers") and self._can_import("langchain_huggingface"):
+            elif self._can_import("sentence_transformers"):
                 logger.info("No embedding_llm given; using local HuggingFace embeddings")
                 provider = "huggingface"
             else:
@@ -882,6 +929,11 @@ class RAG:
             return None
         if provider in {"mock", "huggingface", "free", "local"}:
             return CachedEmbedding(EmbeddingFactory.build(provider=provider, model_name=model_name, base_url=base_url))
+        if provider in PROVIDERS and PROVIDERS[provider].custom and PROVIDERS[provider].protocol == "anthropic":
+            raise ValueError(
+                f"Provider '{provider}' uses the Anthropic API, which has no embeddings endpoint; "
+                "pass embedding_llm='huggingface' | 'openai' | 'ollama' | ... or 'none'"
+            )
         if provider not in PROVIDERS or provider in {"anthropic", "groq"}:
             raise ValueError(
                 f"Unknown embedding provider '{provider}'. Supported: "
@@ -898,7 +950,22 @@ class RAG:
         resolved_model = model_name or spec.default_embedding_model
         rpm = self._effective_rpm(provider, resolved_model)
         limiter = shared_limiter(provider, key, rpm) if rpm else None
-        if provider in {"openai", "google", "ollama"}:
+        if spec.custom:
+            if not resolved_model:
+                raise ValueError(
+                    f"Custom provider '{provider}' has no embedding_model; set it in register_provider()/the "
+                    f"providers file, or pass embedding_llm='{provider}/<model>'"
+                )
+            embedding = EmbeddingFactory.build(
+                provider="google" if spec.protocol == "gemini" else "openai_compatible",
+                api_key=key,
+                model_name=resolved_model,
+                base_url=spec.resolve_base_url(base_url),
+                headers=spec.resolve_headers(),
+                input_types=spec.embedding_input_types,
+                extra_params=spec.embedding_params,
+            )
+        elif provider in {"openai", "google", "ollama"}:
             embedding = EmbeddingFactory.build(provider=provider, api_key=key, model_name=resolved_model, base_url=base_url)
         else:
             if not resolved_model:
@@ -911,6 +978,8 @@ class RAG:
                 api_key=key,
                 model_name=resolved_model,
                 base_url=spec.resolve_base_url(base_url),
+                input_types=spec.embedding_input_types,
+                extra_params=spec.embedding_params,
             )
         return CachedEmbedding(embedding, max_retries=getattr(self, "_llm_max_retries", 2), rate_limiter=limiter)
 
@@ -921,18 +990,38 @@ class RAG:
         chat_provider: Optional[str],
         model_name: Optional[str],
         base_url: Optional[str],
+        explicit_key: Optional[str] = None,
+        chat_api_key: Optional[str] = None,
     ) -> Optional[BaseVisionClient]:
-        """Resolve OCR/vision for scanned pages; None disables it (pages are skipped with a warning)."""
+        """Resolve OCR/vision for scanned pages; None disables it (pages are skipped with a warning).
+
+        ``explicit_key`` is vision_api_key / llm_key; ``chat_api_key`` is only reused for a custom
+        provider when it is the chat provider too (a key is never sent to a different host).
+        """
 
         if isinstance(vision_llm, BaseVisionClient):
             return vision_llm
         if vision_llm is None:
+            chat_spec = PROVIDERS.get(chat_provider or "")
+            chat_model = getattr(unwrap_llm(getattr(self, "_llm_raw", None)), "model_name", None)
+            model_spec = chat_spec.model(chat_model) if chat_spec is not None and chat_spec.custom else None
+            if model_spec is not None and model_spec.image:
+                # the custom chat model accepts images: reuse it (same provider, same key) for OCR
+                return self._chat_vision(chat_spec, model_name or chat_model, explicit_key, chat_api_key, base_url)
             if chat_provider in {"openai", "anthropic", "google"} and api_key:
                 provider = chat_provider
+            elif chat_spec is not None and chat_provider in PROVIDER_DEFAULT_VISION_MODEL and api_key:
+                return self._chat_vision(chat_spec, model_name, explicit_key, chat_api_key, base_url)  # e.g. nvidia
             else:
                 return None
         else:
-            provider = vision_llm.strip().lower()
+            head, _, tail = vision_llm.strip().partition("/")
+            spec = PROVIDERS.get(normalize_provider(head) or "")
+            provider = head.lower()
+            model_name = model_name or tail or None
+            if spec is not None and (spec.custom or (spec.supports_vision and provider not in SUPPORTED_VISION_PROVIDERS)):
+                same = spec.name == chat_provider
+                return self._chat_vision(spec, model_name, explicit_key, chat_api_key if same else None, base_url)
         if provider not in SUPPORTED_VISION_PROVIDERS:
             raise ValueError(f"Unknown vision provider '{provider}'. Supported: {sorted(SUPPORTED_VISION_PROVIDERS)}")
         return VisionFactory.build(
@@ -941,6 +1030,41 @@ class RAG:
             model_name=model_name,
             base_url=base_url,
         )
+
+    def _chat_vision(
+        self,
+        spec: Any,
+        model: Optional[str],
+        explicit_key: Optional[str],
+        chat_api_key: Optional[str],
+        base_url: Optional[str],
+    ) -> BaseVisionClient:
+        """OCR through a chat client: custom providers' image models, or built-ins such as NVIDIA."""
+
+        from raglib.llm.clients import build_chat_client
+        from raglib.vision.chat_vision import ChatVisionClient
+
+        image_models = [item.id for item in spec.models if item.image]
+        model = model or (image_models[0] if image_models else None) or PROVIDER_DEFAULT_VISION_MODEL.get(spec.name)
+        if not model:
+            hint = "declares no model with image=True" if spec.custom else "has no default vision model"
+            raise ValueError(f"Provider '{spec.name}' {hint}; pass vision_llm='{spec.name}/<model>'")
+        declared = spec.model(model)
+        if declared is not None and not declared.image:
+            raise ValueError(
+                f"Model '{model}' of provider '{spec.name}' is not marked image=True, so it cannot read scanned pages"
+                + (f"; image models: {image_models}" if image_models else "")
+            )
+        client = build_chat_client(
+            spec.name,
+            api_key=explicit_key or chat_api_key,
+            model_name=model,
+            base_url=base_url,
+            max_tokens=8192,  # room for reasoning tokens before the transcription
+            timeout=getattr(self, "_llm_timeout", 60.0),
+            max_retries=getattr(self, "_llm_max_retries", 2),
+        )
+        return ChatVisionClient(client)
 
     def _resolve_web_provider(
         self,
@@ -980,6 +1104,42 @@ class RAG:
                 f"web_search_provider='{provider.name}' failed validation. Check internet access and web_search_api_key."
             ) from exc
 
+    def _resolve_graph_llm(
+        self,
+        graph_llm: Optional[Union[str, BaseLLMClient, Any]],
+        chat_provider: Optional[str],
+        chat_key: Optional[str],
+        llm_cache: bool,
+        max_tokens: Optional[int] = 4096,
+    ) -> Optional[BaseLLMClient]:
+        """The model that builds the knowledge graph (None: use the answer model).
+
+        ``max_tokens`` caps each extraction reply: small models in JSON mode sometimes loop
+        (repeating entities or whitespace) and would otherwise hold a local GPU for minutes.
+        """
+
+        if graph_llm is None:
+            return None
+        same_provider = False
+        if isinstance(graph_llm, str):
+            provider, _ = parse_model_string(graph_llm)
+            same_provider = provider is not None and provider == chat_provider
+        saved_max_tokens = getattr(self, "_llm_max_tokens", None)
+        self._llm_max_tokens = max_tokens  # applies to models built from a provider string
+        try:
+            client, _ = self._resolve_chat_llm(
+                chat_llm=graph_llm,
+                api_key=chat_key if same_provider else None,
+                model_name=None,
+                base_url=None,
+                timeout=self._llm_timeout,
+                max_retries=self._llm_max_retries,
+            )
+        finally:
+            self._llm_max_tokens = saved_max_tokens
+        logger.info("GraphRAG indexing model: %s", getattr(unwrap_llm(client), "model_name", type(client).__name__))
+        return CachedLLMClient(client) if llm_cache else client
+
     def _build_graph(self, graph_store: Optional[Any], graph_kwargs: Dict[str, Any]) -> None:
         """Create the GraphRAG indexer and retriever."""
 
@@ -992,17 +1152,24 @@ class RAG:
         )
 
         unknown = set(graph_kwargs) - GRAPH_INDEXER_OPTIONS - GRAPH_LOCAL_OPTIONS - GRAPH_GLOBAL_OPTIONS - {
-            "store_options", "global_level", "default_mode",
+            "store_options", "global_level", "default_mode", "extraction_max_tokens", "build_batch_size",
         }
         if unknown:
             raise ValueError(f"Unknown graph_kwargs: {sorted(unknown)}")
         store = build_graph_store(graph_store, graph_kwargs.get("store_options"))
+        graph_llm = getattr(self, "_graph_llm", None) or self._llm
         self._graph_indexer = GraphIndexer(
-            llm_client=self._llm,
+            llm_client=graph_llm,
             embedding=self._embedding,
             store=store,
             **{key: graph_kwargs[key] for key in GRAPH_INDEXER_OPTIONS if key in graph_kwargs},
         )
+        if self._graph_build == "background":
+            from raglib.graphrag.background import BackgroundGraphBuilder
+
+            self._graph_builder = BackgroundGraphBuilder(
+                self._graph_indexer, self._retriever.get, batch_size=int(graph_kwargs.get("build_batch_size", 64))
+            )
         local = LocalSearch(
             indexer=self._graph_indexer,
             chunk_lookup=self._retriever.get,
@@ -1010,7 +1177,7 @@ class RAG:
         )
         global_search = GlobalSearch(
             indexer=self._graph_indexer,
-            llm_client=self._llm,
+            llm_client=graph_llm,
             level=int(graph_kwargs.get("global_level", 0)),
             max_workers=int(graph_kwargs.get("max_workers", 8)),
             **{key: graph_kwargs[key] for key in GRAPH_GLOBAL_OPTIONS if key in graph_kwargs},
@@ -1074,9 +1241,47 @@ class RAG:
         """Delete chunks from the retriever and graph."""
 
         removed = self._retriever.delete_documents(chunk_ids)
+        if self._graph_builder is not None:
+            self._graph_builder.discard(chunk_ids)
         if self._graph_indexer is not None:
             self._graph_indexer.remove_chunks(chunk_ids)
         return removed
+
+    def _add_to_graph(self, chunks: List[Document]) -> None:
+        """Extract chunks into the graph now, or queue them for the background builder."""
+
+        if self._graph_builder is not None:
+            self._graph_builder.submit(chunks)
+        else:
+            self._graph_indexer.add_chunks(chunks)
+
+    def graph_status(self) -> Dict[str, Any]:
+        """Progress of the knowledge-graph build.
+
+        ``state`` is ``"building"`` while chunks are queued, extracted or communities are being
+        summarized (``graph_build="background"``), ``"ready"`` when the graph is complete, and
+        ``"empty"`` before any chunk was indexed. Queries work in every state.
+        """
+
+        if self._graph_indexer is None:
+            raise ValueError("Graph is not enabled (use rag_type='graph' or enable_graph=True)")
+        if self._graph_builder is not None:
+            return self._graph_builder.status()
+        indexer = self._graph_indexer
+        return {
+            "state": "ready" if indexer.indexed_chunk_ids else "empty",
+            "phase": "idle",
+            "pending_chunks": 0,
+            "failed_extractions": len(indexer.failed_chunk_ids),
+            "skipped_extractions": len(indexer.skipped_chunk_ids),
+        }
+
+    def wait_for_graph(self, timeout: Optional[float] = None) -> bool:
+        """Block until a background graph build has finished (True), or ``timeout`` seconds passed (False)."""
+
+        if self._graph_builder is None:
+            return True
+        return self._graph_builder.wait(timeout)
 
     def _normalize_rag_type(self, rag_type: str) -> str:
         """Normalize rag_type aliases to canonical orchestrator names."""

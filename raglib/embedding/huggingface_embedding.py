@@ -1,4 +1,4 @@
-"""Free local embedding implementation powered by sentence-transformers."""
+"""Free local embeddings powered by sentence-transformers."""
 
 from __future__ import annotations
 
@@ -12,45 +12,51 @@ logger = logging.getLogger(__name__)
 
 
 class HuggingFaceEmbedding(BaseEmbedding):
-    """Provide free local embeddings via LangChain HuggingFace embeddings."""
+    """Run a sentence-transformers model locally (CPU or GPU)."""
 
-    def __init__(self, model_name: Optional[str] = None):
-        """Initialize a local sentence-transformers-backed embedding model."""
+    def __init__(self, model_name: Optional[str] = None, normalize: bool = False, batch_size: int = 32):
+        """Load the model. ``normalize=True`` returns unit-length vectors."""
 
         try:
-            from langchain_huggingface import HuggingFaceEmbeddings
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         except ImportError as exc:
             raise ImportError(
-                "Free local embeddings require sentence-transformers. "
-                "Install with: pip install raglib-py[free-embed]"
+                "Free local embeddings require sentence-transformers. Install with: pip install raglib-py[hf]"
             ) from exc
 
         resolved_model = model_name or PROVIDER_DEFAULT_EMBEDDING_MODEL["huggingface"]
-        self._model = HuggingFaceEmbeddings(model_name=resolved_model)
-        self._dimension = 384
+        self._model = SentenceTransformer(resolved_model)
+        self.normalize = normalize
+        self.batch_size = batch_size
+        getter = getattr(self._model, "get_sentence_embedding_dimension", None)
+        self._dimension = int(getter() or 0) if callable(getter) else 0
         self._model_name = resolved_model
         logger.info("Using HuggingFace embedding model='%s'", resolved_model)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embed a batch of documents using local HuggingFace embeddings."""
+        """Embed a batch of documents."""
 
-        logger.debug("HuggingFaceEmbedding embed_documents called with batch size=%d", len(texts))
-        vectors = self._model.embed_documents(texts)
-        if vectors:
-            self._dimension = len(vectors[0])
-        return vectors
+        if not texts:
+            return []
+        vectors = self._model.encode(
+            list(texts),
+            batch_size=self.batch_size,
+            normalize_embeddings=self.normalize,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        result = [[float(value) for value in row] for row in vectors.tolist()]
+        if result:
+            self._dimension = len(result[0])
+        return result
 
     def embed_query(self, text: str) -> List[float]:
-        """Embed a single query using local HuggingFace embeddings."""
+        """Embed a single query."""
 
-        logger.debug("HuggingFaceEmbedding embed_query called with text length=%d", len(text))
-        vector = self._model.embed_query(text)
-        if vector:
-            self._dimension = len(vector)
-        return vector
+        return self.embed_documents([text])[0]
 
     @property
     def dimension(self) -> int:
-        """Return current embedding dimensionality."""
+        """Return embedding dimensionality."""
 
         return self._dimension

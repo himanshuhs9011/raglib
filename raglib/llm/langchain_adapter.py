@@ -1,4 +1,9 @@
-"""LangChain chat model adapter implementing raglib BaseLLMClient."""
+"""Adapter for LangChain chat models that users pass in themselves.
+
+raglib's own provider clients are native (``raglib.llm.clients``) and do not use LangChain.
+This adapter only wraps an existing LangChain ``BaseChatModel`` object, e.g.
+``RAG(chat_llm=ChatOpenAI(...))``, so it gets raglib's retries, rate limiting and usage tracking.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +11,7 @@ import logging
 from typing import Any, Dict, Iterator, List, Optional
 
 from raglib.llm.base_client import BaseLLMClient
-from raglib.llm.constants import (
-    DEFAULT_LLM_MAX_RETRIES,
-    DEFAULT_LLM_TIMEOUT_SECONDS,
-    OLLAMA_DEFAULT_BASE_URL,
-    PROVIDER_DEFAULT_CHAT_MODEL,
-)
+from raglib.llm.constants import DEFAULT_LLM_MAX_RETRIES, DEFAULT_LLM_TIMEOUT_SECONDS
 from raglib.llm.resilience import RateLimiter, is_retryable, retry_call
 
 logger = logging.getLogger(__name__)
@@ -242,176 +242,27 @@ class LangChainAdapter(BaseLLMClient):
         timeout: float = DEFAULT_LLM_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_LLM_MAX_RETRIES,
         max_tokens: Optional[int] = None,
-    ) -> "LangChainAdapter":
-        """Build a provider-specific LangChain chat model and wrap it with this adapter.
+    ) -> BaseLLMClient:
+        """Deprecated: use ``raglib.llm.build_chat_client`` (native clients, no LangChain needed)."""
 
-        ``max_tokens`` caps the answer length (mapped to each provider's parameter name).
-        """
+        import warnings
 
-        limit: Dict[str, Any] = {"max_tokens": max_tokens} if max_tokens else {}
+        from raglib.llm.clients import build_chat_client
 
-        from raglib.llm.providers import (
-            KIND_AZURE,
-            KIND_OPENAI_COMPATIBLE,
-            get_provider,
+        warnings.warn(
+            "LangChainAdapter.build() is deprecated; use raglib.llm.build_chat_client(), which needs no LangChain.",
+            DeprecationWarning,
+            stacklevel=2,
         )
-
-        spec = get_provider(provider)
-        normalized_provider = spec.name
-        resolved_model = model_name or spec.default_chat_model or PROVIDER_DEFAULT_CHAT_MODEL.get(normalized_provider)
-        if not resolved_model:
-            raise ValueError(
-                f"Provider '{normalized_provider}' has no default model; pass chat_model=... "
-                "(for OpenRouter-style ids use e.g. llm='openrouter/meta-llama/llama-3.3-70b-instruct')"
-            )
-
-        if spec.kind == KIND_OPENAI_COMPATIBLE:
-            lc_model = cls._build_openai_compatible(
-                spec=spec,
-                api_key=api_key,
-                model=resolved_model,
-                base_url=base_url,
-                temperature=temperature,
-                timeout=timeout,
-                limit=limit,
-            )
-            logger.info("Built LangChainAdapter provider='%s' model='%s'", normalized_provider, resolved_model)
-            return cls(langchain_model=lc_model, provider_name=normalized_provider, max_retries=max_retries, model_name=resolved_model)
-
-        if spec.kind == KIND_AZURE:
-            try:
-                from langchain_openai import AzureChatOpenAI
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[openai]") from exc
-            import os
-
-            endpoint = spec.resolve_base_url(base_url)
-            if not endpoint:
-                raise ValueError("Azure OpenAI requires chat_base_url (your endpoint) or AZURE_OPENAI_ENDPOINT")
-            lc_model = AzureChatOpenAI(
-                azure_deployment=resolved_model,
-                azure_endpoint=endpoint,
-                api_key=spec.resolve_api_key(api_key),
-                api_version=os.getenv("OPENAI_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION") or "2024-10-21",
-                temperature=temperature,
-                timeout=timeout,
-                max_retries=0,
-                **limit,
-            )
-            logger.info("Built LangChainAdapter provider='azure' deployment='%s'", resolved_model)
-            return cls(langchain_model=lc_model, provider_name="azure", max_retries=max_retries, model_name=resolved_model)
-
-        if normalized_provider == "openai":
-            try:
-                from langchain_openai import ChatOpenAI
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[openai]") from exc
-            lc_model = ChatOpenAI(
-                model=resolved_model,
-                api_key=api_key,
-                base_url=base_url,
-                temperature=temperature,
-                timeout=timeout,
-                max_retries=0,
-                **limit,
-            )
-        elif normalized_provider == "anthropic":
-            try:
-                from langchain_anthropic import ChatAnthropic
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[anthropic]") from exc
-            lc_model = ChatAnthropic(
-                model=resolved_model,
-                api_key=api_key,
-                temperature=temperature,
-                timeout=timeout,
-                max_retries=0,
-                **limit,
-            )
-        elif normalized_provider == "groq":
-            try:
-                from langchain_groq import ChatGroq
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[groq]") from exc
-            lc_model = ChatGroq(
-                model=resolved_model,
-                api_key=api_key,
-                temperature=temperature,
-                timeout=timeout,
-                max_retries=0,
-                **limit,
-            )
-        elif normalized_provider == "google":
-            try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[google]") from exc
-            lc_model = ChatGoogleGenerativeAI(
-                model=resolved_model,
-                google_api_key=api_key,
-                temperature=temperature,
-                timeout=timeout,
-                max_retries=0,
-                **({"max_output_tokens": max_tokens} if max_tokens else {}),
-            )
-        elif normalized_provider == "ollama":
-            try:
-                from langchain_ollama import ChatOllama
-            except ImportError as exc:
-                raise ImportError("pip install raglib-py[ollama]") from exc
-            lc_model = ChatOllama(
-                model=resolved_model,
-                base_url=base_url or OLLAMA_DEFAULT_BASE_URL,
-                temperature=temperature,
-                **({"num_predict": max_tokens} if max_tokens else {}),
-            )
-        else:
-            raise ValueError(
-                f"Unknown provider '{provider}'. Supported: openai, anthropic, groq, google, ollama"
-            )
-
-        logger.info("Built LangChainAdapter provider='%s' model='%s'", normalized_provider, resolved_model)
-        return cls(langchain_model=lc_model, provider_name=normalized_provider, max_retries=max_retries, model_name=resolved_model)
-
-    @staticmethod
-    def _build_openai_compatible(
-        spec: Any,
-        api_key: Optional[str],
-        model: str,
-        base_url: Optional[str],
-        temperature: float,
-        timeout: float,
-        limit: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """ChatOpenAI pointed at an OpenAI-compatible endpoint (OpenRouter, DeepSeek, vLLM, ...)."""
-
-        try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:
-            raise ImportError(f"Provider '{spec.name}' requires: pip install raglib-py[openai]") from exc
-        import os
-
-        resolved_url = spec.resolve_base_url(base_url)
-        if not resolved_url:
-            raise ValueError(f"Provider '{spec.name}' requires chat_base_url (e.g. http://localhost:8000/v1)")
-        key = spec.resolve_api_key(api_key)
-        if spec.requires_key and not key:
-            raise ValueError(f"Provider '{spec.name}' requires an API key (chat_api_key or {spec.env_keys[0]})")
-        headers = dict(spec.extra_headers)
-        if spec.name == "openrouter":
-            if os.getenv("OPENROUTER_APP_NAME"):
-                headers["X-Title"] = os.environ["OPENROUTER_APP_NAME"]
-            if os.getenv("OPENROUTER_SITE_URL"):
-                headers["HTTP-Referer"] = os.environ["OPENROUTER_SITE_URL"]
-        return ChatOpenAI(
-            model=model,
-            api_key=key or "not-needed",  # local servers ignore the key but the client requires one
-            base_url=resolved_url,
+        return build_chat_client(
+            provider=provider,
+            api_key=api_key,
+            model_name=model_name,
+            base_url=base_url,
             temperature=temperature,
             timeout=timeout,
-            max_retries=0,
-            default_headers=headers or None,
-            **(limit or {}),
+            max_retries=max_retries,
+            max_tokens=max_tokens,
         )
 
     @classmethod

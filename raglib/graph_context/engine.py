@@ -638,7 +638,15 @@ class GraphContextWindow:
         """Drop-in retrieval helper returning standard `raglib.schemas.Document` objects."""
 
         result = self.build_context_window(query=query, top_k_seeds=top_k)
-        return result.documents[:top_k]
+        # Chunks carry the text; section nodes only repeat a summary of them, so they fill
+        # remaining slots instead of displacing chunks from other documents.
+        chunks = [doc for doc in result.documents if doc.metadata.get("node_type") == "chunk"]
+        others = [doc for doc in result.documents if doc.metadata.get("node_type") != "chunk"]
+        selected = (chunks + others)[:top_k]
+        for doc in selected:
+            if not doc.metadata.get("title") and doc.metadata.get("doc_title"):
+                doc.metadata["title"] = doc.metadata["doc_title"]
+        return selected
 
     def _extract_sections(self, text: str, default_title: str) -> List[Tuple[str, str]]:
         """Extract logical sections from headings or paragraphs."""
@@ -1081,7 +1089,9 @@ class GraphContextWindow:
 
         candidates: List[str] = []
         pattern = re.compile(
-            r"\b(?:[A-Z][a-zA-Z0-9_]+(?:\s+[A-Z][a-zA-Z0-9_]+)*|[A-Z]{2,}[a-zA-Z0-9_]*)\b"
+            # Words of one entity are separated by spaces/tabs only: "\s" would join names across
+            # line breaks ("TechCrunch\n\nFlexport CEO") and create junk SHARED_ENTITY links.
+            r"\b(?:[A-Z][a-zA-Z0-9_]+(?:[ \t]+[A-Z][a-zA-Z0-9_]+)*|[A-Z]{2,}[a-zA-Z0-9_]*)\b"
         )
         for match in pattern.finditer(text):
             raw = match.group(0).strip()

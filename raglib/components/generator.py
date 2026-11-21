@@ -62,11 +62,15 @@ class Generator:
         system_prompt: Optional[str] = None,
         reorder: str = "edges",
         min_doc_tokens: int = 40,
+        max_supplementary_tokens: int = 1200,
     ):
         """Initialize generator.
 
         ``reorder="edges"`` places the strongest sources at the start and end of the
         context (mitigates "lost in the middle"); use ``"none"`` to keep ranking order.
+        ``max_supplementary_tokens``: separate budget for documents marked
+        ``metadata["supplementary"]`` (e.g. GraphRAG's entity/relation/community summaries). They come
+        first in the context but can never push the evidence chunks out of ``max_context_tokens``.
         """
 
         if reorder not in {"edges", "none"}:
@@ -77,6 +81,7 @@ class Generator:
         self.max_context_tokens = max_context_tokens
         self.reorder = reorder
         self.min_doc_tokens = min_doc_tokens
+        self.max_supplementary_tokens = max(0, max_supplementary_tokens)
 
     def generate(
         self,
@@ -193,7 +198,17 @@ class Generator:
             return rendered.replace("{context}", context)
 
     def _pack_documents(self, documents: List[Document]) -> List[Document]:
-        """Greedily fit documents into the budget, trimming (not dropping) the last one."""
+        """Fit evidence into ``max_context_tokens`` and supplementary context into its own budget."""
+
+        supplementary = [doc for doc in documents if doc.metadata.get("supplementary")]
+        evidence = [doc for doc in documents if not doc.metadata.get("supplementary")]
+        selected = self._fit(evidence, self.max_context_tokens)
+        if self.reorder == "edges" and len(selected) > 2:
+            selected = self._edge_order(selected)
+        return self._fit(supplementary, self.max_supplementary_tokens) + selected
+
+    def _fit(self, documents: List[Document], budget: int) -> List[Document]:
+        """Greedily fit documents into ``budget`` tokens, trimming (not dropping) the last one."""
 
         selected: List[Document] = []
         used = 0
@@ -201,7 +216,7 @@ class Generator:
             if not doc.content.strip():
                 continue
             tokens = count_tokens(doc.content) + 12  # block markup overhead
-            remaining = self.max_context_tokens - used
+            remaining = budget - used
             if tokens <= remaining:
                 selected.append(doc)
                 used += tokens
@@ -211,8 +226,6 @@ class Generator:
                 if trimmed.strip():
                     selected.append(replace(doc, content=trimmed, metadata={**doc.metadata, "trimmed": True}))
             break
-        if self.reorder == "edges" and len(selected) > 2:
-            selected = self._edge_order(selected)
         return selected
 
     @staticmethod

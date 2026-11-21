@@ -8,15 +8,14 @@ from raglib import RAG, ask
 from raglib.cli import main as cli_main
 from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.llm.base_client import unwrap_llm
+from raglib.llm.clients import OpenAICompatibleClient
 from raglib.llm.providers import PROVIDERS, detect_provider_from_key, parse_model_string
-
-langchain_openai = pytest.importorskip("langchain_openai")
 
 
 def _chat_model(rag: RAG):
-    """Return the underlying LangChain chat model of a RAG."""
+    """Return the native chat client of a RAG."""
 
-    return unwrap_llm(rag._llm)._model
+    return unwrap_llm(rag._llm)
 
 
 @pytest.mark.parametrize(
@@ -46,6 +45,7 @@ def test_parse_model_string(value, expected) -> None:
         ("gsk_abc", "groq"),
         ("xai-abc", "xai"),
         ("pplx-abc", "perplexity"),
+        ("nvapi-abc", "nvidia"),
         ("unknown-key", None),
     ],
 )
@@ -60,13 +60,13 @@ def test_key_prefix_detection(key, provider) -> None:
     [n for n, spec in PROVIDERS.items() if spec.kind == "openai_compatible" and spec.default_chat_model],
 )
 def test_openai_compatible_providers_build_with_correct_endpoint(name: str) -> None:
-    """Every hosted OpenAI-compatible provider points ChatOpenAI at its own base URL."""
+    """Every hosted OpenAI-compatible provider points the client at its own base URL."""
 
     rag = RAG("hello world", llm=name, chat_api_key="test-key", embedding_llm="none")
     model = _chat_model(rag)
     spec = PROVIDERS[name]
-    assert isinstance(model, langchain_openai.ChatOpenAI)
-    assert model.openai_api_base == spec.base_url
+    assert isinstance(model, OpenAICompatibleClient)
+    assert model.base_url == spec.base_url
     assert model.model_name == spec.default_chat_model
 
 
@@ -76,8 +76,8 @@ def test_openrouter_with_model_string_and_headers() -> None:
     rag = RAG("hello", llm="openrouter/deepseek/deepseek-chat", chat_api_key="sk-or-v1-x", embedding_llm="none")
     model = _chat_model(rag)
     assert model.model_name == "deepseek/deepseek-chat"
-    assert model.openai_api_base == "https://openrouter.ai/api/v1"
-    assert model.default_headers.get("X-Title") == "raglib"
+    assert model.base_url == "https://openrouter.ai/api/v1"
+    assert model.extra_headers.get("X-Title") == "raglib"
     assert rag.stats()["retrieval_mode"] == "sparse"
 
 
@@ -85,7 +85,7 @@ def test_openrouter_key_alone_selects_openrouter() -> None:
     """Passing only an OpenRouter key must not build an OpenAI client."""
 
     rag = RAG("hello", llm_key="sk-or-v1-abc", embedding_llm="none")
-    assert _chat_model(rag).openai_api_base == "https://openrouter.ai/api/v1"
+    assert _chat_model(rag).base_url == "https://openrouter.ai/api/v1"
 
 
 def test_provider_auto_detected_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,7 +94,7 @@ def test_provider_auto_detected_from_environment(monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("RAGLIB_OFFLINE", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-env")
     rag = RAG("hello", embedding_llm="none")
-    assert _chat_model(rag).openai_api_base == "https://openrouter.ai/api/v1"
+    assert _chat_model(rag).base_url == "https://openrouter.ai/api/v1"
 
 
 def test_offline_flag_beats_environment_keys(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -117,10 +117,10 @@ def test_mistral_uses_its_own_embeddings() -> None:
     rag = RAG(llm="mistral", chat_api_key="m-key")  # no source: nothing is embedded, no network
     embedding = rag._embedding
     assert isinstance(embedding, CachedEmbedding)
-    inner = embedding.inner._model
-    assert inner.model == "mistral-embed"
-    assert inner.openai_api_base == "https://api.mistral.ai/v1"
-    assert inner.check_embedding_ctx_length is False
+    inner = embedding.inner
+    assert inner.model_name == "mistral-embed"
+    assert inner.base_url == "https://api.mistral.ai/v1"
+    assert inner._url == "https://api.mistral.ai/v1/embeddings"
     assert rag.stats()["retrieval_mode"] == "hybrid"
 
 
@@ -128,7 +128,7 @@ def test_embedding_provider_model_string() -> None:
     """embedding_llm also accepts 'provider/model'."""
 
     rag = RAG(llm="openrouter", chat_api_key="sk-or-v1-x", embedding_llm="mistral/mistral-embed", embedding_api_key="m")
-    assert rag._embedding.inner._model.model == "mistral-embed"
+    assert rag._embedding.inner.model_name == "mistral-embed"
 
 
 def test_local_servers_need_model_but_no_key() -> None:
@@ -138,7 +138,7 @@ def test_local_servers_need_model_but_no_key() -> None:
         RAG("hello", llm="lmstudio", embedding_llm="none")
     rag = RAG("hello", llm="vllm/Qwen/Qwen2.5-7B-Instruct", chat_base_url="http://gpu-box:8000/v1", embedding_llm="none")
     model = _chat_model(rag)
-    assert model.openai_api_base == "http://gpu-box:8000/v1" and model.model_name == "Qwen/Qwen2.5-7B-Instruct"
+    assert model.base_url == "http://gpu-box:8000/v1" and model.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
 
 def test_missing_key_error_names_the_env_var() -> None:

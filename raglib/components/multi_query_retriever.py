@@ -50,6 +50,38 @@ class MultiQueryRetriever:
             ranked_lists = parallel_map(lambda v: self.retriever.retrieve(v, top_k=k, **kwargs), variants, self.max_workers)
         weights = [1.5] + [1.0] * (len(ranked_lists) - 1)
         fused = reciprocal_rank_fusion(ranked_lists, weights=weights)
+        fused = cover_each_list(ranked_lists, fused, k)
         if self.deduplicator is not None:
             fused = self.deduplicator.deduplicate(fused)
         return fused[:k], variants
+
+
+def cover_each_list(ranked_lists: List[List[Document]], fused: List[Document], k: int) -> List[Document]:
+    """Reserve the first slots for each list's best result, then fill by fused (RRF) order.
+
+    RRF rewards documents found by many queries, so when the queries cover different parts of a
+    question (one per source or entity), the part matched by most queries takes every slot and the
+    others are lost. Giving each query its top hit first keeps every part covered; for plain
+    paraphrases the top hits mostly coincide, so the order stays close to RRF.
+    """
+
+    from raglib.core.fusion import doc_key
+
+    scored = {doc_key(doc): doc for doc in fused}  # carry the fused score and metadata
+    chosen: List[Document] = []
+    seen = set()
+    for ranked in ranked_lists:
+        if len(chosen) >= k:
+            break
+        if not ranked:
+            continue
+        key = doc_key(ranked[0])  # this query's best hit; if already chosen, the query is covered
+        if key not in seen:
+            seen.add(key)
+            chosen.append(scored.get(key, ranked[0]))
+    for doc in fused:
+        key = doc_key(doc)
+        if key not in seen:
+            seen.add(key)
+            chosen.append(doc)
+    return chosen

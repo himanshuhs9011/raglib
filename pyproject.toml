@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "raglib-py"
-version = "2.1.0"
+version = "2.2.0"
 description = "Modular Retrieval-Augmented Generation: hybrid search, reranking, CRAG, Self-RAG, agentic and GraphRAG pipelines"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -39,15 +39,17 @@ Repository = "https://github.com/himanshuhs9011/raglib"
 
 [project.optional-dependencies]
 # chat / embedding providers
-# "openai" also covers OpenRouter, DeepSeek, Mistral, Together, Fireworks, xAI, Perplexity,
-# Cerebras, Azure OpenAI, LM Studio, vLLM and any other OpenAI-compatible API.
-openai = ["langchain-core>=0.2.0", "langchain-openai>=0.1.0"]
-openrouter = ["langchain-core>=0.2.0", "langchain-openai>=0.1.0"]
-anthropic = ["langchain-core>=0.2.0", "langchain-anthropic>=0.1.0"]
-groq = ["langchain-core>=0.2.0", "langchain-groq>=0.1.0"]
-google = ["langchain-core>=0.2.0", "langchain-google-genai>=1.0.0"]
-ollama = ["langchain-core>=0.2.0", "langchain-ollama>=0.1.0"]
-hf = ["langchain-huggingface>=0.0.3", "sentence-transformers>=2.6.0"]
+# Every hosted provider is reached with raglib's own HTTP clients (standard library only), so
+# these extras are empty. They are kept so existing `pip install raglib-py[openai]` lines still work.
+openai = []
+openrouter = []
+anthropic = []
+groq = []
+google = []
+ollama = []
+hf = ["sentence-transformers>=2.6.0"]
+# wrap your own LangChain chat model: RAG(chat_llm=ChatOpenAI(...))
+langchain = ["langchain-core>=0.2.0"]
 # retrieval quality
 rerank = ["sentence-transformers>=2.6.0"]
 cohere = ["cohere>=5.0.0"]
@@ -70,22 +72,8 @@ web = ["ddgs>=6.0.0"]
 tavily = ["tavily-python>=0.2.0"]
 serpapi = ["google-search-results>=2.4.0"]
 # bundles
-all-llm = [
-  "langchain-core>=0.2.0",
-  "langchain-openai>=0.1.0",
-  "langchain-anthropic>=0.1.0",
-  "langchain-groq>=0.1.0",
-  "langchain-google-genai>=1.0.0",
-  "langchain-ollama>=0.1.0",
-]
+all-llm = []
 all = [
-  "langchain-core>=0.2.0",
-  "langchain-openai>=0.1.0",
-  "langchain-anthropic>=0.1.0",
-  "langchain-groq>=0.1.0",
-  "langchain-google-genai>=1.0.0",
-  "langchain-ollama>=0.1.0",
-  "langchain-huggingface>=0.0.3",
   "sentence-transformers>=2.6.0",
   "numpy>=1.24",
   "tiktoken>=0.5.0",
@@ -111,11 +99,12 @@ dev = [
 packages = ["raglib"]
 
 [tool.hatch.build.targets.sdist]
+# Leading "/" anchors to the project root; a bare "README.md" also matched files in site/node_modules.
 include = [
-  "raglib/**/*.py",
-  "README.md",
-  "LICENSE",
-  "pyproject.toml",
+  "/raglib/**/*.py",
+  "/README.md",
+  "/LICENSE",
+  "/pyproject.toml",
 ]
 
 [tool.ruff]

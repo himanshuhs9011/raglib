@@ -57,6 +57,10 @@ class LocalSearch:
         if not seeds:
             return []
         seed_scores = {entity.id: score for entity, score in seeds}
+        with self.indexer.read_lock():  # the graph may be growing in a background build
+            return self._search_graph(query, store, seed_scores, top_k)
+
+    def _search_graph(self, query: str, store, seed_scores: Dict[str, float], top_k: int) -> List[Document]:
         distances = store.neighbors(seed_scores.keys(), hops=self.hops, max_nodes=self.max_neighbors)
         entities = {entity.id: entity for entity in store.get_entities(distances.keys())}
 
@@ -179,9 +183,10 @@ class GlobalSearch:
         """Map relevant community reports to scored key points."""
 
         self.indexer.ensure_communities()
-        communities = [c for c in self.indexer.store.communities(self.level) if c.summary]
-        if not communities:
-            communities = [c for c in self.indexer.store.communities() if c.summary]
+        with self.indexer.read_lock():
+            communities = [c for c in self.indexer.store.communities(self.level) if c.summary]
+            if not communities:
+                communities = [c for c in self.indexer.store.communities() if c.summary]
         if not communities:
             return []
         selected = self._prefilter(query, communities)

@@ -64,8 +64,10 @@ class RelevanceGrader:
         prompt = (
             "Grade each retrieved document for the query.\n"
             "CORRECT = directly contains information that answers the query.\n"
-            "AMBIGUOUS = partially relevant or uncertain.\n"
-            "INCORRECT = irrelevant or misleading.\n\n"
+            "AMBIGUOUS = partially relevant or uncertain. A question may need several documents (it compares "
+            "sources, combines facts, or orders events): a document with facts about any one of the entities, "
+            "sources or events it names is AMBIGUOUS, not INCORRECT, even if it cannot answer alone.\n"
+            "INCORRECT = irrelevant or misleading: about none of the things the query asks about.\n\n"
             f"Query: {query}\n\n"
             f"Documents:\n{numbered}\n\n"
             'Reply with JSON only, e.g. {"grades": ["CORRECT", "INCORRECT"]} with exactly one grade per document, in order.'
