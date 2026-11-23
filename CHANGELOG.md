@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**Guardrail cost benchmark.** `benchmarks/guardrails/cost_bench.py` runs one question set through four setups: guards off, the production guards, and all guards in local-model mode and in API-only mode. Per setup it reports attacks blocked, answerable questions wrongly blocked, LLM calls (answer model and cheap model), the calls NothingRelevant and TopicGuard saved, the judge escalation rate, latency per guard and judge stage, and estimated cost from a PriceTable. It runs offline by default (mock LLM, fake local classifiers, lexical embedding). Latency is then simulated and labelled as such; with `--local real` or a real `--llm`, latency is measured. Paid providers need `--yes`.
+
 **Unknown embedding limits warn.** When raglib does not know an embedding model's input limit (a custom embedding, or a provider model missing from the table), it now warns once per model with an `EmbeddingLimitWarning`. The warning names the model and suggests `RAG(embedding_max_tokens=...)`, so a provider can no longer truncate long chunks silently without notice. It only warns; it never raises, even with `preset="production"` / `oversized_chunks="raise"`. The offline mock embedding is exempt.
 
 **Guardrails, tier 2 (LLM judge, used sparingly).** See README "Tier 2: the LLM judge".

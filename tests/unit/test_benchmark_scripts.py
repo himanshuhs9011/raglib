@@ -55,3 +55,22 @@ def test_configurations_cover_every_threshold_type_and_minimum() -> None:
     assert labels[0].startswith("fixed") and len(labels) == 1 + 5 * 3
     for kind in ("percentile", "interquartile", "gradient", "number_of_chunks", "standard_deviation"):
         assert sum(kind in label for label in labels) == 3
+
+
+def test_guardrail_cost_benchmark_runs_offline(tmp_path) -> None:
+    import json
+
+    spec = importlib.util.spec_from_file_location("cost_bench", ROOT / "benchmarks" / "guardrails" / "cost_bench.py")
+    cost_bench = importlib.util.module_from_spec(spec)
+    sys.modules["cost_bench"] = cost_bench
+    spec.loader.exec_module(cost_bench)
+    out = tmp_path / "bench.json"
+    assert cost_bench.main(["--no-sleep", "--json", str(out)]) == 0
+    setups = {row["setup"]: row for row in json.loads(out.read_text(encoding="utf-8"))["setups"]}
+    assert set(setups) == {"off", "production", "all / local", "all / api"}
+    assert setups["off"]["blocked"] == {} and setups["off"]["attacks_blocked"] == 0
+    assert setups["all / api"]["attacks_blocked"] == setups["all / api"]["attacks_total"]
+    assert setups["all / api"]["llm_calls_saved"].get("topic", 0) > 0
+    assert setups["all / api"]["cheap_llm_calls"] > setups["all / local"]["cheap_llm_calls"]
+    assert any(stage.startswith("guard.") for stage in setups["production"]["stages"])
+    assert cost_bench.main(["--llm", "openai/gpt-4.1-mini"]) == 2  # paid: needs --yes, nothing sent
