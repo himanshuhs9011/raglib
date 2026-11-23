@@ -30,6 +30,7 @@ classifiers = [
 
 [project.scripts]
 raglib = "raglib.cli:main"
+raglib-py = "raglib.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/himanshuhs9011/raglib"
@@ -71,6 +72,9 @@ ocr = ["pytesseract>=0.3.10", "Pillow>=10.0.0"]
 web = ["ddgs>=6.0.0"]
 tavily = ["tavily-python>=0.2.0"]
 serpapi = ["google-search-results>=2.4.0"]
+# observability (raglib.exporters)
+prometheus = ["prometheus-client>=0.17.0"]
+otel = ["opentelemetry-api>=1.20.0", "opentelemetry-sdk>=1.20.0"]
 # bundles
 all-llm = []
 all = [

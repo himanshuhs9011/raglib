@@ -51,7 +51,12 @@ def _matches(doc: Document, relevant: Sequence[str]) -> bool:
 
 
 def retrieval_metrics(sources: Sequence[Document], relevant: Sequence[str], k: int) -> Dict[str, float]:
-    """hit_rate@k, MRR@k, recall@k and nDCG@k against gold document/chunk ids."""
+    """hit_rate@k, MRR@k, precision@k, recall@k and nDCG@k against gold document/chunk ids.
+
+    ``precision@k`` = relevant chunks among the top ``k`` / ``k`` (a run that returns fewer than
+    ``k`` chunks is not rewarded for it). Track it to stop over-fetching: when precision@k is low,
+    most of what is sent to the LLM is noise that costs tokens and latency.
+    """
 
     top = list(sources)[:k]
     hits = [_matches(doc, relevant) for doc in top]
@@ -62,6 +67,7 @@ def retrieval_metrics(sources: Sequence[Document], relevant: Sequence[str], k: i
     return {
         f"hit_rate@{k}": 1.0 if first else 0.0,
         f"mrr@{k}": 1.0 / first if first else 0.0,
+        f"precision@{k}": sum(hits) / k if k > 0 else 0.0,
         f"recall@{k}": covered / len(relevant) if relevant else 0.0,
         f"ndcg@{k}": dcg / ideal if ideal else 0.0,
     }

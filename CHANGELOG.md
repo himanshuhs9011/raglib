@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+**Security: filters were not applied on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search, but these paths ignored it and could return documents outside the filter:
+- GraphRAG local and global search (`rag_type="graph"`), the router's `graph` and `hybrid` routes (`rag_type="routing"`), and the agentic `graph_search` tool.
+- The decision engine's web/hybrid fallback (`BaseRAG._retrieve_by_mode`), and `HybridRAG` when no corpus retriever is set.
+- `web_search_provider="local"`, which searches the corpus.
+- `neighbor_window` expansion, which could add neighbouring chunks that fail the filter.
+
+All of them now apply the filter. GraphRAG uses an entity, relation or community report only when the source chunks behind it pass the filter. A backend that cannot enforce a filter now raises `FilterNotSupportedError` instead of returning everything. As defence in depth, dense hits are re-checked against the filter, and hits a vector store returns outside it are dropped and logged.
+
+**Access control.** `RAG(access_control=True)` adds per-document permissions: tag documents at ingest (`add(..., access=access_tags("confidential", department="finance", allowed_roles=["cfo"]))`) and pass `query(..., user=UserContext(...))`. raglib builds the permission filter, ANDs it with your filters and applies it as a pre-filter in every backend. It denies by default: untagged documents are never returned, and queries without a user see only the lowest level. Re-adding unchanged text with new tags updates its permissions. Conversation memory is kept per user. See README "Access Control".
+
+**Production setup in one command.** `raglib-py --production [PATH] --llm PROVIDER [--docs DIR]` (also `raglib init`) writes a complete `rag_pipeline.py`. Every `RAG(...)` option is on its own line with its production value and a comment: 500-token chunks with 100 overlap, hybrid retrieval of 10 candidates (new `rerank_candidates` option), and a local cross-encoder that keeps the best 3. The command also writes a `.env.example` for your credentials, and the file links to the docs for further customization. The same values are available in code as `RAG(..., preset="production")` / `RAG.production(...)`, and arguments you pass yourself win. New `raglib-py` console command. `raglib presets` lists presets, and `raglib ask/chat/graph` accept `--preset`. The library defaults are unchanged.
+
+**Per-stage latency percentiles.** The pipeline now times `query_rewrite`, `query_embedding`, `dense_search`, `filtering`, `bm25_search`, `fusion`, `rerank`, `prompt_build`, `generate`, `post_process` and a final `total` event. `TraceEvent` has new `parent`, `run_id` and `started_at` fields. `LatencyStats` (pass it as `on_event`) keeps a rolling window per stage and reports count, P50, P95, P99, min and max (linear interpolation). Each sample carries tags: `cache_hit`, `query_tokens`, `num_candidates`, `reranker_used` and `is_cold_start`. `slowest(stage, n)` shows why queries were slow. `benchmark(rag, queries, repeats)` and `benchmarks/latency/bench_latency.py` print the table. Optional `PrometheusExporter` and `OpenTelemetryExporter` (`[prometheus]`, `[otel]` extras), and `on_event` accepts a list of callbacks.
+- Existing stage names are kept, and `usage["latency_ms"]` is still the sum of top-level stages. The new `usage["wall_latency_ms"]` is the wall time of the run.
+- With the built-in `Generator`, the `generate` event now times only the LLM call: prompt building and citation parsing are the separate `prompt_build` and `post_process` events. This is a few milliseconds less than before. `trace_events` also ends with the new `total` event.
+
+**Caching and invalidation.**
+- `llm_cache_ttl` / `embedding_cache_ttl`: entry lifetimes for both caches. Both are now built on `raglib.cache.TTLCache`, an LRU cache that tags each entry with the documents it was built from.
+- Every document has a version (a hash of its content and permissions). Re-ingesting a changed document drops the cached LLM responses, answers and vectors built from it.
+- `rag.invalidate(doc)`, `rag.invalidate_all()` and `rag.on_document_update(source=..., doc_ids=...)` give event-driven invalidation for external update jobs.
+- `answer_cache=True` adds a question-level answer cache (the FAQ tier). An entry is served only while its source documents keep their versions, and a permission change drops it.
+- `prompt_caching=True` marks the system prompt with Anthropic `cache_control` (no-op for other providers). Cache read and write tokens are reported in usage.
+
+**Conditional reranking.** `rerank_skip_threshold` / `rerank_skip_margin` skip the reranker when the top candidate's dense cosine similarity is high enough. The fusion score is not used, because RRF and relative-fusion scores are not comparable across queries.
+
+**Retrieval quality.**
+- `chunking_strategy="embedding"`: semantic chunking with embeddings, breaking where similarity drops (percentile or fixed cut-off, min/max chunk size). It reuses the embedding cache. The LLM-based `"semantic"` strategy is unchanged.
+- `parent_retrieval="heading" | "fixed"`: search small child chunks and send their de-duplicated parent sections to the LLM.
+- `cheap_llm` + `tier_router`: route each query to the FAQ tier (answer cache), a cheap model, or the full pipeline. The router is pluggable (`HeuristicTierRouter` by default), and the chosen tier is in `result.metadata["tier"]` and on the trace.
+
+**Cost tracking.**
+- `prices=PriceTable(...)` (USD per 1M tokens for LLM input/output and embeddings, per 1K searches for Cohere rerank and web search APIs) adds `cost_usd`, `cost_by_stage`, `cost_by_model` and `cost_by_category` to `result.usage`.
+- `CostReport` aggregates cost over many queries and projects a monthly bill, with LLM spend kept separate from vector-DB hosting. `rag.ingest_usage()` reports ingestion cost.
+- raglib ships no built-in prices.
+- `result.usage` also has `embedding_tokens` and a per-model `usage_by_model`, and `record_usage()` accepts `model=` and cache token counts.
+
+**Evaluation.** `precision@k` sits next to `recall@k` in `raglib.eval`.
+
+**Behaviour change: personalized queries are no longer cached.** With the default `cache_personalized=False`, queries that pass `user=` or `filters=` skip the LLM cache and the answer cache. Answers are identical, but repeated personalized questions are no longer served from cache. Pass `cache_personalized=True` for the old behaviour. The README's "Trade-offs" table lists what every new option costs.
+
+**Other changes (not breaking):**
+- New optional parameters: `RAG(access_control=)`, `query/aquery/stream(user=)`, `add(access=, metadata=)`, `reset_memory(user=)`. New `rag.permission_filter(user)`.
+- `GraphRetriever.retrieve`, `LocalSearch.search`, `GlobalSearch.search` and `WebRetriever.retrieve` accept `filters=`. `GlobalSearch` takes an optional `chunk_lookup`, which it needs to serve filtered queries.
+- `BaseVectorStore.supports_metadata_filters` and `BaseSearchProvider.searches_corpus` / `supports_filters` capability flags.
+- `matches_filter(..., array_contains=True)` gives list-valued fields "contains" semantics, like Qdrant and pgvector. The default is unchanged.
+- Chroma `where` translation is recursive, so nested `$and`/`$or` filters with several keys per clause work.
+
 ## 2.2.0 - 2026-11-21
 
 **Benchmark.** raglib's RAG types are now measured on MultiHop-RAG, a public third-party dataset: method, code and every answer are in `benchmarks/multihop_rag/`, and results are on the website's Benchmarks page.

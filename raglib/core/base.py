@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from typing import Generator as GeneratorType
 
 from raglib.components.context_reducer import ContextReducer
@@ -48,9 +48,10 @@ from raglib.components.router_retriever import RouterRetriever
 from raglib.components.web_retriever import WebRetriever
 from raglib.core.intents import is_greeting
 from raglib.core.runtime import RunState, UsageMeter, run_scope, usage_scope
-from raglib.core.tracing import Tracer
+from raglib.core.text import count_tokens
+from raglib.core.tracing import OnEvent, Tracer, active_tracer
 from raglib.llm.base_client import BaseLLMClient
-from raglib.schemas import Document, GenerationResult, TraceEvent
+from raglib.schemas import Document, GenerationResult
 from raglib.vectorstores.base_store import MetadataFilter
 
 logger = logging.getLogger(__name__)
@@ -108,14 +109,25 @@ class BaseRAG:
         graph_retriever: Optional[Any] = None,
         use_memory: bool = False,
         skip_retrieval_for_smalltalk: bool = True,
-        on_event: Optional[Callable[[TraceEvent], None]] = None,
+        on_event: OnEvent = None,
         strict: bool = False,
+        rerank_candidates: Optional[int] = None,
+        price_table: Optional[Any] = None,
     ):
         """Initialize optional pipeline components via dependency injection.
 
         ``strict=True`` re-raises failures of optional steps instead of degrading
         (degradations are otherwise listed in ``result.metadata["degraded"]``).
+        ``rerank_candidates``: how many chunks to retrieve for the reranker to cut down to its
+        ``top_k`` (default ``max(4 * top_k, 20)``); ignored without a reranker.
+        ``price_table`` (``raglib.costs.PriceTable``): adds ``cost_usd`` / ``cost_by_stage`` to usage.
         """
+
+        self.price_table = price_table
+
+        if rerank_candidates is not None and rerank_candidates <= 0:
+            raise ValueError("rerank_candidates must be greater than zero")
+        self.rerank_candidates = rerank_candidates
 
         self.retriever = retriever
         self.web_retriever = web_retriever
@@ -154,11 +166,16 @@ class BaseRAG:
     ) -> GenerationResult:
         """Execute the pipeline for one query and return the answer with sources."""
 
-        with run_scope(self.strict) as state, usage_scope() as meter:
-            ctx = self._start(query, session_id, filters)
-            ctx.usage, ctx.run_state = meter, state
-            result = self.answer(ctx)
-            return self._finish(ctx, result)
+        tracer = Tracer(on_event=self.on_event)
+        with run_scope(self.strict) as state, usage_scope() as meter, active_tracer(tracer):
+            try:
+                ctx = self._start(query, session_id, filters, tracer=tracer)
+                ctx.usage, ctx.run_state = meter, state
+                result = self.answer(ctx)
+                return self._finish(ctx, result)
+            except Exception as exc:
+                tracer.finish(error=f"{type(exc).__name__}: {exc}", pipeline=self.pipeline_name)
+                raise
 
     async def arun(
         self,
@@ -186,22 +203,28 @@ class BaseRAG:
             yield result.answer
             return result
 
-        with run_scope(self.strict) as state, usage_scope() as meter:
-            ctx = self._start(query, session_id, filters)
-            ctx.usage, ctx.run_state = meter, state
-            documents = self._prepare_documents(ctx)
-            with ctx.tracer.stage("generate", streaming=True) as meta, usage_scope() as generation:
+        tracer = Tracer(on_event=self.on_event)
+        with run_scope(self.strict) as state, usage_scope() as meter, active_tracer(tracer):
+            try:
+                ctx = self._start(query, session_id, filters, tracer=tracer)
+                ctx.usage, ctx.run_state = meter, state
+                documents = self._prepare_documents(ctx)
+                # prompt_build is traced by the generator; "generate" times the streamed LLM reply.
                 context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
-                parts: List[str] = []
-                for token in tokens:
-                    parts.append(token)
-                    yield token
-                meta["docs"] = len(context_docs)
-            result = self.generator.finalize(
-                "".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
-            )
-            result = self.post_generate(result)
-            return self._finish(ctx, result)
+                with ctx.tracer.stage("generate", streaming=True) as meta, usage_scope() as generation:
+                    parts: List[str] = []
+                    for token in tokens:
+                        parts.append(token)
+                        yield token
+                    meta["docs"] = len(context_docs)
+                result = self.generator.finalize(
+                    "".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
+                )
+                result = self.post_generate(result)
+                return self._finish(ctx, result)
+            except Exception as exc:
+                tracer.finish(error=f"{type(exc).__name__}: {exc}", pipeline=self.pipeline_name)
+                raise
 
     def answer(self, ctx: PipelineContext) -> GenerationResult:
         """Default pipeline: retrieve -> process -> generate."""
@@ -219,6 +242,7 @@ class BaseRAG:
         with ctx.tracer.stage("retrieve") as meta:
             documents = self.retrieve(ctx)
             meta["docs"] = len(documents)
+        ctx.tracer.tag("num_candidates", len(documents))
         documents = self.post_retrieve(ctx.search_query, documents)
         with ctx.tracer.stage("process_documents") as meta:
             documents = self.process_documents(ctx, documents)
@@ -282,6 +306,14 @@ class BaseRAG:
             if self.llm_client is None:
                 raise ValueError("Either generator or llm_client must be provided")
             self.generator = Generator(llm_client=self.llm_client)
+        if type(self.generator).generate is Generator.generate:
+            # The built-in generator traces prompt_build, generate (the LLM call) and post_process.
+            return self.generator.generate(
+                query=ctx.query,
+                documents=documents,
+                memory_context=ctx.history,
+                reasoning_trace=ctx.trace,
+            )
         with ctx.tracer.stage("generate") as meta:
             result = self.generator.generate(
                 query=ctx.query,
@@ -316,6 +348,8 @@ class BaseRAG:
         """How many candidates to retrieve: more when a real reranker will cut them down."""
 
         if self.reranker is not None and self.reranker.backend != "none":
+            if self.rerank_candidates is not None:
+                return max(self.rerank_candidates, self.reranker.top_k)
             return max(self.reranker.top_k * 4, 20)
         return None
 
@@ -329,14 +363,16 @@ class BaseRAG:
     def _retrieve_by_mode(self, ctx: PipelineContext, query: str, mode: str) -> List[Document]:
         """Dispatch retrieval to the selected mode with graceful fallbacks."""
 
+        from raglib.components.web_retriever import web_retrieve
+
         if mode == RETRIEVAL_WEB and self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return web_retrieve(self.web_retriever, query, ctx.filters)
         if mode == RETRIEVAL_HYBRID and self.hybrid_retriever is not None:
-            return self.hybrid_retriever.retrieve(query)
+            return self.hybrid_retriever.retrieve(query, filters=ctx.filters)
         if self.retriever is not None:
             return self.retrieve_corpus(ctx, query)
         if self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return web_retrieve(self.web_retriever, query, ctx.filters)
         logger.warning("No retriever available for mode=%s", mode)
         return []
 
@@ -347,13 +383,23 @@ class BaseRAG:
             return self.conversation_store.get(session_id)
         return self.memory_module
 
-    def _start(self, query: str, session_id: Optional[str], filters: Optional[MetadataFilter]) -> PipelineContext:
+    def _start(
+        self,
+        query: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        tracer: Optional[Tracer] = None,
+    ) -> PipelineContext:
         """Validate input, load history, and build the retrieval query."""
 
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         query = query.strip()
-        tracer = Tracer(on_event=self.on_event)
+        tracer = tracer or Tracer(on_event=self.on_event)
+        tracer.tag("pipeline", self.pipeline_name)
+        tracer.tag("query_tokens", count_tokens(query))
+        tracer.tag("reranker_used", False)
+        tracer.tag("num_candidates", 0)
         ctx = PipelineContext(query=query, search_query=query, session_id=session_id, filters=filters, tracer=tracer)
 
         if self.use_memory:
@@ -368,7 +414,7 @@ class BaseRAG:
                     ctx.trace.append(f"condensed:{ctx.search_query[:80]}")
 
         if self.query_rewriter is not None:
-            with tracer.stage("rewrite") as meta:
+            with tracer.stage("rewrite") as meta, tracer.stage("query_rewrite"):
                 rewritten = self.query_rewriter.rewrite(ctx.search_query)
                 meta["rewritten_query"] = rewritten
             if rewritten and rewritten != ctx.search_query:
@@ -387,11 +433,23 @@ class BaseRAG:
             memory = self.memory_for(ctx.session_id)
             if memory is not None:
                 memory.add(query=ctx.query, answer=result.answer, documents=result.sources)
+        costs: Dict[str, Any] = {}
+        if ctx.usage is not None and self.price_table is not None:
+            from raglib.costs import price_run
+
+            costs = price_run(self.price_table, ctx.usage.breakdown(), ctx.tracer.events)
+        total = ctx.tracer.finish(error=None, pipeline=self.pipeline_name, docs=len(result.sources), **costs)
         result.trace_events = list(ctx.tracer.events)
-        result.usage = {**result.usage, "latency_ms": ctx.tracer.total_latency_ms()}
+        result.usage = {
+            **result.usage,
+            "latency_ms": ctx.tracer.total_latency_ms(),
+            "wall_latency_ms": total.latency_ms,
+        }
         if ctx.usage is not None:
             # Totals over every LLM call of the run (grading, routing, rewriting, generation, ...).
             result.usage.update(ctx.usage.as_dict())
+            result.usage["usage_by_model"] = ctx.usage.breakdown()
+        result.usage.update(costs)
         if ctx.run_state is not None and ctx.run_state.degraded:
             ctx.metadata["degraded"] = list(ctx.run_state.degraded)
         # Pipeline diagnostics (crag_verdict, agent_steps, hop_queries, graph_mode, ...) are part of the

@@ -31,7 +31,7 @@ class MockLLMClient(BaseLLMClient):
         from raglib.core.text import count_tokens
 
         answer = self._respond(prompt, system)
-        record_usage(count_tokens(f"{system}\n{prompt}"), count_tokens(answer), estimated=True)
+        record_usage(count_tokens(f"{system}\n{prompt}"), count_tokens(answer), estimated=True, model="mock/mock")
         return answer
 
     def _respond(self, prompt: str, system: str = "") -> str:

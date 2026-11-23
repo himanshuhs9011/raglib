@@ -6,11 +6,13 @@ import logging
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
+from raglib.access import FilterNotSupportedError
 from raglib.core.runtime import report_degraded
 from raglib.providers.base_provider import BaseSearchProvider, ProviderError
 from raglib.providers.duckduckgo_provider import DuckDuckGoProvider
 from raglib.providers.factory import build_search_provider
 from raglib.schemas import Document
+from raglib.vectorstores.base_store import MetadataFilter
 
 logger = logging.getLogger(__name__)
 
@@ -53,18 +55,24 @@ class WebRetriever:
         else:
             self.fallback_provider = None
 
-    def retrieve(self, query: str) -> List[Document]:
-        """Retrieve top-k web documents for a query."""
+    def retrieve(self, query: str, filters: Optional[MetadataFilter] = None) -> List[Document]:
+        """Retrieve top-k web documents for a query.
+
+        ``filters`` apply only to providers that search the local corpus (see
+        ``BaseSearchProvider.searches_corpus``); public internet results are not corpus documents.
+        """
 
         if not isinstance(query, str) or not query.strip():
             return []
 
         logger.info("WebRetriever querying provider=%s", self.provider.name)
         try:
-            docs = self.provider.search(query=query, num_results=self.top_k)
+            docs = self._search(self.provider, query, filters)
+        except FilterNotSupportedError:
+            raise
         except Exception as exc:  # noqa: BLE001
             report_degraded(f"web_search:{self.provider.name}", exc, logger)
-            fallback_docs = self._retrieve_from_fallback(query=query, cause=exc)
+            fallback_docs = self._retrieve_from_fallback(query=query, cause=exc, filters=filters)
             if fallback_docs:
                 return fallback_docs
             if self.fail_silently:
@@ -73,7 +81,24 @@ class WebRetriever:
 
         return self._normalize_documents(docs=docs, provider_name=self.provider.name)
 
-    def _retrieve_from_fallback(self, query: str, cause: Exception) -> List[Document]:
+    def _search(self, provider: BaseSearchProvider, query: str, filters: Optional[MetadataFilter]) -> List[Document]:
+        """Call one provider, enforcing ``filters`` on providers that search the local corpus."""
+
+        if filters and getattr(provider, "searches_corpus", False):
+            if not getattr(provider, "supports_filters", False):
+                raise FilterNotSupportedError(
+                    f"Search provider '{provider.name}' searches the corpus but cannot apply metadata filters"
+                )
+            return provider.search(query=query, num_results=self.top_k, filters=filters)  # type: ignore[call-arg]
+        if not getattr(provider, "searches_corpus", False):
+            from raglib.core.runtime import record_search_usage
+
+            record_search_usage(f"web:{provider.name}", 1)  # billable API call (priced per 1K searches)
+        return provider.search(query=query, num_results=self.top_k)
+
+    def _retrieve_from_fallback(
+        self, query: str, cause: Exception, filters: Optional[MetadataFilter] = None
+    ) -> List[Document]:
         """Retrieve from fallback provider after primary provider failure."""
 
         if self.fallback_provider is None:
@@ -87,7 +112,9 @@ class WebRetriever:
         )
 
         try:
-            docs = self.fallback_provider.search(query=query, num_results=self.top_k)
+            docs = self._search(self.fallback_provider, query, filters)
+        except FilterNotSupportedError:
+            raise
         except Exception as fallback_exc:  # noqa: BLE001
             report_degraded(f"web_search:{self.fallback_provider.name}", fallback_exc, logger)
             if self.fail_silently:
@@ -155,3 +182,11 @@ class WebRetriever:
         if not line:
             return "Web result"
         return line[:120]
+
+
+def web_retrieve(retriever: Any, query: str, filters: Optional[MetadataFilter] = None) -> List[Document]:
+    """Call ``retriever.retrieve`` passing ``filters`` only when set (custom retrievers may not take it)."""
+
+    if filters:
+        return retriever.retrieve(query, filters=filters)
+    return retriever.retrieve(query)

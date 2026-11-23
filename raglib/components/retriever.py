@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import replace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
+from raglib.access import FilterNotSupportedError
 from raglib.components.bm25 import BM25Index
 from raglib.core.concurrency import ReadWriteLock
 from raglib.core.fusion import DEFAULT_RRF_K, reciprocal_rank_fusion
+from raglib.core.tracing import trace_stage
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.schemas import Document
 from raglib.vectorstores.base_store import (
@@ -78,6 +80,9 @@ class Retriever:
         self.hybrid_alpha = hybrid_alpha
         self.mmr_lambda = mmr_lambda
         self.neighbor_window = max(0, neighbor_window)
+        # Small-to-big: when set (RAG(parent_retrieval=...)), hits are replaced by their parent
+        # section (``metadata["section_id"]``), de-duplicated, before they leave the retriever.
+        self.parent_lookup: Optional[Callable[[str], Optional[Document]]] = None
 
         self._embedding = embedding
         self._vector_store: Optional[BaseVectorStore] = None
@@ -217,26 +222,57 @@ class Retriever:
             raise ValueError(f"Unknown retrieval mode '{mode}'")
         if active_mode != "sparse" and self._vector_store is None:
             active_mode = "sparse"
+        if filters and active_mode != "sparse" and not getattr(self._vector_store, "supports_metadata_filters", True):
+            raise FilterNotSupportedError(
+                f"{type(self._vector_store).__name__} cannot apply metadata filters; refusing to return "
+                "unfiltered results (use a store that supports filters, or mode='sparse')"
+            )
         candidate_k = max(self.fetch_k or 0, k * 4 if (self.mmr_lambda is not None or active_mode == "hybrid") else k)
+        if self.parent_lookup is not None:
+            candidate_k = max(candidate_k, k * 4)  # several children may share one section
 
-        query_vector = self._embedding.embed_query(query) if active_mode in {"dense", "hybrid"} else None
+        query_vector = None
+        if active_mode in {"dense", "hybrid"}:
+            with trace_stage("query_embedding"):
+                query_vector = self._embedding.embed_query(query)
         with self._lock.read():
-            dense = self._dense_search(query_vector, candidate_k, filters) if query_vector is not None else []
-            sparse = self._sparse_search(query, candidate_k, filters) if active_mode in {"sparse", "hybrid"} else []
+            dense: List[Document] = []
+            sparse: List[Document] = []
+            if query_vector is not None:
+                with trace_stage("dense_search", candidates=candidate_k, filtered=bool(filters)) as meta:
+                    dense = self._dense_search(query_vector, candidate_k, filters)
+                    meta["hits"] = len(dense)
+            if active_mode in {"sparse", "hybrid"}:
+                # BM25 applies filters while scoring, so their cost is part of this stage.
+                with trace_stage("bm25_search", candidates=candidate_k, filtered=bool(filters)) as meta:
+                    sparse = self._sparse_search(query, candidate_k, filters)
+                    meta["hits"] = len(sparse)
 
-            if active_mode == "hybrid" and self.fusion == "rrf":
-                candidates = reciprocal_rank_fusion([dense, sparse], k=self.rrf_k, list_names=["dense", "bm25"])
-            elif active_mode == "hybrid":
-                candidates = self._relative_score_fusion(query, query_vector, dense, sparse)
+            if active_mode == "hybrid" or (self.mmr_lambda is not None and len(dense or sparse) > k):
+                with trace_stage("fusion", method=self.fusion if active_mode == "hybrid" else "none") as meta:
+                    if active_mode == "hybrid" and self.fusion == "rrf":
+                        candidates = reciprocal_rank_fusion([dense, sparse], k=self.rrf_k, list_names=["dense", "bm25"])
+                    elif active_mode == "hybrid":
+                        candidates = self._relative_score_fusion(query, query_vector, dense, sparse)
+                    else:
+                        candidates = dense or sparse
+                    if self.mmr_lambda is not None and len(candidates) > k:
+                        candidates = self._mmr(query, candidates, k)
+                        meta["mmr"] = True
+                    meta["candidates"] = len(candidates)
             else:
                 candidates = dense or sparse
 
-            if self.mmr_lambda is not None and len(candidates) > k:
-                candidates = self._mmr(query, candidates, k)
-
-            results = candidates[:k]
+            if self.parent_lookup is not None:
+                with trace_stage("parent_expand", candidates=len(candidates)) as meta:
+                    results = self._expand_parents(candidates, k)
+                    meta["sections"] = sum(1 for doc in results if doc.metadata.get("parent_expanded"))
+            else:
+                results = candidates[:k]
             if self.neighbor_window > 0:
-                results = [self._expand_neighbors(doc) for doc in results]
+                results = [
+                    doc if doc.metadata.get("parent_expanded") else self._expand_neighbors(doc, filters) for doc in results
+                ]
         logger.debug("Retriever mode=%s returned %d docs", active_mode, len(results))
         return [
             replace(doc, metadata={**doc.metadata, "retriever": active_mode}, source=doc.source or "vector")
@@ -265,6 +301,26 @@ class Retriever:
                 )
             documents.append(
                 replace(base, score=float(hit.score), metadata={**base.metadata, "dense_score": float(hit.score)})
+            )
+        if not filters:
+            return documents
+        # The store already applied the filter inside its search (pre-filter). Defence in depth:
+        # never trust a backend to have done so (a custom store may ignore it). List-valued
+        # fields use the backends' "contains" semantics.
+        with trace_stage("filtering", pushdown=True, checked=len(documents)) as meta:
+            kept = [
+                doc
+                for doc in documents
+                if matches_filter({**doc.metadata, "source": doc.source, "doc_id": doc.id}, filters, array_contains=True)
+            ]
+            outside_filter = len(documents) - len(kept)
+            meta["dropped"] = outside_filter
+        documents = kept
+        if outside_filter:
+            logger.warning(
+                "%s returned %d hits outside the metadata filter; dropped them",
+                type(self._vector_store).__name__,
+                outside_filter,
             )
         return documents
 
@@ -367,15 +423,48 @@ class Retriever:
             remaining.remove(best_doc)
         return selected
 
-    def _expand_neighbors(self, doc: Document) -> Document:
-        """Small-to-big: widen a hit with its neighbouring chunks from the same parent."""
+    def _expand_parents(self, candidates: List[Document], k: int) -> List[Document]:
+        """Replace child hits by their parent sections, keeping rank order and dropping duplicates."""
+
+        assert self.parent_lookup is not None
+        chosen: Dict[str, Document] = {}
+        order: List[str] = []
+        for doc in candidates:
+            section_id = doc.metadata.get("section_id")
+            section = self.parent_lookup(str(section_id)) if section_id else None
+            key = str(section_id) if section is not None else doc.id
+            if key in chosen:
+                existing = chosen[key]
+                existing.metadata["child_ids"] = [*existing.metadata.get("child_ids", []), doc.id]
+                continue
+            if len(order) >= k:
+                continue
+            if section is None:
+                chosen[key] = doc
+            else:
+                scores = {name: doc.metadata[name] for name in ("dense_score", "bm25_score", "fusion") if name in doc.metadata}
+                chosen[key] = replace(
+                    section,
+                    score=doc.score,
+                    metadata={**section.metadata, **scores, "child_ids": [doc.id], "parent_expanded": True, "section_id": key},
+                )
+            order.append(key)
+        return [chosen[key] for key in order]
+
+    def _expand_neighbors(self, doc: Document, filters: Optional[MetadataFilter] = None) -> Document:
+        """Small-to-big: widen a hit with its neighbouring chunks (only those passing ``filters``)."""
+
+        def visible(neighbor: Optional[Document]) -> bool:
+            return neighbor is not None and (
+                not filters or matches_filter({**neighbor.metadata, "source": neighbor.source}, filters)
+            )
 
         parts = [doc.content]
         current = doc
         for _ in range(self.neighbor_window):
             prev_id = current.metadata.get("prev_id")
             prev_doc = self._doc_index.get(prev_id) if prev_id else None
-            if prev_doc is None:
+            if not visible(prev_doc):
                 break
             parts.insert(0, prev_doc.content)
             current = prev_doc
@@ -383,7 +472,7 @@ class Retriever:
         for _ in range(self.neighbor_window):
             next_id = current.metadata.get("next_id")
             next_doc = self._doc_index.get(next_id) if next_id else None
-            if next_doc is None:
+            if not visible(next_doc):
                 break
             parts.append(next_doc.content)
             current = next_doc

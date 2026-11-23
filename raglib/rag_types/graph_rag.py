@@ -8,6 +8,7 @@ from typing import Any, List
 
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import reciprocal_rank_fusion
+from raglib.graphrag.search import require_filter_support
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class GraphRAG(BaseRAG):
     def retrieve(self, ctx: PipelineContext) -> List[Document]:
         """Run local or global graph search."""
 
+        require_filter_support(self.graph_retriever, ctx.filters)
         mode = self.graph_retriever.resolve_mode(ctx.search_query, self.search_mode)
         ctx.trace.append(f"graph_mode:{mode}")
         ctx.metadata["graph_mode"] = mode
@@ -46,15 +48,16 @@ class GraphRAG(BaseRAG):
             # graph_build="background": hybrid search answers fully; the graph adds what is built so far
             ctx.trace.append("graph_building:partial_graph")
             ctx.metadata["graph_building"] = True
-        
-        
-        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode)
+
+        # Only pass filters when set, so custom graph retrievers without the keyword keep working.
+        filter_kwargs = {"filters": ctx.filters} if ctx.filters else {}
+        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode, **filter_kwargs)
         if mode == "global":
             ctx.trace.append(f"global_points:{len(graph_docs)}")
             if graph_docs or self.retriever is None:
                 return graph_docs
             ctx.trace.append("global_empty:fallback_local")
-            graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode="local")
+            graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode="local", **filter_kwargs)
 
         # Entity/relation/community summaries get their own token budget (Generator.max_supplementary_tokens),
         # so they add structure without pushing the evidence chunks out of the context.

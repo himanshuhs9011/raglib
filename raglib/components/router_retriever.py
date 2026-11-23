@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 
 from raglib.components.hybrid_retriever import HybridRetriever
 from raglib.components.retriever import Retriever
-from raglib.components.web_retriever import WebRetriever
+from raglib.components.web_retriever import WebRetriever, web_retrieve
 from raglib.core.intents import (
     is_comparison,
     is_global_question,
@@ -98,11 +98,15 @@ class RouterRetriever:
     def retrieve_route(self, route: str, query: str, **kwargs: Any) -> List[Document]:
         """Retrieve from a specific route."""
 
+        filters = kwargs.get("filters")
         if route == ROUTE_WEB and self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return web_retrieve(self.web_retriever, query, filters)
         if route == ROUTE_HYBRID and self.hybrid_retriever is not None:
-            return self.hybrid_retriever.retrieve(query)
+            return self.hybrid_retriever.retrieve(query, **kwargs)
         if route == ROUTE_GRAPH and self.graph_retriever is not None:
+            from raglib.graphrag.search import require_filter_support
+
+            require_filter_support(self.graph_retriever, filters)
             return self.graph_retriever.retrieve(query, **kwargs)
         return self.vector_retriever.retrieve(query, **kwargs)
 

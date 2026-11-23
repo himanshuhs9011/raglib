@@ -20,7 +20,17 @@ class ProviderNotConfiguredError(ProviderError, ValueError):
 
 
 class BaseSearchProvider(ABC):
-    """Abstract contract for web search providers."""
+    """Abstract contract for web search providers.
+
+    Metadata filters (and access control) restrict *your corpus*; results from the public
+    internet are not corpus documents, so external providers ignore them. A provider that
+    searches the local corpus must set ``searches_corpus = True`` and, to serve filtered
+    queries, ``supports_filters = True`` with ``search(query, num_results, filters=None)``;
+    otherwise a filtered query raises ``FilterNotSupportedError``.
+    """
+
+    searches_corpus: bool = False
+    supports_filters: bool = False
 
     @abstractmethod
     def search(self, query: str, num_results: int = 5) -> List[Document]:
@@ -41,6 +51,12 @@ class ProviderChain(BaseSearchProvider):
         """Initialize a fallback chain of providers."""
 
         self.providers = providers
+
+    @property
+    def searches_corpus(self) -> bool:  # type: ignore[override]
+        """True when any provider in the chain searches the local corpus."""
+
+        return any(getattr(provider, "searches_corpus", False) for provider in self.providers)
 
     @property
     def name(self) -> str:

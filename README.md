@@ -12,9 +12,10 @@
 
 1. [Installation](#1-installation)
 2. [60-Second Quickstart (Offline & Cloud)](#2-60-second-quickstart-offline--cloud)
+   - [Presets & Production Setup](#presets--production-setup)
 3. [The `RAG` Facade API (Complete Reference)](#3-the-rag-facade-api-complete-reference)
 4. [Supported Input Sources & Loaders](#4-supported-input-sources--loaders)
-5. [Chunking Strategies (`fixed`, `recursive`, `llm`)](#5-chunking-strategies-fixed-recursive-llm)
+5. [Chunking Strategies (`fixed`, `recursive`, `embedding`, `llm`)](#5-chunking-strategies-fixed-recursive-embedding-llm)
 6. [Retrieval: Hybrid Search, Filters, MMR & Reranking](#6-retrieval-hybrid-search-filters-mmr--reranking)
 7. [All 14 Built-In RAG Architectures](#7-all-14-built-in-rag-architectures)
 8. [GraphRAG (Knowledge-Graph RAG)](#8-graphrag-knowledge-graph-rag)
@@ -169,6 +170,54 @@ print(rag.query("Explain our deployment workflow").answer)
 
 ---
 
+## Presets & Production Setup
+
+One command writes a complete production pipeline into a new `.py` file. Every option of `RAG(...)` is on its own line with its production value and a comment, so you can see everything you can change:
+
+```bash
+raglib-py --production --llm openrouter           # writes rag_pipeline.py + .env.example
+raglib-py --production app/my_rag.py --llm anthropic --docs data/
+cp .env.example .env                              # add your keys
+python rag_pipeline.py "What is our refund policy?" --latency
+```
+
+The generated file reads your credentials from `.env`. It looks like this (an excerpt: the real file lists every option):
+
+```python
+rag = RAG(
+    # ---------------------------------------------------------------- chat model + credentials
+    llm="openrouter",                       # "provider" or "provider/model" (chat_llm= is the same option)
+    chat_api_key=os.getenv("OPENROUTER_API_KEY"),
+    llm_fallbacks=None,                     # e.g. ["groq/llama-3.3-70b-versatile"], tried when the main model fails
+    # ---------------------------------------------------------------- chunking
+    chunk_size=500,                         # tokens per chunk
+    chunk_overlap=100,                      # tokens shared by neighbouring chunks (20% keeps ideas whole)
+    # ---------------------------------------------------------------- retrieval
+    retrieval_mode="hybrid",                # "hybrid" (BM25 + vectors) | "dense" | "sparse" (BM25 only)
+    top_k=3,                                # chunks sent to the LLM
+    # ---------------------------------------------------------------- reranking
+    reranker="cross_encoder",               # "cross_encoder" (local, pip install raglib-py[rerank]) | "cohere" | "llm" | "none"
+    rerank_candidates=10,                   # chunks retrieved for the reranker, which keeps the best top_k
+    # ... vector store, memory, GraphRAG, web search, access control, tracing ...
+)
+```
+
+| Production value | Setting | Library default |
+| :--- | :--- | :--- |
+| 500 / 100 (20%) | `chunk_size` / `chunk_overlap` | 400 / 50 |
+| hybrid (BM25 + vectors) | `retrieval_mode` | hybrid when an embedding is set |
+| 10 chunks retrieved for the reranker | `rerank_candidates` | `max(4 * top_k, 20)` |
+| `"cross_encoder"` (local `BAAI/bge-reranker-base`) | `reranker` | `"none"` |
+| 3 chunks sent to the LLM | `top_k` | 5 |
+
+`raglib init [PATH] --preset production` does the same as `raglib-py --production`. Both refuse to overwrite a file unless you pass `--force`. The cross-encoder needs `pip install raglib-py[rerank]`. Without it raglib logs a warning and keeps the hybrid order.
+
+For quick scripts, the same values are also available in code (anything you pass yourself wins): `RAG("docs/", llm="openai", preset="production")`, or `raglib ask docs/ "Question?" --preset production`.
+
+To customize more, every option is explained in [section 3](#3-the-rag-facade-api-complete-reference) and the sections after it.
+
+---
+
 ## 3. The `RAG` Facade API (Complete Reference)
 
 ### Constructor Signature
@@ -227,6 +276,23 @@ rag = RAG(
     # ---- agents & observability
     tools=None,                         # [Tool(...), SQLTool(...)] for rag_type="agentic"
     strict=False,                       # True: raise when an optional step fails instead of degrading
+    access_control=None,                # True / AccessControl(...): per-document permissions (see "Access Control")
+    preset=None,                        # "production": tested settings for every argument you leave out
+    rerank_candidates=None,             # chunks retrieved for the reranker to cut to top_k
+    rerank_skip_threshold=None,         # skip the reranker when the top hit's cosine similarity is >= this
+    rerank_skip_margin=None,            # ...and at least this far above the runner-up
+    llm_cache_ttl=None,                 # seconds before a cached LLM response expires
+    embedding_cache_ttl=None,           # seconds before a cached embedding expires
+    cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
+    answer_cache=None,                  # True: question-level answer cache (FAQ tier)
+    prompt_caching=False,               # Anthropic cache_control on the system prompt
+    cheap_llm=None,                     # cheaper model for easy questions (tier routing)
+    tier_router=None,                   # callable(question, context) -> "faq" | "cheap" | "full"
+    parent_retrieval=None,              # "heading" | "fixed": search small chunks, answer from parent sections
+    parent_chunk_size=2000,             # max tokens of a parent section
+    semantic_breakpoint="percentile",   # chunking_strategy="embedding": "percentile" | "fixed"
+    semantic_threshold=None,            # percentile (95) or cosine similarity (0.75) where a chunk ends
+    prices=None,                        # PriceTable: USD cost per stage in result.usage
     on_event=None,                      # callback(TraceEvent) for every pipeline stage
     output_dir=None,                    # write each query result as JSON
     **rag_type_kwargs,                  # forwarded to the orchestrator (e.g. max_hops=3, search_mode="global")
@@ -237,10 +303,10 @@ rag = RAG(
 
 | Method | Description |
 | :--- | :--- |
-| `rag.query(question, session_id=None, filters=None)` | Run the pipeline. Returns `GenerationResult(answer, sources, citations, reasoning_trace, trace_events, usage)`. |
+| `rag.query(question, session_id=None, filters=None, user=None)` | Run the pipeline. Returns `GenerationResult(answer, sources, citations, reasoning_trace, trace_events, usage)`. |
 | `rag.stream(question, ...)` | Generator of answer tokens; its return value is the final `GenerationResult`. |
 | `await rag.aquery(question, ...)` | Async query. |
-| `rag.add(source) -> int` | Idempotent upsert: unchanged documents are skipped, changed ones replace their old chunks. Returns new chunks indexed. |
+| `rag.add(source, access=None, metadata=None) -> int` | Idempotent upsert: unchanged documents are skipped, changed ones replace their old chunks. Returns new chunks indexed. |
 | `rag.update(source)` / `rag.delete(source)` | Re-ingest changed sources / remove every chunk (and graph entity) from a source. |
 | `rag.save(dir)` / `rag.load(dir, allow_model_change=False)` | Persist and restore the chunk index, in-memory vectors and knowledge graph without re-embedding. Files are written atomically; `load` refuses an index built with a different embedding model (pass `allow_model_change=True` to re-embed). |
 | `rag.reset_memory(session_id=None)` | Clear one conversation (or all). |
@@ -276,13 +342,16 @@ rag = RAG(
 
 ---
 
-## 5. Chunking Strategies (`fixed`, `recursive`, `llm`)
+## 5. Chunking Strategies (`fixed`, `recursive`, `embedding`, `llm`)
 
 | Strategy | Aliases | How It Works | Best For |
 | :--- | :--- | :--- | :--- |
 | **`"fixed"`** *(default)* | `"fixed_size"`, `"sliding"`, `"sentence"` | Packs complete sentences up to `chunk_size` with sentence-aware `chunk_overlap`. | Clean prose, fast ingestion. |
 | **`"recursive"`** | `"recursive_character"` | Splits along structural separators (`"\n\n"`, `"\n"`, `". "`, ... `""`) to keep paragraphs together, then applies overlap. | Markdown, structured reports. |
+| **`"embedding"`** | `"semantic_embedding"` | At every gap between sentences, embeds the two sentences before and after it and starts a new chunk where their similarity drops (`semantic_breakpoint="percentile"` cuts above the 95th percentile of distances, `"fixed"` below a cosine similarity). Chunks stay between `chunk_size // 4` and `chunk_size` tokens. | Legal, medical and financial documents. **Trade-off:** ~2x the corpus in embedding tokens and slower ingestion, for chunks that end at topic changes. |
 | **`"llm"`** | `"semantic"`, `"llm_semantic"` | The LLM groups numbered sentences at topic shifts (`CHUNK: start-end`); falls back to `"recursive"` without an LLM. | High-value documents with shifting topics. |
+
+**Small-to-big (parent sections).** `RAG(parent_retrieval="heading", chunk_size=200, parent_chunk_size=2000)` embeds and searches small child chunks for precise matches. The LLM then gets each child's whole parent section, split at Markdown or numbered headings (`"fixed"` uses fixed windows instead). Duplicate sections are removed, and `metadata["child_ids"]` lists the children that matched. **Trade-off:** answers see whole sections, but each source is bigger, so prompts grow and fewer sources fit in `max_context_tokens`. `neighbor_window` remains a separate, lighter option.
 
 `chunk_size` is a hard limit for `fixed` and `recursive`: a line or sentence longer than it is split further, so log files, one-record-per-line data and text without punctuation never end up as one giant chunk. Line breaks inside a chunk are kept. For Chinese, Japanese, Thai, Lao, Khmer and Myanmar each character counts as one unit, and `。！？` end sentences.
 
@@ -708,6 +777,98 @@ print(result.metadata.get("degraded"))  # optional steps that failed and fell ba
 rag.chat()                     # interactive terminal session with memory
 ```
 
+### Per-stage latency (P50 / P95 / P99)
+
+Every query is timed stage by stage: `query_rewrite`, `query_embedding`, `dense_search`, `filtering`, `bm25_search`, `fusion`, `rerank`, `prompt_build`, `generate` (the LLM call only), `post_process`, and `total` (wall time). Each event carries `parent`, so `dense_search` shows up under `retrieve`. `LatencyStats` aggregates those events over many queries:
+
+```python
+from raglib import RAG, LatencyStats
+
+stats = LatencyStats(window=10_000, cold_start_after_s=300)   # rolling window per stage, thread-safe
+rag = RAG("docs/", llm="openai", preset="production", on_event=stats)
+for question in questions:
+    rag.query(question)
+
+stats.print_report()
+# stage              count   p50 ms   p95 ms   p99 ms   min ms   max ms
+# query_embedding      500    41.20    88.10   131.40    30.02   410.77
+# rerank               500   212.55   301.90   356.12   180.33   498.10
+# generate             500   812.40  1610.25  2380.70   402.11  4100.90
+# ...
+stats.report()["generate"]["p95"]        # the same numbers as a dict
+for sample in stats.slowest("generate", 3):   # why were they slow?
+    print(sample.duration_ms, sample.tags)    # cache_hit, query_tokens, num_candidates, reranker_used, is_cold_start
+```
+
+- **Several observers**: `on_event` accepts a list, e.g. `on_event=[stats, PrometheusExporter(), OpenTelemetryExporter()]`.
+- **Prometheus** (`pip install raglib-py[prometheus]`): a `raglib_stage_duration_seconds` histogram labelled `stage` and `status`.
+- **OpenTelemetry** (`pip install raglib-py[otel]`): one `raglib.query` trace per question, with a nested span per stage at its real start and end time.
+- **Benchmark**: `benchmark(rag, queries, repeats=5)` returns a `LatencyStats`. It clears the caches before each query unless `warm_cache=True`. From the shell: `python benchmarks/latency/bench_latency.py --source docs/ --queries questions.txt --llm openai --preset production --slowest generate`. It runs offline with a sample corpus if you leave out `--llm`.
+- One sample is recorded per stage execution, so a multi-query run that embeds 4 queries adds 4 `query_embedding` samples. Filters are applied inside the vector store's search (a pre-filter), so their cost is part of `dense_search` / `bm25_search`. `filtering` times the re-check of dense hits.
+
+### Caching, cache invalidation and model routing
+
+```python
+rag = RAG(
+    "docs/", llm="openai/gpt-4.1",
+    embedding_cache_ttl=24 * 3600,      # repeated questions reuse their query embedding for a day
+    answer_cache=True,                  # FAQ tier: same question -> cached answer, no LLM call
+    cheap_llm="openai/gpt-4.1-nano",    # short factual questions go to the cheap model
+    reranker="cross_encoder",
+    rerank_skip_threshold=0.85,         # confident top hit -> skip the reranker (calibrate per embedding model)
+)
+result = rag.query("When do offices close?")
+result.metadata["tier"]               # "faq" | "cheap" | "full" (also tagged on the trace for LatencyStats)
+
+# Event-driven invalidation: call this from the job that updates the corpus
+rag.on_document_update(source="docs/")          # re-ingest; answers built from changed documents are dropped
+rag.on_document_update(doc_ids=["policy.md"])   # a document changed elsewhere
+rag.invalidate("policy.md"); rag.invalidate_all()
+```
+
+- Every document has a version (a hash of its content and permissions). A cached answer is served only while the versions of all its sources are unchanged. Re-ingesting a changed document also drops the LLM responses and vectors built from it.
+- **Public tier only:** a query with `user=` or `filters=` never reads or writes the LLM cache or the answer cache, unless you pass `cache_personalized=True`.
+- `prompt_caching=True` sends Anthropic `cache_control` on the system prompt. It does nothing for other providers, which cache automatically or not at all.
+- `tier_router` takes any `callable(question, context) -> "faq" | "cheap" | "full"`. `context` has `answer_cached`, `cheap_available` and `personalized`. The default `HeuristicTierRouter` makes no LLM call.
+
+### Cost in USD
+
+```python
+from raglib import CostReport, PriceTable
+
+prices = PriceTable(
+    llm={"openai/gpt-4.1": (2.00, 8.00), "openai/gpt-4.1-nano": (0.10, 0.40)},  # USD per 1M input / output
+    embedding={"text-embedding-3-small": 0.02},                                # USD per 1M tokens
+    search={"cohere": 2.00, "web:tavily": 8.00},                               # USD per 1K searches
+    vector_db_monthly=58.0,
+)
+costs = CostReport(prices)
+rag = RAG("docs/", llm="openai/gpt-4.1", prices=prices, on_event=costs)
+rag.query("...").usage["cost_by_stage"]      # {"generate": 0.0041, "query_embedding": 2e-07, "rerank": ...}
+costs.print_report(queries_per_day=10_000)  # totals, per stage and model, monthly projection (LLM vs vector DB)
+rag.ingest_usage()                          # tokens and USD spent on ingestion (embeddings, graph extraction)
+```
+
+raglib ships no built-in prices, because prices change and a silently wrong default is worse than an explicit `cost_unpriced` list. Prompt-cache tokens are priced at 0.1x (read) and 1.25x (write) of the input price unless you set them per model. Embedding tokens are estimated locally.
+
+### Trade-offs
+
+Every speed or cost option buys something with something else:
+
+| Option | You gain | You pay | Rule |
+| :--- | :--- | :--- | :--- |
+| `rerank_skip_threshold` | the rerank stage on confident queries (30-40% of rerank cost in the source talk's example) | a confident-looking wrong top hit is no longer corrected; cosine scales differ per embedding model | calibrate on a golden eval set and compare accuracy with and without it |
+| `rerank_candidates` 10 -> 20+ | better recall for the reranker | more rerank latency (the "silent killer" stage) | measure the `rerank` P95 with `LatencyStats` |
+| `top_k=3` instead of 5 | ~40% fewer context tokens | the answer may lose supporting evidence | check `precision@k` / `recall@k` with `raglib.eval` |
+| `answer_cache` (FAQ tier) | no retrieval and no LLM call on repeats | everyone gets the same answer; wording variants miss | public tier only; invalidate on document updates |
+| `cache_personalized=True` | cache hits for logged-in users | a cache keyed on the question is wrong when the answer depends on who asked | leave it off unless answers don't depend on the user |
+| `llm_cache_ttl` / `embedding_cache_ttl` | bounded memory, refreshed answers | repeated work is paid again after the TTL | use TTLs as a backstop; invalidate on events |
+| `cheap_llm` + routing | most queries on the cheap path | two model integrations; misrouted hard questions get weaker answers | the router must be fast and accurate: measure per tier |
+| `prompt_caching` | ~90% cheaper cached system-prompt tokens | 1.25x write cost; no effect below the model's minimum prompt length (512-4096 tokens) | only with a long, stable system prompt |
+| `chunking_strategy="embedding"` | chunks end at topic changes | ~2x embedding tokens, slower ingestion | high-value documents only |
+| `parent_retrieval` | answers see whole sections | larger prompts, fewer sources per prompt | small children (~200 tokens), parents <= 2000 |
+| `chunk_overlap` 20% -> 50% | fewer facts split across chunks | more chunks to embed and store | 20% by default, 50% for dense technical text |
+
 ---
 
 ## 13. Evaluation
@@ -723,7 +884,7 @@ dataset = [
 ]
 judge = build_chat_client("openai", model_name="gpt-4.1")   # use a strong judge model
 report = evaluate(rag, dataset, judge_llm=judge, k=5)
-print(report)   # hit_rate@5, mrr@5, recall@5, ndcg@5, faithfulness, answer_relevance, context_precision, correctness, latency_ms
+print(report)   # hit_rate@5, mrr@5, precision@5, recall@5, ndcg@5, faithfulness, answer_relevance, context_precision, correctness, latency_ms
 ```
 
 `relevant_ids` can be chunk ids, parent document ids or file paths. Run it in CI to catch retrieval regressions when you change chunking, models or fusion settings.
@@ -818,10 +979,37 @@ raglib graph papers/ --out graph.html
 | `SQLTool` | Runs on a private in-memory copy of the tables; only read statements are authorized, one statement per call, with a timeout and a row cap. | Load only tables the agent may read. |
 | User-supplied file paths | `allowed_dirs=[...]` sandboxes file and folder sources (resolves `..` and symlinks). | Always set it when paths come from users. |
 | Prompt injection | Retrieved text is wrapped in `<source>` blocks with an instruction to treat it as data. | Treat answers as untrusted output; don't give agent tools destructive permissions. |
-| Multi-user | `session_id` isolates chat history. Documents are shared within one `RAG` instance. | Use one `RAG` per tenant, or `filters={"tenant": ...}` on every query. |
+| Multi-user | `session_id` isolates chat history. With `access_control=True`, documents are filtered per user inside every search (vector, BM25, hybrid, graph, multi-query, web+corpus) and history is kept per user. | Tag documents at ingest and pass `user=` on every query (see "Access Control"). |
 | Data at rest | `output_dir`, `save()`, Chroma and graph files contain document text and Q&A. | Store them on encrypted disks; delete with `rag.delete(source)` (removes chunks, vectors and graph entities). |
 
 If a key was ever committed to git, rotating it is the only fix: deleting the line does not remove it from history.
+
+## Access Control
+
+Per-document permissions, enforced inside every search (in-memory, Chroma, Qdrant, pgvector, BM25, GraphRAG, multi-query, web+corpus) before anything reaches the LLM. Deny by default: an untagged document is never returned, and a query without a user only sees the lowest level.
+
+```python
+from raglib import RAG, UserContext, access_tags
+
+rag = RAG(llm="openai", access_control=True)   # levels: public < internal < confidential < executive
+
+rag.add("handbook/", access=access_tags("internal"))
+rag.add("board/q4_strategy.pdf", access=access_tags("executive", department="leadership", allowed_roles=["exec"]))
+
+employee = UserContext(user_id="u42", roles=["staff"], departments=["sales"], max_access_level="internal")
+rag.query("What is our Q4 strategy?", user=employee)        # never sees the board memo
+rag.query("Holiday policy?", user={"max_access_level": "internal"})   # a dict works too
+rag.query("Holiday policy?")                                # anonymous: "public" documents only
+```
+
+- **Tags**: `access_level` (one of the ordered levels; the user's `max_access_level` must be at or above it), `department` (the user must be in one of them, if set), `allowed_roles` (the user must hold one of them, if set). Pass them with `add(..., access=...)` or in a `Document`'s metadata.
+- **Your own policy**: `AccessControl(levels=("public", "staff", "restricted"), default_access_level="staff")` changes the levels; `default_access_level` tags untagged documents instead of hiding them.
+- **Your own filters** are ANDed with the permission filter, so they can only narrow it. `rag.permission_filter(user)` shows the filter raglib applies.
+- **Permission changes**: re-adding unchanged text with new tags updates its permissions (no re-embedding with the default embedding cache).
+- **GraphRAG**: an entity or relation is used only when one of its source chunks is visible to the user. Its merged description is shown only when all of them are, and a community report only when every member is.
+- **Conversation memory** is kept per user, so the same `session_id` used by two users never shares history.
+- **Backends that cannot filter raise `FilterNotSupportedError`** instead of returning everything: a `BaseVectorStore` with `supports_metadata_filters = False`, a custom graph retriever without `supports_filters = True`, or a search provider that searches your corpus without filter support. Hits that a vector store returns outside the filter are dropped and logged.
+- Index-time work (entity extraction, community reports) reads every document, as embedding does. Use a model you trust with all of your data for `graph_llm`.
 
 ## Scaling & Concurrency
 

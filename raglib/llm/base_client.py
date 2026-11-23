@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import threading
 from abc import ABC, abstractmethod
-from collections import OrderedDict
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -53,38 +51,72 @@ class BaseLLMClient(ABC):
         return parse_json(raw, default=default)
 
 
+def _record_llm_cache(hit: bool) -> None:
+    """Report an LLM cache lookup to the running pipeline's tracer (no-op outside a run)."""
+
+    from raglib.core.tracing import record_cache_lookup
+
+    record_cache_lookup("llm", hit)
+
+
 class CachedLLMClient(BaseLLMClient):
     """Thread-safe LRU cache in front of any LLM client (keyed on system + prompt).
 
     Useful for deterministic (temperature=0) calls repeated across queries, such as
     query rewriting, relevance grading and GraphRAG extraction of unchanged chunks.
+
+    * ``ttl`` (seconds, default ``None`` = no expiry): entries older than this are refetched.
+    * Entries are tagged with the documents in the prompt (``raglib.cache.cache_dependencies``),
+      so ``invalidate(doc_ids)`` drops the answers built from changed documents.
+    * Inside ``raglib.cache.cache_bypass()`` (personalized queries) nothing is read or stored.
+
+    Keys include the full prompt (and so the retrieved text): a changed document produces a new
+    key, so a stale entry is never *served*; invalidation frees memory and removes old text.
+    Trade-off: a TTL refreshes answers to unchanged prompts (useful with web search results)
+    at the cost of re-paying for them.
     """
 
-    def __init__(self, inner: BaseLLMClient, max_entries: int = 2048):
+    def __init__(self, inner: BaseLLMClient, max_entries: int = 2048, ttl: Optional[float] = None):
         """Wrap ``inner`` with an in-memory LRU cache."""
+
+        from raglib.cache import TTLCache
 
         self.inner = inner
         self.max_entries = max_entries
-        self._cache: "OrderedDict[str, str]" = OrderedDict()
-        self._lock = threading.Lock()
-        self.hits = 0
-        self.misses = 0
+        self._cache = TTLCache(max_entries=max_entries, ttl=ttl)
+
+    @property
+    def ttl(self) -> Optional[float]:
+        """Entry lifetime in seconds (``None`` = no expiry)."""
+
+        return self._cache.ttl
+
+    @property
+    def hits(self) -> int:
+        """Cache hits so far."""
+
+        return self._cache.hits
+
+    @property
+    def misses(self) -> int:
+        """Cache misses so far."""
+
+        return self._cache.misses
 
     def complete(self, prompt: str, system: str = "") -> str:
         """Return a cached completion or call the wrapped client."""
 
+        from raglib.cache import caching_allowed
+
+        if not caching_allowed():
+            return self.inner.complete(prompt=prompt, system=system)
         key = hashlib.sha256(f"{system}\x00{prompt}".encode("utf-8")).hexdigest()
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self.hits += 1
-                return self._cache[key]
-            self.misses += 1
+        hit, cached = self._cache.lookup(key)
+        _record_llm_cache(hit)
+        if hit:
+            return cached
         value = self.inner.complete(prompt=prompt, system=system)
-        with self._lock:
-            self._cache[key] = value
-            if len(self._cache) > self.max_entries:
-                self._cache.popitem(last=False)
+        self._cache.set(key, value)
         return value
 
     def complete_json(self, prompt: str, system: str = "", default: Any = None) -> Any:
@@ -92,27 +124,31 @@ class CachedLLMClient(BaseLLMClient):
 
         import json
 
+        from raglib.cache import caching_allowed
+
+        if not caching_allowed():
+            value = self.inner.complete_json(prompt, system=system, default=_MISSING)
+            return default if value is _MISSING else value
         key = hashlib.sha256(f"json\x00{system}\x00{prompt}".encode("utf-8")).hexdigest()
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self.hits += 1
-                return json.loads(self._cache[key])
-            self.misses += 1
+        hit, cached = self._cache.lookup(key)
+        _record_llm_cache(hit)
+        if hit:
+            return json.loads(cached)
         value = self.inner.complete_json(prompt, system=system, default=_MISSING)
         if value is _MISSING:
             return default
-        with self._lock:
-            self._cache[key] = json.dumps(value)
-            if len(self._cache) > self.max_entries:
-                self._cache.popitem(last=False)
+        self._cache.set(key, json.dumps(value))
         return value
+
+    def invalidate(self, doc_ids: Iterable[str]) -> int:
+        """Drop cached responses whose prompt contained one of ``doc_ids``; returns the count."""
+
+        return self._cache.invalidate(doc_ids)
 
     def clear(self) -> None:
         """Drop every cached response (called when documents are deleted)."""
 
-        with self._lock:
-            self._cache.clear()
+        self._cache.clear()
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Delegate chat calls without caching (transcripts rarely repeat)."""

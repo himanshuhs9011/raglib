@@ -1,19 +1,22 @@
-"""Chunk splitting utilities with fixed, recursive, and LLM strategies."""
+"""Chunk splitting utilities with fixed, recursive, LLM and embedding (semantic) strategies."""
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 from typing import List, Optional, Sequence
 
 from raglib.core.text import count_units, has_no_space_script, unit_spans
+from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CHUNKING_STRATEGIES = ("fixed", "recursive", "llm")
+SUPPORTED_CHUNKING_STRATEGIES = ("fixed", "recursive", "llm", "embedding")
+SEMANTIC_BREAKPOINTS = ("percentile", "fixed")
 CHUNKING_STRATEGY_ALIASES = {
     "fixed": "fixed",
     "fixed_size": "fixed",
@@ -24,6 +27,9 @@ CHUNKING_STRATEGY_ALIASES = {
     "llm": "llm",
     "semantic": "llm",
     "llm_semantic": "llm",
+    "embedding": "embedding",
+    "embedding_semantic": "embedding",
+    "semantic_embedding": "embedding",
 }
 
 # Sentence boundaries: whitespace after . ! ? (or the Devanagari danda), any line break,
@@ -63,8 +69,31 @@ class ChunkSplitter:
         strategy: str = "fixed",
         llm_client: Optional[BaseLLMClient] = None,
         separators: Optional[Sequence[str]] = None,
+        embedding: Optional[BaseEmbedding] = None,
+        semantic_breakpoint: str = "percentile",
+        semantic_threshold: Optional[float] = None,
+        semantic_min_tokens: Optional[int] = None,
     ):
-        """Configure chunk size, overlap, strategy, and optional LLM client."""
+        """Configure chunk size, overlap, strategy, and optional LLM client / embedding model.
+
+        ``strategy="embedding"`` (semantic chunking with embeddings): at every gap between two
+        sentences, embed the two sentences before it and the two after it, and start a new chunk
+        where their similarity drops - so chunks end where the topic changes. ``semantic_breakpoint``:
+
+        * ``"percentile"`` (default): break where the distance to the next sentence is above the
+          ``semantic_threshold``-th percentile of all distances in the document (default 95).
+        * ``"fixed"``: break where the cosine similarity is below ``semantic_threshold`` (default 0.75).
+
+        Chunks are kept between ``semantic_min_tokens`` (default ``chunk_size // 4``) and
+        ``chunk_size`` tokens; no overlap is added (boundaries are topic changes). Pass a
+        ``CachedEmbedding`` (RAG does) so re-ingesting unchanged text costs nothing.
+
+        Trade-off (accuracy vs cost): ~15-25% better retrieval on structured documents in published
+        tests, but every sentence is embedded - roughly 2x the corpus in embedding tokens (pairs of
+        sentences around each gap) on top of the chunk embeddings, and slower ingestion. Use it for
+        high-value documents (legal, medical, financial), not millions of blog pages.
+        The ``"llm"`` strategy (alias ``"semantic"``) asks an LLM for the boundaries instead.
+        """
 
         if chunk_size <= 0:
             raise ValueError("chunk_size must be greater than zero")
@@ -81,6 +110,20 @@ class ChunkSplitter:
         self._strategy = self._normalize_strategy(strategy)
         self._llm_client = llm_client
         self._separators = list(separators) if separators is not None else list(DEFAULT_RECURSIVE_SEPARATORS)
+        if semantic_breakpoint not in SEMANTIC_BREAKPOINTS:
+            raise ValueError(f"semantic_breakpoint must be one of {list(SEMANTIC_BREAKPOINTS)}")
+        if semantic_breakpoint == "percentile" and semantic_threshold is not None and not 0 < semantic_threshold < 100:
+            raise ValueError("a percentile semantic_threshold must be between 0 and 100")
+        if semantic_breakpoint == "fixed" and semantic_threshold is not None and not -1 <= semantic_threshold <= 1:
+            raise ValueError("a fixed semantic_threshold is a cosine similarity between -1 and 1")
+        self._embedding = embedding
+        self._semantic_breakpoint = semantic_breakpoint
+        self._semantic_threshold = (
+            semantic_threshold if semantic_threshold is not None else (95.0 if semantic_breakpoint == "percentile" else 0.75)
+        )
+        self._semantic_min_tokens = max(1, semantic_min_tokens if semantic_min_tokens is not None else chunk_size // 4)
+        if self._strategy == "embedding" and self._embedding is None:
+            logger.warning("chunking_strategy='embedding' without an embedding model; falling back to recursive")
 
         if self._strategy == "llm" and self._llm_client is None:
             logger.warning(
@@ -172,6 +215,8 @@ class ChunkSplitter:
             parts = self._split_recursive(text)
         elif self._strategy == "llm":
             parts = self._split_llm(text)
+        elif self._strategy == "embedding":
+            parts = self._split_embedding(text)
         else:
             parts = self._split_fixed(text)
 
@@ -347,6 +392,61 @@ class ChunkSplitter:
             overlapped.append(current)
         return overlapped
 
+    def _split_embedding(self, text: str) -> List[str]:
+        """Semantic chunking: break where neighbouring sentences stop being similar."""
+
+        if self._embedding is None:
+            return self._split_recursive(text)
+        sentences: List[str] = []
+        for sentence in self._split_sentences(text):
+            if self._count_tokens(sentence) > self._chunk_size:
+                sentences.extend(self._hard_split(sentence, overlap=0))
+            elif sentence.strip():
+                sentences.append(sentence.strip())
+        if len(sentences) <= 1:
+            return sentences or [text]
+        # For the gap after sentence i, compare the two sentences before it with the two after it
+        # (single sentences are too short to embed reliably; overlapping windows blur the boundary).
+        # right(i) == left(i + 2), so de-duplicated this is about one embedding per sentence.
+        gaps = range(len(sentences) - 1)
+        lefts = [" ".join(sentences[max(0, i - 1) : i + 1]) for i in gaps]
+        rights = [" ".join(sentences[i + 1 : i + 3]) for i in gaps]
+        unique = list(dict.fromkeys(lefts + rights))
+        try:
+            vectors = dict(zip(unique, self._embedding.embed_documents(unique)))
+        except Exception as exc:  # noqa: BLE001 - chunking must not fail ingestion
+            logger.warning("Embedding chunking failed (%s); falling back to recursive", exc)
+            return self._split_recursive(text)
+        similarities = [_cosine(vectors[left], vectors[right]) for left, right in zip(lefts, rights)]
+        if self._semantic_breakpoint == "percentile":
+            distances = [1.0 - value for value in similarities]
+            cutoff = _percentile(distances, self._semantic_threshold)
+            breaks = {i for i, distance in enumerate(distances) if distance > cutoff}
+        else:
+            breaks = {i for i, value in enumerate(similarities) if value < self._semantic_threshold}
+
+        joiner = "" if has_no_space_script(text) else " "
+        chunks: List[List[str]] = []
+        current: List[str] = []
+        tokens = 0
+        for index, sentence in enumerate(sentences):
+            size = self._count_tokens(sentence)
+            if current and tokens + size > self._chunk_size:
+                chunks.append(current)
+                current, tokens = [], 0
+            current.append(sentence)
+            tokens += size
+            if index in breaks and tokens >= self._semantic_min_tokens:
+                chunks.append(current)
+                current, tokens = [], 0
+        if current:
+            # A short tail joins the previous chunk when it fits, instead of becoming a tiny chunk.
+            if chunks and tokens < self._semantic_min_tokens and self._count_tokens(joiner.join(chunks[-1] + current)) <= self._chunk_size:
+                chunks[-1].extend(current)
+            else:
+                chunks.append(current)
+        return [joiner.join(chunk).strip() for chunk in chunks if chunk]
+
     def _split_llm(self, text: str) -> List[str]:
         """Use an LLM to propose semantic chunk boundaries with recursive fallback."""
 
@@ -502,3 +602,20 @@ class ChunkSplitter:
                 f"Supported values: {sorted(SUPPORTED_CHUNKING_STRATEGIES)}"
             )
         return normalized
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    """Cosine similarity of two vectors (0 for a zero vector)."""
+
+    dot = sum(a * b for a, b in zip(left, right))
+    norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
+    return dot / norm if norm else 0.0
+
+
+def _percentile(values: Sequence[float], q: float) -> float:
+    """Linear-interpolation percentile."""
+
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q / 100.0
+    low, high = math.floor(position), math.ceil(position)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)

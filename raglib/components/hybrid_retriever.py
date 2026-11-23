@@ -6,7 +6,7 @@ import logging
 from typing import Any, List, Optional
 
 from raglib.components.retriever import Retriever
-from raglib.components.web_retriever import WebRetriever
+from raglib.components.web_retriever import WebRetriever, web_retrieve
 from raglib.core.concurrency import parallel_map
 from raglib.core.fusion import interleave
 from raglib.schemas import Document
@@ -56,7 +56,7 @@ class HybridRetriever:
 
         tasks = [
             (lambda: self.vector_retriever.retrieve(query, **kwargs)) if self.vector_weight > 0 else (lambda: []),
-            (lambda: self.web_retriever.retrieve(query)) if self.web_weight > 0 else (lambda: []),
+            (lambda: web_retrieve(self.web_retriever, query, kwargs.get("filters"))) if self.web_weight > 0 else (lambda: []),
         ]
         vector_docs, web_docs = parallel_map(lambda task: task(), tasks, max_workers=2)
         fused = self.allocate(vector_docs, web_docs)

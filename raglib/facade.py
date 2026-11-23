@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
@@ -10,8 +11,10 @@ import threading
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
+from raglib.access import ACCESS_TAG_KEYS, AccessControl, UserContext, merge_filters
+from raglib.cache import AnswerCache, cache_bypass
 from raglib.components.decision import DecisionEngine
 from raglib.components.deduplicator import Deduplicator
 from raglib.components.evaluator import Evaluator
@@ -41,7 +44,10 @@ from raglib.constants import (
     SUPPORTED_VISION_PROVIDERS,
     WEB_REQUIRED_RAG_TYPES,
 )
+from raglib.core.runtime import UsageMeter, usage_scope
 from raglib.core.text import token_set
+from raglib.core.tracing import OnEvent, Tracer, run_tags
+from raglib.costs import PriceTable
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.embedding.embedding_factory import EmbeddingFactory
@@ -66,10 +72,13 @@ from raglib.llm.providers import (
 from raglib.llm.resilience import shared_limiter
 from raglib.loaders.chunk_splitter import ChunkSplitter
 from raglib.loaders.document_loader import DocumentLoader, SourceInput
+from raglib.loaders.sections import PARENT_MODES, build_sections
+from raglib.presets import apply_presets
 from raglib.providers.base_provider import BaseSearchProvider
 from raglib.providers.factory import build_search_provider, normalize_provider_name
-from raglib.schemas import Document, GenerationResult, TraceEvent
-from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord
+from raglib.routing import TIER_CHEAP, TIER_FAQ, TIER_FULL, HeuristicTierRouter, TierRouter, decide
+from raglib.schemas import Document, GenerationResult
+from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord, matches_filter
 from raglib.vectorstores.in_memory_store import InMemoryVectorStore
 from raglib.vision.base_vision import BaseVisionClient
 from raglib.vision.vision_factory import VisionFactory
@@ -140,6 +149,8 @@ class _LocalSearchProvider(BaseSearchProvider):
     """Offline web-style provider over the loaded corpus (for tests and demos only)."""
 
     PROVIDER_NAME = "local_web"
+    searches_corpus = True  # its "web" results are corpus chunks, so filters / access control apply
+    supports_filters = True
 
     def __init__(self, documents_fn: Callable[[], List[Document]]):
         """Initialize with a callable returning the current corpus."""
@@ -152,14 +163,18 @@ class _LocalSearchProvider(BaseSearchProvider):
 
         return self.PROVIDER_NAME
 
-    def search(self, query: str, num_results: int = 5) -> List[Document]:
-        """Lexical overlap search over the corpus."""
+    def search(self, query: str, num_results: int = 5, filters: Optional[MetadataFilter] = None) -> List[Document]:
+        """Lexical overlap search over the corpus (only chunks passing ``filters``)."""
 
         query_terms = token_set(query, remove_stopwords=True) or token_set(query)
         if not query_terms:
             return []
         scored: List[Document] = []
         for document in self._documents_fn():
+            if filters and not matches_filter(
+                {**document.metadata, "source": document.source, "doc_id": document.id}, filters
+            ):
+                continue
             overlap = len(query_terms & token_set(document.content))
             if overlap:
                 scored.append(
@@ -193,6 +208,7 @@ class RAG:
         rag = RAG("docs/", offline=True)
     """
 
+    @apply_presets
     def __init__(
         self,
         source: SourceInput = None,
@@ -244,7 +260,7 @@ class RAG:
         graph_llm: Optional[Union[str, BaseLLMClient, Any]] = None,
         graph_build: str = "sync",
         tools: Optional[Sequence[Any]] = None,
-        on_event: Optional[Callable[[TraceEvent], None]] = None,
+        on_event: OnEvent = None,
         llm_cache: bool = True,
         llm_timeout: float = 60.0,
         llm_max_retries: int = 2,
@@ -257,6 +273,23 @@ class RAG:
         llm_max_tokens: Optional[int] = None,
         conversation_store: Optional[ConversationStore] = None,
         strict: bool = False,
+        access_control: Union[bool, AccessControl, Mapping[str, Any], None] = None,
+        preset: Optional[str] = None,
+        rerank_candidates: Optional[int] = None,
+        rerank_skip_threshold: Optional[float] = None,
+        rerank_skip_margin: Optional[float] = None,
+        llm_cache_ttl: Optional[float] = None,
+        embedding_cache_ttl: Optional[float] = None,
+        cache_personalized: bool = False,
+        answer_cache: Union[bool, AnswerCache, None] = None,
+        prompt_caching: bool = False,
+        cheap_llm: Optional[Union[str, BaseLLMClient, Any]] = None,
+        tier_router: Optional[TierRouter] = None,
+        parent_retrieval: Optional[str] = None,
+        parent_chunk_size: int = 2000,
+        semantic_breakpoint: str = "percentile",
+        semantic_threshold: Optional[float] = None,
+        prices: Union[PriceTable, Mapping[str, Any], None] = None,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -278,6 +311,31 @@ class RAG:
         ``SQLiteConversationStore("chats.db")``). ``strict=True`` raises when an optional step
         (grader, router, reranker, query rewrite, web search, ...) fails, instead of degrading
         and listing the failure in ``result.metadata["degraded"]``.
+
+        ``access_control=True`` (or an ``AccessControl``) turns on document permissions: tag
+        documents at ingest (``add(..., access={"access_level": "confidential", ...})``) and pass
+        ``user=UserContext(...)`` to ``query``. Deny by default: untagged documents are never
+        returned, and a query without a user sees only the lowest level. See ``raglib.access``.
+
+        ``preset="production"`` fills in tested production settings for every argument you do not
+        pass yourself (see ``raglib.presets``); ``RAG.production(...)`` is the shortcut.
+        ``rerank_candidates`` is how many chunks are retrieved for the reranker to cut to ``top_k``.
+
+        Caching and cost (each option names its trade-off in the README):
+
+        * ``rerank_skip_threshold`` / ``rerank_skip_margin``: skip the reranker when the top hit's
+          dense cosine similarity is already this high (see ``Reranker``).
+        * ``llm_cache_ttl`` / ``embedding_cache_ttl``: seconds before cached LLM responses / vectors expire.
+        * ``cache_personalized=False``: LLM and answer caches are skipped for queries with a ``user``
+          or caller ``filters`` (only the public tier is cached).
+        * ``answer_cache``: question-level answer cache (FAQ tier); on by default with tier routing.
+        * ``prompt_caching``: Anthropic ``cache_control`` on the system prompt (no-op elsewhere).
+        * ``cheap_llm`` + ``tier_router``: route easy questions to a cheaper model (``raglib.routing``).
+        * ``parent_retrieval="heading" | "fixed"``: search small chunks, answer from their parent
+          sections of up to ``parent_chunk_size`` tokens.
+        * ``chunking_strategy="embedding"``: semantic chunking with ``semantic_breakpoint`` /
+          ``semantic_threshold`` (see ``ChunkSplitter``).
+        * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
         """
 
         if top_k <= 0:
@@ -294,6 +352,9 @@ class RAG:
         self._output_dir = output_dir
         self._offline = bool(offline) if offline is not None else _env_flag(OFFLINE_ENV_VAR)
         self._top_k = top_k
+        self._preset = preset
+        self._access: Optional[AccessControl] = AccessControl.coerce(access_control)
+        self._parent_acl: Dict[str, str] = {}  # parent document id -> access-tag signature
 
         effective_chat_key = chat_api_key if chat_api_key is not None else llm_key
         self._llm_rpm = llm_rpm
@@ -322,8 +383,13 @@ class RAG:
                     )[0]
                 )
             self._llm_raw = FallbackLLMClient(clients)
-        self._llm: BaseLLMClient = CachedLLMClient(self._llm_raw) if llm_cache else self._llm_raw
+        if prompt_caching:
+            _enable_prompt_caching(self._llm_raw)
+        self._llm: BaseLLMClient = CachedLLMClient(self._llm_raw, ttl=llm_cache_ttl) if llm_cache else self._llm_raw
         self._chat_provider = chat_provider
+        self._cache_personalized = cache_personalized
+        self._prices: Optional[PriceTable] = PriceTable.coerce(prices)
+        self._ingest_meter = UsageMeter()
 
         self._embedding = self._resolve_embedding(
             embedding_llm=embedding_llm,
@@ -333,6 +399,8 @@ class RAG:
             model_name=embedding_model,
             base_url=embedding_base_url,
         )
+        if embedding_cache_ttl is not None and isinstance(self._embedding, CachedEmbedding):
+            self._embedding.ttl = embedding_cache_ttl
         self._vision = self._resolve_vision(
             vision_llm=vision_llm,
             api_key=self._first_non_empty(vision_api_key, llm_key, chat_api_key),
@@ -357,7 +425,21 @@ class RAG:
             overlap=chunk_overlap,
             strategy=chunking_strategy,
             llm_client=self._llm if uses_llm_chunking else None,
+            embedding=self._embedding,
+            semantic_breakpoint=semantic_breakpoint,
+            semantic_threshold=semantic_threshold,
         )
+        if parent_retrieval is not None and parent_retrieval not in PARENT_MODES:
+            raise ValueError(f"parent_retrieval must be one of {list(PARENT_MODES)} or None")
+        if parent_chunk_size <= 0:
+            raise ValueError("parent_chunk_size must be greater than zero")
+        self._parent_retrieval = parent_retrieval
+        self._parent_chunk_size = parent_chunk_size
+        self._sections: Dict[str, Document] = {}  # section id -> parent section (small-to-big)
+        self._parent_sections: Dict[str, List[str]] = {}  # document id -> its section ids
+        self._staged_sections: Dict[str, List[Document]] = {}
+        self._doc_versions: Dict[str, str] = {}  # document id -> content + permission hash
+        self._invalidated_entries = 0  # cache entries dropped by document updates (all time)
         self._retriever = Retriever(
             documents=[],
             embedding=self._embedding,
@@ -372,6 +454,8 @@ class RAG:
             neighbor_window=neighbor_window,
         )
         self.retriever = self._retriever
+        if parent_retrieval is not None:
+            self._retriever.parent_lookup = self._sections.get
         self._parents: Dict[str, List[str]] = {}
         self._ingest_lock = threading.RLock()  # add/update/delete are serialized; queries are not blocked
 
@@ -415,6 +499,8 @@ class RAG:
             model_name=reranker_model,
             llm_client=self._llm if reranker == "llm" else None,
             api_key=reranker_api_key,
+            skip_threshold=rerank_skip_threshold,
+            skip_margin=rerank_skip_margin,
         )
         self._conversations = conversation_store or ConversationStore(
             max_turns=max_history_turns, max_tokens=max_history_tokens
@@ -450,6 +536,8 @@ class RAG:
             "use_memory": bool(memory) if memory is not None else self._rag_type == "memory",
             "on_event": on_event,
             "strict": strict,
+            "rerank_candidates": rerank_candidates,
+            "price_table": self._prices,
         }
         if self._rag_type == "hybrid_web":
             if self._hybrid_retriever is None:
@@ -464,6 +552,41 @@ class RAG:
             rag_type_kwargs["tools"] = list(tools)
         self._rag = self._build_orchestrator(self._rag_type, rag_type_kwargs)
 
+        # Tier routing: FAQ (answer cache) -> cheap model -> full pipeline.
+        self._cheap_rag: Optional[Any] = None
+        if cheap_llm is not None:
+            cheap_provider = parse_model_string(cheap_llm)[0] if isinstance(cheap_llm, str) else None
+            cheap_raw = self._resolve_chat_llm(
+                chat_llm=cheap_llm,
+                api_key=effective_chat_key if cheap_provider == chat_provider else None,
+                model_name=None,
+                base_url=None,
+                timeout=llm_timeout,
+                max_retries=llm_max_retries,
+            )[0]
+            if prompt_caching:
+                _enable_prompt_caching(cheap_raw)
+            cheap = CachedLLMClient(cheap_raw, ttl=llm_cache_ttl) if llm_cache else cheap_raw
+            self._cheap_rag = self._build_orchestrator(
+                "advanced",
+                {
+                    "llm_client": cheap,
+                    "generator": Generator(llm_client=cheap, max_context_tokens=max_context_tokens),
+                    "reranker": Reranker(top_k=top_k, backend="none"),
+                    "query_rewriter": None,
+                },
+            )
+        if isinstance(answer_cache, AnswerCache):
+            self._answer_cache: Optional[AnswerCache] = answer_cache
+        elif answer_cache or (answer_cache is None and (cheap_llm is not None or tier_router is not None)):
+            self._answer_cache = AnswerCache()
+        else:
+            self._answer_cache = None
+        if self._answer_cache is not None:
+            self._answer_cache.version_of = self.document_version
+        routing = self._answer_cache is not None or self._cheap_rag is not None or tier_router is not None
+        self._tier_router: Optional[TierRouter] = (tier_router or HeuristicTierRouter()) if routing else None
+
         if source is not None:
             self.add(source)
         logger.info(
@@ -476,47 +599,157 @@ class RAG:
             "on" if self._graph_indexer else "off",
         )
 
+    @classmethod
+    def production(cls, source: SourceInput = None, **kwargs: Any) -> "RAG":
+        """Shortcut for ``RAG(source, preset="production", **kwargs)``; your kwargs override the preset."""
+
+        kwargs.setdefault("preset", "production")
+        return cls(source, **kwargs)
+
     def query(
         self,
         question: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
+        user: Union[UserContext, Mapping[str, Any], None] = None,
     ) -> GenerationResult:
-        """Answer one question. ``session_id`` isolates conversation memory per user."""
+        """Answer one question. ``session_id`` isolates conversation memory per user.
+
+        With ``access_control`` on, ``user`` (a ``UserContext`` or a dict with ``user_id``,
+        ``roles``, ``departments``, ``max_access_level``) decides which documents are visible;
+        ``filters`` can only narrow that further.
+        """
 
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
-        result = self._rag.run(question.strip(), session_id=session_id, filters=filters)
+        question = question.strip()
+        effective_filters, session_key = self._scope(filters, user, session_id)
+        personalized = self._personalized(filters, user)
+        with cache_bypass(personalized and not self._cache_personalized):
+            result = self._answer(question, session_key, effective_filters, personalized)
+        result.metadata["session_id"] = session_id
         if self._output_dir:
-            self._save_result(question.strip(), result)
+            self._save_result(question, result)
         return result
+
+    def _personalized(self, filters: Optional[MetadataFilter], user: Any) -> bool:
+        """True when the answer may depend on who asks (a user context or caller filters)."""
+
+        return user is not None or bool(filters)
+
+    def _answer(
+        self, question: str, session_key: Optional[str], filters: Optional[MetadataFilter], personalized: bool
+    ) -> GenerationResult:
+        """Route to the FAQ / cheap / full tier and run it."""
+
+        if self._tier_router is None:
+            return self._rag.run(question, session_id=session_key, filters=filters)
+        cache = self._answer_cache
+        # Answers that depend on who asks, or on the conversation so far, are never served from cache.
+        cacheable = cache is not None and (self._cache_personalized or not personalized) and not self._rag.use_memory
+        scope = json.dumps(filters, sort_keys=True, default=str) if filters else None
+        cached = cache.get(question, scope, self._rag_type) if cacheable and cache is not None else None
+        context = {
+            "answer_cached": cached is not None,
+            "cheap_available": self._cheap_rag is not None,
+            "personalized": personalized,
+        }
+        decision = decide(self._tier_router, question, context)
+        logger.info("tier=%s (%s)", decision.tier, decision.reason)
+        if decision.tier == TIER_FAQ and cached is not None:
+            return self._faq_result(cached, decision.reason)
+        tier = TIER_CHEAP if decision.tier in (TIER_FAQ, TIER_CHEAP) and self._cheap_rag is not None else TIER_FULL
+        pipeline = self._cheap_rag if tier == TIER_CHEAP else self._rag
+        with run_tags(tier=tier):
+            result = pipeline.run(question, session_id=session_key, filters=filters)
+        result.metadata.update({"tier": tier, "tier_reason": decision.reason, "answer_cache_hit": False})
+        if cacheable and cache is not None:
+            cache.put(question, result, scope, self._rag_type)
+        return result
+
+    def _faq_result(self, cached: GenerationResult, reason: str) -> GenerationResult:
+        """Return a cached answer, traced as its own short run (tier ``faq``)."""
+
+        tracer = Tracer(on_event=self._rag.on_event)
+        tracer.tag("tier", TIER_FAQ)
+        with tracer.stage("answer_cache"):
+            pass
+        total = tracer.finish(pipeline=self._rag_type, cache_hit={"answer": True}, cost_usd=0.0)
+        cached.metadata.update({"tier": TIER_FAQ, "tier_reason": reason, "answer_cache_hit": True})
+        cached.trace_events = list(tracer.events)
+        cached.usage = {"llm_calls": 0, "total_tokens": 0, "latency_ms": tracer.total_latency_ms(), "wall_latency_ms": total.latency_ms}
+        if self._prices is not None:
+            cached.usage["cost_usd"] = 0.0
+        return cached
 
     async def aquery(
         self,
         question: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
+        user: Union[UserContext, Mapping[str, Any], None] = None,
     ) -> GenerationResult:
         """Async ``query`` (runs the pipeline in a worker thread)."""
 
         import asyncio
 
-        return await asyncio.to_thread(self.query, question, session_id, filters)
+        return await asyncio.to_thread(self.query, question, session_id, filters, user)
 
     def stream(
         self,
         question: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
+        user: Union[UserContext, Mapping[str, Any], None] = None,
     ) -> Iterator[str]:
         """Stream answer tokens: ``for token in rag.stream(q): print(token, end="")``."""
 
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
-        result = yield from self._rag.stream(question.strip(), session_id=session_id, filters=filters)
+        effective_filters, session_key = self._scope(filters, user, session_id)
+        # Streaming always runs the full pipeline (tier routing and the answer cache are query() features).
+        with cache_bypass(self._personalized(filters, user) and not self._cache_personalized):
+            result = yield from self._rag.stream(question.strip(), session_id=session_key, filters=effective_filters)
+        if result is not None:
+            result.metadata["session_id"] = session_id
         if self._output_dir and result is not None:
             self._save_result(question.strip(), result)
         return result
+
+    @property
+    def access_control(self) -> Optional[AccessControl]:
+        """The access-control policy (``None`` when access control is off)."""
+
+        return self._access
+
+    def permission_filter(self, user: Union[UserContext, Mapping[str, Any], None] = None) -> Optional[MetadataFilter]:
+        """The metadata filter access control applies for ``user`` (``None`` when it is off)."""
+
+        if self._access is None:
+            return None
+        return self._access.filter_for(UserContext.coerce(user))
+
+    def _scope(
+        self,
+        filters: Optional[MetadataFilter],
+        user: Union[UserContext, Mapping[str, Any], None],
+        session_id: Optional[str],
+    ) -> Tuple[Optional[MetadataFilter], Optional[str]]:
+        """Merge the permission filter into ``filters`` and namespace the memory session by user."""
+
+        context = UserContext.coerce(user)
+        if self._access is None:
+            if context is not None:
+                raise ValueError("user=... needs access_control (RAG(..., access_control=True))")
+            return filters, session_id
+        acl = self._access.filter_for(context)
+        # Memory is per user: two users never read each other's history, even with the same (or no)
+        # session_id. Without a user_id the owner is the permission scope itself.
+        if context is not None and context.user_id:
+            owner = f"user:{context.user_id}"
+        else:
+            owner = "acl:" + hashlib.sha256(json.dumps(acl, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return merge_filters(acl, filters), f"{owner}::{session_id or 'default'}"
 
     def chat(self, session_id: str = "interactive") -> None:
         """Open an interactive terminal Q&A loop with conversation memory."""
@@ -535,8 +768,16 @@ class RAG:
         source: SourceInput,
         batch_size: int = 256,
         on_progress: Optional[Callable[[Dict[str, int]], None]] = None,
+        *,
+        access: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> int:
         """Add or update sources. Unchanged documents are skipped; changed ones are replaced.
+
+        ``metadata`` is merged into every loaded document. ``access`` sets the access tags
+        (``access_level``, ``department``, ``allowed_roles``; see ``raglib.access.access_tags``)
+        on every loaded document; tags already in a ``Document``'s metadata work too. Re-adding
+        unchanged text with different tags updates its permissions.
 
         Large inputs are processed in batches of ~``batch_size`` chunks: each batch is embedded
         and indexed before the next file is read, so memory stays bounded, progress is reported
@@ -545,6 +786,11 @@ class RAG:
         Returns the number of new chunks indexed.
         """
 
+        if access is not None:
+            unknown = set(access) - set(ACCESS_TAG_KEYS)
+            if unknown:
+                raise ValueError(f"Unknown access tags: {sorted(unknown)}. Supported: {list(ACCESS_TAG_KEYS)}")
+        extra = {**dict(metadata or {}), **dict(access or {})}
         stats = {"files": 0, "chunks_indexed": 0, "skipped": 0}
         pending: List[Document] = []
 
@@ -555,15 +801,19 @@ class RAG:
             if on_progress is not None:
                 on_progress(dict(stats))
 
-        for loaded in self._loader.iter_load(source):
-            stats["files"] += 1
-            if not loaded:
-                stats["skipped"] += 1
-                continue
-            pending.extend(self._splitter.split(loaded))
-            if len(pending) >= batch_size:
-                flush()
-        flush()
+        with usage_scope() as meter:  # ingest cost: embeddings, LLM chunking, graph extraction
+            for loaded in self._loader.iter_load(source):
+                stats["files"] += 1
+                if not loaded:
+                    stats["skipped"] += 1
+                    continue
+                if extra:
+                    loaded = [replace(document, metadata={**document.metadata, **extra}) for document in loaded]
+                pending.extend(self._chunk(loaded))
+                if len(pending) >= batch_size:
+                    flush()
+            flush()
+        self._ingest_meter.merge(meter)
         logger.info(
             "Ingested %d new chunks from %d sources (corpus=%d)",
             stats["chunks_indexed"],
@@ -571,6 +821,102 @@ class RAG:
             len(self._retriever.documents),
         )
         return stats["chunks_indexed"]
+
+    def _tag(self, document: Document) -> Document:
+        """Apply access-control tags to a chunk or section (no-op without access control)."""
+
+        return replace(document, metadata=self._access.tag(document.metadata)) if self._access is not None else document
+
+    def _chunk(self, documents: List[Document]) -> List[Document]:
+        """Split loaded documents into chunks (children of parent sections with parent_retrieval)."""
+
+        if self._parent_retrieval is None:
+            return [self._tag(chunk) for chunk in self._splitter.split(documents)]
+        chunks: List[Document] = []
+        for document in documents:
+            sections = [self._tag(section) for section in build_sections(document, self._parent_retrieval, self._parent_chunk_size)]
+            with self._ingest_lock:
+                self._staged_sections.setdefault(document.id, []).extend(sections)
+            for child in self._splitter.split(sections):
+                # Children belong to the document (replace/delete semantics) and point to their section.
+                metadata = {**child.metadata, "parent_id": document.id, "section_id": child.metadata["parent_id"]}
+                chunks.append(self._tag(replace(child, metadata=metadata)))
+        return chunks
+
+    def _register_sections(self, parent_id: str) -> None:
+        """Make the staged sections of ``parent_id`` current (replacing its old ones)."""
+
+        staged = self._staged_sections.pop(parent_id, None)
+        if staged is None:
+            return
+        for section_id in self._parent_sections.pop(parent_id, []):
+            self._sections.pop(section_id, None)
+        for section in staged:
+            self._sections[section.id] = section
+        self._parent_sections[parent_id] = [section.id for section in staged]
+
+    def document_version(self, parent_id: str) -> Optional[str]:
+        """Content + permission hash of an indexed document (``None`` when not indexed)."""
+
+        return self._doc_versions.get(parent_id)
+
+    def _invalidate_documents(self, parent_ids: Sequence[str], old_texts: Sequence[str] = ()) -> int:
+        """Drop cached answers built from ``parent_ids`` and the cached vectors of ``old_texts``."""
+
+        dropped = 0
+        if isinstance(self._llm, CachedLLMClient):
+            dropped += self._llm.invalidate(parent_ids)
+        if self._answer_cache is not None:
+            dropped += self._answer_cache.invalidate(parent_ids)
+        if old_texts and isinstance(self._embedding, CachedEmbedding):
+            dropped += self._embedding.invalidate_texts(list(old_texts))
+        self._invalidated_entries += dropped
+        return dropped
+
+    def invalidate(self, source: SourceInput) -> int:
+        """Drop every cached answer (LLM cache and answer cache) that used these documents.
+
+        ``source`` is a document id, a file path, or a list of them. Returns the number of cache
+        entries dropped. Use it when a document changed outside raglib; ``add``/``update`` of a
+        changed document and ``on_document_update`` invalidate automatically.
+        """
+
+        items = source if isinstance(source, (list, tuple, set)) else [source]
+        parent_ids = self._known_parents_for(source) | {str(item) for item in items if isinstance(item, str)}
+        texts = [doc.content for pid in parent_ids for doc in (self._retriever.get(cid) for cid in self._parents.get(pid, [])) if doc]
+        return self._invalidate_documents(sorted(parent_ids), texts)
+
+    def invalidate_all(self) -> None:
+        """Clear the LLM, embedding and answer caches."""
+
+        self._purge_caches()
+        if self._answer_cache is not None:
+            self._answer_cache.clear()
+
+    def on_document_update(self, source: SourceInput = None, doc_ids: Optional[Sequence[str]] = None) -> Dict[str, int]:
+        """Hook for external update jobs (e.g. the nightly corpus sync): event-driven invalidation.
+
+        ``source``: files/folders/URLs/texts that changed - they are re-ingested (``add``), which
+        replaces changed documents and drops the cached answers that used them. ``doc_ids``:
+        documents changed elsewhere - their cached answers are dropped. Returns
+        ``{"reindexed_chunks": n, "invalidated": m}``. Cache freshness is a correctness issue: call
+        this from the job that updates the corpus instead of relying on TTLs alone.
+        """
+
+        before = self._invalidated_entries
+        reindexed = self.add(source) if source is not None else 0
+        if doc_ids:
+            self.invalidate(list(doc_ids))
+        return {"reindexed_chunks": reindexed, "invalidated": self._invalidated_entries - before}
+
+    def ingest_usage(self) -> Dict[str, Any]:
+        """Tokens (and USD, with ``prices``) spent on ingestion so far: embeddings, LLM chunking, graph."""
+
+        info: Dict[str, Any] = {**self._ingest_meter.as_dict(), "usage_by_model": self._ingest_meter.breakdown()}
+        if self._prices is not None:
+            cost = self._prices.cost(self._ingest_meter.breakdown())
+            info.update({"cost_usd": round(cost["total"], 8), "cost_by_model": cost["by_model"], "cost_unpriced": cost["unpriced"]})
+        return info
 
     def _index_chunks(self, chunks: List[Document]) -> int:
         """Upsert one batch of chunks (per-document replace semantics)."""
@@ -581,22 +927,47 @@ class RAG:
                 by_parent.setdefault(str(chunk.metadata.get("parent_id", chunk.id)), []).append(chunk)
             to_add: List[Document] = []
             changed: Dict[str, List[str]] = {}
+            retagged: List[Document] = []
+            signatures: Dict[str, str] = {}
             for parent_id, parent_chunks in by_parent.items():
                 new_ids = [chunk.id for chunk in parent_chunks]
                 old_ids = self._parents.get(parent_id)
+                signature = AccessControl.signature(parent_chunks[0].metadata)
+                version = hashlib.sha256(json.dumps([new_ids, signature]).encode("utf-8")).hexdigest()[:16]
                 if old_ids == new_ids:
+                    if self._parent_acl.get(parent_id, signature) != signature:
+                        retagged.extend(parent_chunks)  # same text, new permissions
+                        signatures[parent_id] = signature
+                        self._register_sections(parent_id)
+                        self._doc_versions[parent_id] = version
+                        # A cached public answer must not outlive a permission change.
+                        self._invalidate_documents([parent_id])
+                    else:
+                        self._staged_sections.pop(parent_id, None)
                     continue
+                signatures[parent_id] = signature
                 if old_ids:
+                    old_texts = [doc.content for doc in (self._retriever.get(cid) for cid in old_ids) if doc]
                     self._delete_chunk_ids(old_ids)
                     self._parents.pop(parent_id, None)
+                    self._invalidate_documents([parent_id], old_texts)
                     logger.info("Document %s changed; replaced %d old chunks", parent_id, len(old_ids))
+                self._register_sections(parent_id)
+                self._doc_versions[parent_id] = version
                 changed[parent_id] = new_ids
                 to_add.extend(parent_chunks)
+            if retagged:
+                # Chunk ids are unchanged, so the graph keeps pointing at them and picks up the new
+                # tags on lookup; only the retriever indexes (which store metadata) are rewritten.
+                self._retriever.delete_documents([chunk.id for chunk in retagged])
+                self._retriever.add_documents(retagged)
+                logger.info("Updated access tags of %d chunks", len(retagged))
             added = self._retriever.add_documents(to_add)
             if self._graph_indexer is not None and to_add:
                 self._add_to_graph(to_add)  # skips chunks it already extracted
             # Record documents only after they are really indexed, so a failed batch is retried next run.
             self._parents.update(changed)
+            self._parent_acl.update(signatures)
             return len(added)
 
     def update(self, source: SourceInput) -> int:
@@ -617,14 +988,26 @@ class RAG:
             chunk_ids: List[str] = []
             for parent_id in parent_ids:
                 chunk_ids.extend(self._parents.pop(parent_id, []))
+                self._parent_acl.pop(parent_id, None)
+                self._doc_versions.pop(parent_id, None)
+                for section_id in self._parent_sections.pop(parent_id, []):
+                    self._sections.pop(section_id, None)
             removed = self._delete_chunk_ids(chunk_ids)
             if removed:
-                self._purge_caches()
+                # Deleted text must not survive anywhere, including caches keyed on its prompt.
+                self.invalidate_all()
             return removed
 
-    def reset_memory(self, session_id: Optional[str] = None) -> None:
-        """Clear conversation memory for one session (or all sessions)."""
+    def reset_memory(
+        self, session_id: Optional[str] = None, user: Union[UserContext, Mapping[str, Any], None] = None
+    ) -> None:
+        """Clear conversation memory for one session (or all sessions).
 
+        With access control on, sessions are kept per user: pass the same ``user`` as to ``query``.
+        """
+
+        if self._access is not None and (session_id is not None or user is not None):
+            session_id = self._scope(None, user, session_id)[1]
         self._conversations.clear(session_id)
 
     def retry_graph_extraction(self, include_skipped: bool = False) -> Dict[str, int]:
@@ -680,7 +1063,16 @@ class RAG:
         path.mkdir(parents=True, exist_ok=True)
         chunks = [asdict(document) for document in self._retriever.documents]
         store = self._retriever.vector_store
-        payload = {"version": 3, "index": self._index_fingerprint(), "parents": self._parents, "chunks": chunks}
+        payload = {
+            "version": 3,
+            "index": self._index_fingerprint(),
+            "parents": self._parents,
+            "acl": self._parent_acl,
+            "versions": self._doc_versions,
+            "sections": {section_id: asdict(section) for section_id, section in self._sections.items()},
+            "parent_sections": self._parent_sections,
+            "chunks": chunks,
+        }
         # Write each file atomically, so a crash mid-save never leaves a half-written index.
         if isinstance(store, InMemoryVectorStore):
             store.dump(str(path), "vectors")  # binary float32 + metadata: loads ~50x faster than JSON
@@ -731,6 +1123,10 @@ class RAG:
             store.delete([document.id for document in documents])  # drop vectors from the old model
         self._retriever.add_documents(documents)
         self._parents.update({key: list(value) for key, value in payload.get("parents", {}).items()})
+        self._parent_acl.update({key: str(value) for key, value in payload.get("acl", {}).items()})
+        self._doc_versions.update({key: str(value) for key, value in payload.get("versions", {}).items()})
+        self._sections.update({key: Document(**value) for key, value in payload.get("sections", {}).items()})
+        self._parent_sections.update({key: list(value) for key, value in payload.get("parent_sections", {}).items()})
         if self._graph_indexer is not None and (path / "graph").exists():
             self._graph_indexer.load(str(path / "graph"))
             missing = [doc for doc in documents if doc.id not in self._graph_indexer.indexed_chunk_ids]
@@ -777,6 +1173,12 @@ class RAG:
             "llm": type(self._llm_raw).__name__,
             "web_provider": self._web_provider.name if self._web_provider else None,
             "reranker": self._reranker.backend,
+            "preset": self._preset,
+            "tiers": ["faq" if self._answer_cache else None, "cheap" if self._cheap_rag else None, "full"]
+            if self._tier_router
+            else None,
+            "answer_cache": self._answer_cache.stats if self._answer_cache is not None else None,
+            "parent_sections": len(self._sections) if self._parent_retrieval else None,
         }
         if self._graph_indexer is not None:
             info["graph"] = {
@@ -1178,6 +1580,7 @@ class RAG:
         global_search = GlobalSearch(
             indexer=self._graph_indexer,
             llm_client=graph_llm,
+            chunk_lookup=self._retriever.get,
             level=int(graph_kwargs.get("global_level", 0)),
             max_workers=int(graph_kwargs.get("max_workers", 8)),
             **{key: graph_kwargs[key] for key in GRAPH_GLOBAL_OPTIONS if key in graph_kwargs},
@@ -1354,3 +1757,18 @@ def unwrap_embedding(embedding: Optional[BaseEmbedding]) -> Optional[BaseEmbeddi
     while isinstance(embedding, CachedEmbedding):
         embedding = embedding.inner
     return embedding
+
+
+def _enable_prompt_caching(client: Any) -> None:
+    """Turn on Anthropic prompt caching on ``client`` and its fallbacks (no-op for other providers)."""
+
+    from raglib.llm.clients import AnthropicClient
+
+    seen = 0
+    for candidate in [client, *getattr(client, "clients", [])]:
+        inner = unwrap_llm(candidate)
+        if isinstance(inner, AnthropicClient):
+            inner.prompt_caching = True
+            seen += 1
+    if not seen:
+        logger.info("prompt_caching=True has no effect: the chat model is not an Anthropic model")

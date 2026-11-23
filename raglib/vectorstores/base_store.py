@@ -32,32 +32,57 @@ class VectorHit:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-def matches_filter(metadata: Dict[str, Any], filters: Optional[MetadataFilter]) -> bool:
+def matches_filter(
+    metadata: Dict[str, Any],
+    filters: Optional[MetadataFilter],
+    array_contains: bool = False,
+) -> bool:
     """Evaluate a Mongo/Chroma-style metadata filter against a metadata dict.
 
     Supported: ``{"key": value}``, ``{"key": {"$eq"|"$ne"|"$in"|"$nin"|"$gt"|"$gte"|"$lt"|"$lte": v}}``
     and top-level ``{"$and": [...]}`` / ``{"$or": [...]}``.
+
+    ``array_contains=True`` gives list-valued metadata MongoDB/Qdrant/pgvector semantics
+    (``{"tags": "a"}`` matches ``["a", "b"]``; ``$in`` matches any overlap). The default keeps
+    plain equality, as before.
     """
 
     if not filters:
         return True
     for key, condition in filters.items():
         if key == "$and":
-            if not all(matches_filter(metadata, item) for item in condition):
+            if not all(matches_filter(metadata, item, array_contains) for item in condition):
                 return False
             continue
         if key == "$or":
-            if not any(matches_filter(metadata, item) for item in condition):
+            if not any(matches_filter(metadata, item, array_contains) for item in condition):
                 return False
             continue
         value = metadata.get(key)
-        if isinstance(condition, dict):
-            for operator, expected in condition.items():
-                if not _apply_operator(value, operator, expected):
+        operators = condition if isinstance(condition, dict) else {"$eq": condition}
+        for operator, expected in operators.items():
+            if array_contains and isinstance(value, (list, tuple)):
+                if not _apply_array_operator(list(value), operator, expected):
                     return False
-        elif value != condition:
-            return False
+            elif not _apply_operator(value, operator, expected):
+                return False
     return True
+
+
+def _apply_array_operator(values: List[Any], operator: str, expected: Any) -> bool:
+    """Apply one operator to a list-valued field (an element matches = the field matches)."""
+
+    if operator == "$eq":
+        return expected in values or values == expected
+    if operator == "$ne":
+        return expected not in values and values != expected
+    if operator == "$in":
+        return any(item in values for item in expected)
+    if operator == "$nin":
+        return not any(item in values for item in expected)
+    if operator in {"$gt", "$gte", "$lt", "$lte"}:
+        return any(_apply_operator(item, operator, expected) for item in values)
+    raise ValueError(f"Unsupported metadata filter operator '{operator}'")
 
 
 def _apply_operator(value: Any, operator: str, expected: Any) -> bool:
@@ -88,7 +113,14 @@ def _apply_operator(value: Any, operator: str, expected: Any) -> bool:
 
 
 class BaseVectorStore(ABC):
-    """Abstract vector store contract for add/query/delete lifecycle operations."""
+    """Abstract vector store contract for add/query/delete lifecycle operations.
+
+    ``supports_metadata_filters``: set it to ``False`` in a backend whose ``query`` cannot apply
+    ``filters``; the retriever then raises ``FilterNotSupportedError`` for filtered queries
+    instead of returning unfiltered (possibly restricted) results.
+    """
+
+    supports_metadata_filters: bool = True
 
     @abstractmethod
     def clear(self) -> None:

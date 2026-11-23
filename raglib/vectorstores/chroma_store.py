@@ -177,13 +177,28 @@ class ChromaVectorStore(BaseVectorStore):
 
     @staticmethod
     def _to_chroma_where(filters: Optional[MetadataFilter]) -> Optional[Dict[str, Any]]:
-        """Chroma requires an explicit $and when filtering on several keys."""
+        """Rewrite a raglib filter into Chroma's stricter ``where`` grammar, recursively.
+
+        Chroma needs one key per dict (several keys become an explicit ``$and``) and at least
+        two items in every ``$and`` / ``$or`` list (a single item is unwrapped).
+        """
 
         if not filters:
             return None
-        if len(filters) == 1:
-            return dict(filters)
-        return {"$and": [{key: value} for key, value in filters.items()]}
+        clauses: List[Dict[str, Any]] = []
+        for key, value in filters.items():
+            if key in {"$and", "$or"}:
+                items = [item for item in (ChromaVectorStore._to_chroma_where(sub) for sub in value) if item]
+                if not items:
+                    if key == "$or":  # an empty OR matches nothing; Chroma cannot express it directly
+                        clauses.append({"_raglib_match_nothing": True})
+                    continue
+                clauses.append(items[0] if len(items) == 1 else {key: items})
+            else:
+                clauses.append({key: value})
+        if not clauses:
+            return None
+        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
     @staticmethod
     def _normalize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:

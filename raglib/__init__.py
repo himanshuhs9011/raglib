@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from raglib.access import AccessControl, FilterNotSupportedError, UserContext, access_tags
+from raglib.cache import AnswerCache, TTLCache
 from raglib.components import (
     BM25Index,
     ContextReducer,
@@ -30,6 +32,8 @@ from raglib.components import (
     WebRetriever,
 )
 from raglib.core.base import BaseRAG
+from raglib.costs import CostReport, ModelPrice, PriceTable
+from raglib.exporters import OpenTelemetryExporter, PrometheusExporter
 from raglib.facade import RAG
 from raglib.graph_context import (
     ConnectedNodeRef,
@@ -37,6 +41,7 @@ from raglib.graph_context import (
     GraphContextWindow,
     GraphNode,
 )
+from raglib.latency import LatencySample, LatencyStats, benchmark
 from raglib.llm.base_client import BaseLLMClient, CachedLLMClient
 from raglib.llm.clients import build_chat_client
 from raglib.llm.mock_client import MockLLMClient
@@ -58,6 +63,7 @@ from raglib.rag_types import (
     ToolAugmentedRAG,
     WebRAG,
 )
+from raglib.routing import HeuristicTierRouter, TierDecision
 from raglib.schemas import (
     Citation,
     Document,
@@ -68,6 +74,22 @@ from raglib.schemas import (
 )
 
 __all__ = [
+    "AnswerCache",
+    "TTLCache",
+    "PriceTable",
+    "ModelPrice",
+    "CostReport",
+    "HeuristicTierRouter",
+    "TierDecision",
+    "LatencyStats",
+    "LatencySample",
+    "benchmark",
+    "PrometheusExporter",
+    "OpenTelemetryExporter",
+    "AccessControl",
+    "UserContext",
+    "FilterNotSupportedError",
+    "access_tags",
     "RAG",
     "ask",
     "BaseRAG",

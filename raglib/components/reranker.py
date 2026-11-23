@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import replace
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from raglib.core.runtime import report_degraded
+from raglib.core.tracing import trace_stage, trace_tag
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
 
@@ -43,8 +44,24 @@ class Reranker:
         api_key: Optional[str] = None,
         score_fn: Optional[ScoreFn] = None,
         max_chars_per_doc: int = 1500,
+        skip_threshold: Optional[float] = None,
+        skip_margin: Optional[float] = None,
     ):
-        """Configure the reranking backend."""
+        """Configure the reranking backend.
+
+        Conditional reranking: with ``skip_threshold`` set, the reranker is skipped when the
+        first-stage top candidate is already confident - its **dense cosine similarity**
+        (``metadata["dense_score"]``) is at least ``skip_threshold`` and, with ``skip_margin``,
+        at least ``skip_margin`` above the runner-up's. The fusion score is not used on purpose:
+        RRF scores are rank-based (about 1/60) and relative-fusion scores are min-max normalized
+        per query, so the top candidate scores about 1.0 whether or not it is relevant. Without a
+        dense score (BM25-only retrieval) the reranker always runs.
+
+        Trade-off (latency vs accuracy): skipped queries save the whole rerank stage, but a
+        confident-looking wrong top hit is no longer corrected. Cosine scales differ per embedding
+        model (relevant hits are ~0.8+ on some models, ~0.4 on others): calibrate the threshold
+        on a golden eval set and compare accuracy with and without it before shipping.
+        """
 
         normalized = (backend or "none").strip().lower().replace("-", "_")
         if score_fn is not None:
@@ -60,6 +77,32 @@ class Reranker:
         self.api_key = api_key
         self.score_fn = score_fn
         self.max_chars_per_doc = max_chars_per_doc
+        self.skip_threshold = skip_threshold
+        self.skip_margin = skip_margin
+
+    @staticmethod
+    def confidence(documents: Sequence[Document]) -> Optional[Tuple[float, Optional[float]]]:
+        """``(top dense similarity, margin over the next candidate)`` or None without a dense score."""
+
+        scores = [doc.metadata.get("dense_score") for doc in documents]
+        if not scores or scores[0] is None:
+            return None
+        top = float(scores[0])
+        others = [float(score) for score in scores[1:] if score is not None]
+        return top, (top - max(others)) if others else None
+
+    def should_skip(self, documents: Sequence[Document]) -> bool:
+        """True when conditional reranking applies to these first-stage candidates."""
+
+        if self.skip_threshold is None:
+            return False
+        confidence = self.confidence(documents)
+        if confidence is None:
+            return False
+        top, margin = confidence
+        if top < self.skip_threshold:
+            return False
+        return self.skip_margin is None or margin is None or margin >= self.skip_margin
 
     def rerank(self, query: str, documents: List[Document], top_k: Optional[int] = None) -> List[Document]:
         """Return the top-k documents in reranked order."""
@@ -69,6 +112,22 @@ class Reranker:
             return []
         if self.backend == "none" or len(documents) == 1:
             return list(documents[:k])
+        if self.should_skip(documents):
+            top, margin = self.confidence(documents) or (0.0, None)
+            trace_tag("rerank_skipped", True)
+            trace_tag("rerank_confidence", round(top, 4))
+            return [
+                replace(doc, metadata={**doc.metadata, "rerank_skipped": True}) for doc in documents[:k]
+            ]
+        trace_tag("reranker_used", True)
+        with trace_stage("rerank", backend=self.backend, candidates=len(documents), top_k=k) as meta:
+            reranked = self._rerank_scored(query, documents, k)
+            meta["degraded"] = reranked is None
+        return list(documents[:k]) if reranked is None else reranked
+
+    def _rerank_scored(self, query: str, documents: List[Document], k: int) -> Optional[List[Document]]:
+        """Score and sort ``documents``; ``None`` when the backend failed (caller keeps the first-stage order)."""
+
         try:
             if self.backend == "llm":
                 return self._rerank_llm(query, documents)[:k]
@@ -76,7 +135,7 @@ class Reranker:
             scores = list(self._score(query, texts))
         except Exception as exc:  # noqa: BLE001 - reranking must degrade to first-stage order
             report_degraded(f"reranker:{self.backend}", exc, logger)
-            return list(documents[:k])
+            return None
         rescored = [
             replace(doc, score=float(score), metadata={**doc.metadata, "rerank_score": float(score), "first_stage_score": doc.score})
             for doc, score in zip(documents, scores)
@@ -125,6 +184,10 @@ class Reranker:
             raise ValueError("cohere reranker requires api_key or COHERE_API_KEY")
         client = cohere.ClientV2(api_key=api_key)
         response = client.rerank(model=self.model_name or DEFAULT_COHERE_MODEL, query=query, documents=list(texts))
+        from raglib.core.runtime import record_search_usage
+
+        # Cohere bills "search units": one query over up to 100 documents.
+        record_search_usage("cohere", max(1, -(-len(texts) // 100)))
         scores = [0.0] * len(texts)
         for item in response.results:
             scores[item.index] = float(item.relevance_score)

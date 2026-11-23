@@ -6,6 +6,7 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 from raglib.components.tools import Tool
+from raglib.components.web_retriever import web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import interleave
 from raglib.core.runtime import report_degraded
@@ -57,17 +58,23 @@ class AgenticRAG(BaseRAG):
                 func=lambda q: self.retriever.retrieve(q, filters=ctx.filters),  # type: ignore[union-attr]
             )
         if self.web_retriever is not None:
+            web_retriever = self.web_retriever
             tools["search_web"] = Tool(
                 name="search_web",
                 description="Search the public internet for recent or external information. Input: a web query.",
-                func=self.web_retriever.retrieve,
+                func=lambda q: web_retrieve(web_retriever, q, ctx.filters),
             )
         if self.graph_retriever is not None:
+            from raglib.graphrag.search import require_filter_support
+
+            graph_retriever = self.graph_retriever
+            require_filter_support(graph_retriever, ctx.filters)
+            filter_kwargs = {"filters": ctx.filters} if ctx.filters else {}
             tools["graph_search"] = Tool(
                 name="graph_search",
                 description="Query the knowledge graph for entities, their relationships and corpus-wide themes. "
                 "Input: a question or entity names.",
-                func=self.graph_retriever.retrieve,
+                func=lambda q: graph_retriever.retrieve(q, **filter_kwargs),
             )
         for tool in self.extra_tools:
             tools[tool.name] = tool

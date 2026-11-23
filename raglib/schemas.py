@@ -43,12 +43,19 @@ class RetrievalContext:
 
 @dataclass
 class TraceEvent:
-    """One timed pipeline stage (retrieve, rerank, generate, ...)."""
+    """One timed pipeline stage (retrieve, dense_search, rerank, generate, ..., total).
+
+    ``parent`` is the stage that was open when this one started (None for top-level stages),
+    ``run_id`` groups the events of one query, ``started_at`` is the start in epoch seconds.
+    """
 
     stage: str
     latency_ms: float
     meta: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    parent: Optional[str] = None
+    run_id: Optional[str] = None
+    started_at: Optional[float] = None
 
 
 @dataclass

@@ -31,7 +31,7 @@ from raglib.llm.resilience import RateLimiter, is_retryable, retry_call
 logger = logging.getLogger(__name__)
 
 Message = Dict[str, str]
-Usage = Optional[Tuple[int, int]]
+Usage = Optional[Tuple[int, ...]]  # (prompt, completion) or (prompt, completion, cache_read, cache_write)
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
@@ -203,7 +203,7 @@ class HTTPChatClient(BaseLLMClient):
             label=f"{self._provider}:{self.model_name}:stream",
         )
         parts: List[str] = []
-        prompt_tokens = completion_tokens = 0
+        prompt_tokens = completion_tokens = cache_read = cache_write = 0
         reported = False
         thinking = LeadingThinkFilter()
         while parsed is not None:
@@ -212,6 +212,9 @@ class HTTPChatClient(BaseLLMClient):
                 reported = True
                 prompt_tokens = max(prompt_tokens, usage[0])
                 completion_tokens = max(completion_tokens, usage[1])
+                if len(usage) > 2:
+                    cache_read = max(cache_read, usage[2])
+                    cache_write = max(cache_write, usage[3])
             text = thinking.feed(raw) if raw else ""
             if text:
                 parts.append(text)
@@ -222,7 +225,11 @@ class HTTPChatClient(BaseLLMClient):
         if tail:
             parts.append(tail)
             yield tail
-        self._record_usage((prompt_tokens, completion_tokens) if reported else None, f"{system}\n{prompt}", "".join(parts))
+        self._record_usage(
+            (prompt_tokens, completion_tokens, cache_read, cache_write) if reported else None,
+            f"{system}\n{prompt}",
+            "".join(parts),
+        )
 
     # ------------------------------------------------------------------ internals
 
@@ -245,17 +252,26 @@ class HTTPChatClient(BaseLLMClient):
         self._record_usage(usage, prompt_text, text)
         return strip_leading_think(text)
 
-    @staticmethod
-    def _record_usage(usage: Usage, prompt_text: str, completion: str) -> None:
-        """Report the provider's token counts, or an estimate when it sent none."""
+    @property
+    def model_label(self) -> str:
+        """``provider/model`` - the name cost tracking prices this client's calls under."""
+
+        return f"{self._provider}/{self.model_name}"
+
+    def _record_usage(self, usage: Usage, prompt_text: str, completion: str) -> None:
+        """Report the provider's token counts (and prompt-cache counts), or an estimate when it sent none."""
 
         from raglib.core.runtime import record_usage
         from raglib.core.text import count_tokens
 
         if usage is not None and (usage[0] or usage[1]):
-            record_usage(int(usage[0]), int(usage[1]), estimated=False)
+            cache_read, cache_write = (int(usage[2]), int(usage[3])) if len(usage) > 2 else (0, 0)
+            record_usage(
+                int(usage[0]), int(usage[1]), estimated=False, model=self.model_label,
+                cache_read_tokens=cache_read, cache_write_tokens=cache_write,
+            )
         else:
-            record_usage(count_tokens(prompt_text), count_tokens(completion), estimated=True)
+            record_usage(count_tokens(prompt_text), count_tokens(completion), estimated=True, model=self.model_label)
 
     def __repr__(self) -> str:
         """Readable form that never shows the API key."""
@@ -474,7 +490,18 @@ class OpenAICompatibleClient(HTTPChatClient):
 
 
 class AnthropicClient(HTTPChatClient):
-    """Anthropic Messages API (Claude)."""
+    """Anthropic Messages API (Claude).
+
+    ``prompt_caching = True`` marks the system prompt with ``cache_control`` (``{"type": "ephemeral"}``,
+    5-minute TTL), so repeated requests read it from Anthropic's prompt cache. Trade-off: cache
+    writes cost about 1.25x the input price and reads about 0.1x, so it pays off from the second
+    request within the TTL; prompts shorter than the model's minimum (512-4096 tokens depending on
+    the model) are silently not cached, which includes raglib's short default system prompt - it
+    helps with a long custom ``Generator(system_prompt=...)`` (instructions, examples, glossaries).
+    Cache reads and writes are reported in usage (``cache_read_tokens`` / ``cache_write_tokens``).
+    """
+
+    prompt_caching: bool = False
 
     def default_base_url(self) -> str:
         """Anthropic's public endpoint."""
@@ -490,7 +517,11 @@ class AnthropicClient(HTTPChatClient):
             "messages": merge_consecutive(messages),
         }
         if system:
-            payload["system"] = system
+            if self.prompt_caching:
+                # The system prompt is the stable prefix; the retrieved sources and the question vary.
+                payload["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+            else:
+                payload["system"] = system
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if stream:
@@ -509,8 +540,7 @@ class AnthropicClient(HTTPChatClient):
             raise ValueError(f"anthropic returned an unexpected body: {str(body)[:300]}")
         blocks = body.get("content") or []
         text = "".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict) and block.get("type") == "text")
-        usage = body.get("usage") or {}
-        counts = (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
+        counts = _anthropic_usage(body.get("usage") or {})
         return text, counts if any(counts) else None
 
     def parse_stream_event(self, event):
@@ -530,11 +560,9 @@ class AnthropicClient(HTTPChatClient):
             delta = data.get("delta") or {}
             return (str(delta.get("text", "")) if delta.get("type") == "text_delta" else ""), None
         if kind == "message_start":
-            usage = (data.get("message") or {}).get("usage") or {}
-            return "", (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
+            return "", _anthropic_usage((data.get("message") or {}).get("usage") or {})
         if kind == "message_delta":
-            usage = data.get("usage") or {}
-            return "", (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
+            return "", _anthropic_usage(data.get("usage") or {})
         return "", None
 
     def image_content(self, prompt, image_b64, mime_type):
@@ -544,6 +572,15 @@ class AnthropicClient(HTTPChatClient):
             {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
             {"type": "text", "text": prompt},
         ]
+
+
+def _anthropic_usage(usage: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    """``(prompt, completion, cache_read, cache_write)``; Anthropic's ``input_tokens`` excludes cached tokens."""
+
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+    prompt = int(usage.get("input_tokens") or 0) + cache_read + cache_write
+    return prompt, int(usage.get("output_tokens") or 0), cache_read, cache_write
 
 
 class GeminiClient(HTTPChatClient):

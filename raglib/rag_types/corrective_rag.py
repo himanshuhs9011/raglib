@@ -8,6 +8,7 @@ from typing import Any, List, Tuple
 
 from raglib.components.grader import LABEL_CORRECT, LABEL_INCORRECT, RelevanceGrader
 from raglib.components.query_rewriter import clean_llm_query
+from raglib.components.web_retriever import web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.runtime import report_degraded
 from raglib.core.text import token_set
@@ -180,7 +181,7 @@ class CorrectiveRAG(BaseRAG):
             ctx.trace.append(f"web_search_query:{search_query[:60]}")
             with ctx.tracer.stage("web_search") as meta:
                 try:
-                    web_documents = self.web_retriever.retrieve(search_query)
+                    web_documents = web_retrieve(self.web_retriever, search_query, ctx.filters)
                 except Exception as exc:  # noqa: BLE001
                     report_degraded("crag_web_search", exc, logger)
                     ctx.trace.append("web_search_failed")

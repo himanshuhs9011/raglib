@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
+from raglib.access import FilterNotSupportedError
 from raglib.core.concurrency import parallel_map
 from raglib.core.intents import is_global_question
 from raglib.core.text import token_set
@@ -14,10 +15,61 @@ from raglib.graphrag.indexer import GraphIndexer
 from raglib.graphrag.schemas import Community
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
+from raglib.vectorstores.base_store import MetadataFilter, matches_filter
 
 logger = logging.getLogger(__name__)
 
 ChunkLookup = Callable[[str], Optional[Document]]
+
+
+class ChunkGate:
+    """Decides which graph elements a filtered query may see, from their source chunks.
+
+    Graph elements are merged across documents, so:
+
+    * a chunk is visible when it passes the filter (unknown or deleted chunks never are);
+    * an entity or relation is visible when at least one of its source chunks is - its name
+      then appears in text the user may read;
+    * its merged *description* is shown only when every source chunk is visible, because the
+      description may quote a restricted document;
+    * a community report (an LLM summary over all its members) is shown only when every
+      member entity is fully visible.
+    """
+
+    def __init__(self, chunk_lookup: ChunkLookup, filters: MetadataFilter):
+        """Check chunks with ``chunk_lookup`` against ``filters`` (results cached per query)."""
+
+        self._lookup = chunk_lookup
+        self._filters = filters
+        self._cache: Dict[str, bool] = {}
+
+    def allowed(self, chunk_id: str) -> bool:
+        """True when the chunk exists and passes the filter."""
+
+        if chunk_id not in self._cache:
+            chunk = self._lookup(chunk_id)
+            self._cache[chunk_id] = chunk is not None and matches_filter(
+                {**chunk.metadata, "source": chunk.source, "doc_id": chunk.id}, self._filters
+            )
+        return self._cache[chunk_id]
+
+    def any_allowed(self, chunk_ids: Iterable[str]) -> bool:
+        """True when at least one chunk is visible."""
+
+        return any(self.allowed(chunk_id) for chunk_id in chunk_ids)
+
+    def all_allowed(self, chunk_ids: Iterable[str]) -> bool:
+        """True when there is at least one chunk and every chunk is visible."""
+
+        ids = list(chunk_ids)
+        return bool(ids) and all(self.allowed(chunk_id) for chunk_id in ids)
+
+    def community_allowed(self, store, community: Community) -> bool:
+        """True when every member entity of the community is fully visible."""
+
+        member_ids = set(community.entity_ids)
+        entities = store.get_entities(member_ids)
+        return len(entities) == len(member_ids) and all(self.all_allowed(e.source_chunk_ids) for e in entities)
 
 
 class LocalSearch:
@@ -49,20 +101,66 @@ class LocalSearch:
         self.max_relations = max_relations
         self.max_reports = max_reports
 
-    def search(self, query: str, top_k: int = 5) -> List[Document]:
-        """Return graph context documents followed by the best-supported chunks."""
+    def search(self, query: str, top_k: int = 5, filters: Optional[MetadataFilter] = None) -> List[Document]:
+        """Return graph context documents followed by the best-supported chunks.
+
+        With ``filters``, only graph elements backed by chunks that pass the filter are used
+        (see ``ChunkGate``), and traversal only crosses relations backed by a visible chunk.
+        """
 
         store = self.indexer.store
-        seeds = self.indexer.entity_search(query, top_k=self.top_k_entities)
+        gate = ChunkGate(self.chunk_lookup, filters) if filters else None
+        seeds = self.indexer.entity_search(query, top_k=self.top_k_entities * (4 if gate else 1))
+        if gate is not None:
+            seeds = [(entity, score) for entity, score in seeds if gate.any_allowed(entity.source_chunk_ids)]
+            seeds = seeds[: self.top_k_entities]
         if not seeds:
             return []
         seed_scores = {entity.id: score for entity, score in seeds}
         with self.indexer.read_lock():  # the graph may be growing in a background build
-            return self._search_graph(query, store, seed_scores, top_k)
+            return self._search_graph(query, store, seed_scores, top_k, gate)
 
-    def _search_graph(self, query: str, store, seed_scores: Dict[str, float], top_k: int) -> List[Document]:
-        distances = store.neighbors(seed_scores.keys(), hops=self.hops, max_nodes=self.max_neighbors)
+    def _filtered_neighbors(self, store, seed_ids: Iterable[str], gate: ChunkGate) -> Dict[str, int]:
+        """Breadth-first expansion that only crosses relations backed by a visible chunk."""
+
+        distances: Dict[str, int] = {entity_id: 0 for entity_id in seed_ids}
+        frontier = list(distances)
+        for hop in range(1, self.hops + 1):
+            if not frontier or len(distances) >= self.max_neighbors:
+                break
+            frontier_set = set(frontier)
+            next_frontier: List[str] = []
+            for relation in store.relations_for(frontier, limit=self.max_neighbors * 4):
+                if not gate.any_allowed(relation.source_chunk_ids):
+                    continue
+                for left, right in ((relation.source, relation.target), (relation.target, relation.source)):
+                    if left in frontier_set and right not in distances and len(distances) < self.max_neighbors:
+                        distances[right] = hop
+                        next_frontier.append(right)
+            frontier = next_frontier
+        return distances
+
+    def _search_graph(
+        self,
+        query: str,
+        store,
+        seed_scores: Dict[str, float],
+        top_k: int,
+        gate: Optional[ChunkGate] = None,
+    ) -> List[Document]:
+        if gate is None:
+            distances = store.neighbors(seed_scores.keys(), hops=self.hops, max_nodes=self.max_neighbors)
+        else:
+            distances = self._filtered_neighbors(store, seed_scores.keys(), gate)
         entities = {entity.id: entity for entity in store.get_entities(distances.keys())}
+        if gate is not None:
+            entities = {eid: e for eid, e in entities.items() if gate.any_allowed(e.source_chunk_ids)}
+            distances = {eid: distance for eid, distance in distances.items() if eid in entities}
+
+        def entity_line(entity) -> str:
+            if gate is not None and not gate.all_allowed(entity.source_chunk_ids):
+                return f"- {entity.name} ({entity.type})"  # merged description may quote a hidden document
+            return f"- {entity.name} ({entity.type}): {entity.description[:250]}"
 
         weights: Dict[str, float] = {}
         for entity_id, distance in distances.items():
@@ -75,6 +173,8 @@ class LocalSearch:
             if entity is None:
                 continue
             for chunk_id in entity.source_chunk_ids:
+                if gate is not None and not gate.allowed(chunk_id):
+                    continue
                 chunk_scores[chunk_id] = chunk_scores.get(chunk_id, 0.0) + weight
 
         documents: List[Document] = []
@@ -83,29 +183,38 @@ class LocalSearch:
             documents.append(
                 Document(
                     id=f"graph-entities-{_digest(query)}",
-                    content="Entities:\n" + "\n".join(f"- {e.name} ({e.type}): {e.description[:250]}" for e in ranked_entities),
+                    content="Entities:\n" + "\n".join(entity_line(e) for e in ranked_entities),
                     metadata={"title": "Knowledge graph entities", "graph": "entities"},
                     source="graph",
                     score=1.0,
                 )
             )
-        relations = store.relations_for(list(seed_scores.keys()), limit=self.max_relations)
+        relations = store.relations_for(list(seed_scores.keys()), limit=self.max_relations * (4 if gate else 1))
+        if gate is not None:
+            relations = [
+                r
+                for r in relations
+                if r.source in entities and r.target in entities and gate.any_allowed(r.source_chunk_ids)
+            ][: self.max_relations]
+        names = {e.id: e.name for e in entities.values()}
+
+        def relation_line(r) -> str:
+            line = f"- {names.get(r.source, r.source)} --{r.type}--> {names.get(r.target, r.target)}"
+            if gate is not None and not gate.all_allowed(r.source_chunk_ids):
+                return line
+            return f"{line}: {r.description[:200]}"
+
         if relations:
-            names = {e.id: e.name for e in entities.values()}
             documents.append(
                 Document(
                     id=f"graph-relations-{_digest(query)}",
-                    content="Relationships:\n"
-                    + "\n".join(
-                        f"- {names.get(r.source, r.source)} --{r.type}--> {names.get(r.target, r.target)}: {r.description[:200]}"
-                        for r in relations
-                    ),
+                    content="Relationships:\n" + "\n".join(relation_line(r) for r in relations),
                     metadata={"title": "Knowledge graph relationships", "graph": "relations"},
                     source="graph",
                     score=0.9,
                 )
             )
-        documents.extend(self._community_documents(ranked_entities))
+        documents.extend(self._community_documents(ranked_entities, gate))
 
         chunk_docs: List[Document] = []
         for chunk_id, score in sorted(chunk_scores.items(), key=lambda item: item[1], reverse=True):
@@ -125,8 +234,8 @@ class LocalSearch:
                 break
         return chunk_docs + documents
 
-    def _community_documents(self, entities: Sequence) -> List[Document]:
-        """Reports of the communities the top entities belong to (if already built)."""
+    def _community_documents(self, entities: Sequence, gate: Optional[ChunkGate] = None) -> List[Document]:
+        """Reports of the communities the top entities belong to (if already built and visible)."""
 
         store = self.indexer.store
         counts: Dict[str, int] = {}
@@ -137,6 +246,8 @@ class LocalSearch:
         for community_id, _ in sorted(counts.items(), key=lambda item: item[1], reverse=True):
             community = store.get_community(community_id)
             if community is None or not community.summary:
+                continue
+            if gate is not None and not gate.community_allowed(store, community):
                 continue
             documents.append(
                 Document(
@@ -168,10 +279,12 @@ class GlobalSearch:
         top_communities: int = 20,
         max_points: int = 15,
         max_workers: int = 8,
+        chunk_lookup: Optional[ChunkLookup] = None,
     ):
-        """Configure global search."""
+        """Configure global search (``chunk_lookup`` is required to serve filtered queries)."""
 
         self.indexer = indexer
+        self.chunk_lookup = chunk_lookup
         self.llm_client = llm_client
         self.level = level
         self.top_communities = top_communities
@@ -179,14 +292,29 @@ class GlobalSearch:
         self.max_workers = max(1, max_workers)
         self.last_mapped = 0
 
-    def search(self, query: str) -> List[Document]:
-        """Map relevant community reports to scored key points."""
+    def search(self, query: str, filters: Optional[MetadataFilter] = None) -> List[Document]:
+        """Map relevant community reports to scored key points.
 
+        With ``filters``, only communities whose every member entity is backed solely by
+        visible chunks are mapped (a report summarizes all members, so a mixed one could leak).
+        """
+
+        gate: Optional[ChunkGate] = None
+        if filters:
+            if self.chunk_lookup is None:
+                raise FilterNotSupportedError("GlobalSearch needs chunk_lookup to apply metadata filters")
+            gate = ChunkGate(self.chunk_lookup, filters)
         self.indexer.ensure_communities()
+        store = self.indexer.store
+
+        def visible(communities: List[Community]) -> List[Community]:
+            usable = [c for c in communities if c.summary]
+            return usable if gate is None else [c for c in usable if gate.community_allowed(store, c)]
+
         with self.indexer.read_lock():
-            communities = [c for c in self.indexer.store.communities(self.level) if c.summary]
+            communities = visible(store.communities(self.level))
             if not communities:
-                communities = [c for c in self.indexer.store.communities() if c.summary]
+                communities = visible(store.communities())
         if not communities:
             return []
         selected = self._prefilter(query, communities)
@@ -268,7 +396,13 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
 
 
 class GraphRetriever:
-    """Single retrieval entry point for the graph (used by GraphRAG, routing and agent tools)."""
+    """Single retrieval entry point for the graph (used by GraphRAG, routing and agent tools).
+
+    ``supports_filters`` tells pipelines that ``retrieve(..., filters=...)`` is enforced; a
+    graph retriever without it makes filtered queries raise ``FilterNotSupportedError``.
+    """
+
+    supports_filters = True
 
     def __init__(self, local: LocalSearch, global_search: GlobalSearch, default_mode: str = "auto", top_k: int = 5):
         """Configure the retriever."""
@@ -294,9 +428,26 @@ class GraphRetriever:
             return "global" if is_global_question(query) else "local"
         return chosen
 
-    def retrieve(self, query: str, top_k: Optional[int] = None, mode: Optional[str] = None, **_: object) -> List[Document]:
-        """Retrieve graph context for a query."""
+    def retrieve(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        mode: Optional[str] = None,
+        filters: Optional[MetadataFilter] = None,
+        **_: object,
+    ) -> List[Document]:
+        """Retrieve graph context for a query; ``filters`` restrict it to visible source chunks."""
 
         if self.resolve_mode(query, mode) == "global":
-            return self.global_search.search(query)
-        return self.local.search(query, top_k=top_k or self.top_k)
+            return self.global_search.search(query, filters=filters)
+        return self.local.search(query, top_k=top_k or self.top_k, filters=filters)
+
+
+def require_filter_support(retriever: object, filters: Optional[MetadataFilter], label: str = "graph retriever") -> None:
+    """Raise ``FilterNotSupportedError`` when ``filters`` are set but ``retriever`` cannot enforce them."""
+
+    if filters and not getattr(retriever, "supports_filters", False):
+        raise FilterNotSupportedError(
+            f"{type(retriever).__name__} ({label}) cannot apply metadata filters; refusing to return "
+            "unfiltered results"
+        )

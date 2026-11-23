@@ -8,12 +8,20 @@ import re
 from dataclasses import replace
 from typing import Iterator, List, Optional, Tuple
 
+from raglib.cache import cache_dependencies
 from raglib.core.runtime import UsageMeter, usage_scope
 from raglib.core.text import count_tokens, truncate_to_tokens
+from raglib.core.tracing import trace_stage
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Citation, Document, GenerationResult
 
 logger = logging.getLogger(__name__)
+
+
+def source_parents(documents: List[Document]) -> List[str]:
+    """Ids of the documents (not chunks) behind ``documents``: what an answer depends on."""
+
+    return list(dict.fromkeys(str(doc.metadata.get("parent_id") or doc.id) for doc in documents))
 
 
 def source_label(doc: Document) -> str:
@@ -94,10 +102,15 @@ class Generator:
 
         trace = list(reasoning_trace) if reasoning_trace is not None else []
         context_docs, prompt = self.build_prompt(query, documents, memory_context)
-        with usage_scope() as meter:
+        # Cached answers are tagged with their source documents, so a document update invalidates them.
+        with trace_stage("generate", docs=len(context_docs)) as meta, usage_scope() as meter, cache_dependencies(
+            source_parents(context_docs)
+        ):
             answer = self.llm_client.complete(prompt=prompt, system=self.system_prompt)
+            usage = self._usage(answer, prompt, meter)
+            meta.update(usage)
         trace.append(f"generated_with_docs={len(context_docs)}")
-        return self._result(answer, context_docs, trace, prompt, meter)
+        return self._result(answer, context_docs, trace, prompt, meter, usage=usage)
 
     def stream(
         self,
@@ -111,7 +124,15 @@ class Generator:
         return context_docs, self.llm_client.stream(prompt=prompt, system=self.system_prompt)
 
     def build_prompt(self, query: str, documents: List[Document], memory_context: str = "") -> Tuple[List[Document], str]:
-        """Pack documents into the token budget and render the prompt."""
+        """Pack documents into the token budget and render the prompt (traced as ``prompt_build``)."""
+
+        with trace_stage("prompt_build", candidates=len(documents)) as meta:
+            context_docs, prompt = self._build_prompt(query, documents, memory_context)
+            meta["docs"] = len(context_docs)
+        return context_docs, prompt
+
+    def _build_prompt(self, query: str, documents: List[Document], memory_context: str) -> Tuple[List[Document], str]:
+        """Untraced body of ``build_prompt``."""
 
         context_docs = self._pack_documents(documents)
         memory_block = f"<conversation>\n{memory_context.strip()}\n</conversation>\n\n" if memory_context.strip() else ""
@@ -143,32 +164,39 @@ class Generator:
         trace: List[str],
         prompt: str,
         meter: Optional[UsageMeter] = None,
+        usage: Optional[dict] = None,
     ) -> GenerationResult:
-        """Assemble the result with parsed citations and token usage of the answer call.
+        """Assemble the result with parsed citations (traced as ``post_process``)."""
+
+        with trace_stage("post_process") as meta:
+            result = GenerationResult(
+                answer=answer,
+                sources=context_docs,
+                reasoning_trace=trace,
+                citations=self.extract_citations(answer, context_docs),
+                usage=usage if usage is not None else self._usage(answer, prompt, meter),
+            )
+            meta["citations"] = len(result.citations)
+        return result
+
+    def _usage(self, answer: str, prompt: str, meter: Optional[UsageMeter]) -> dict:
+        """Token usage of the answer call.
 
         ``prompt_tokens`` / ``completion_tokens`` are the provider's counts when it reports
         them (``generation_usage_estimated`` is then False), otherwise local estimates.
         """
 
         if meter is not None and meter.llm_calls and not meter.estimated_calls:
-            usage = {
+            return {
                 "prompt_tokens": meter.prompt_tokens,
                 "completion_tokens": meter.completion_tokens,
                 "generation_usage_estimated": False,
             }
-        else:
-            usage = {
-                "prompt_tokens": count_tokens(prompt) + count_tokens(self.system_prompt) if prompt else 0,
-                "completion_tokens": count_tokens(answer),
-                "generation_usage_estimated": True,
-            }
-        return GenerationResult(
-            answer=answer,
-            sources=context_docs,
-            reasoning_trace=trace,
-            citations=self.extract_citations(answer, context_docs),
-            usage=usage,
-        )
+        return {
+            "prompt_tokens": count_tokens(prompt) + count_tokens(self.system_prompt) if prompt else 0,
+            "completion_tokens": count_tokens(answer),
+            "generation_usage_estimated": True,
+        }
 
     @staticmethod
     def extract_citations(answer: str, context_docs: List[Document]) -> List[Citation]:

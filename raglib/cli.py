@@ -1,4 +1,4 @@
-"""Command-line interface: ``raglib ask``, ``raglib chat``, ``raglib providers``."""
+"""Command-line interface: ``raglib ask``, ``chat``, ``graph``, ``init``, ``presets``, ``providers``."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ USAGE_EXAMPLES = """examples:
   raglib ask notes.md "Key dates?" --llm ollama/llama3.1 --embedding ollama
   raglib chat docs/ --llm openrouter/deepseek/deepseek-chat
   raglib graph docs/ --out graph.html         # knowledge graph you can open in a browser
+  raglib-py --production --llm openrouter    # write rag_pipeline.py (every option written out) + .env.example
+  raglib-py --production app/my_rag.py --llm anthropic --docs data/
+  raglib ask docs/ "Question?" --preset production
+  raglib presets
   raglib providers
   raglib ask docs/ "Question?" --providers providers.json --llm myprovider/model-id   # custom provider
 """
@@ -24,7 +28,8 @@ def _add_common(command: argparse.ArgumentParser) -> None:
     command.add_argument("--llm", help="provider or provider/model (default: detected from API key env vars)")
     command.add_argument("--embedding", help="embedding provider or provider/model (openai, ollama, huggingface, none, ...)")
     command.add_argument("--rag-type", default="advanced", help="advanced | hybrid | corrective | self | agentic | graph | ...")
-    command.add_argument("--top-k", type=int, default=5)
+    command.add_argument("--top-k", type=int, default=None, help="chunks sent to the LLM (default 5, or the preset's)")
+    command.add_argument("--preset", help="configuration preset, e.g. production (see: raglib presets)")
     command.add_argument("--web", help="enable web search with this provider (e.g. duckduckgo, tavily)")
     command.add_argument("--offline", action="store_true", help="use the offline mock models (no API keys)")
     command.add_argument("-v", "--verbose", action="store_true", help="show info logs")
@@ -66,6 +71,17 @@ def _build_parser() -> argparse.ArgumentParser:
     graph.add_argument("--max-nodes", type=int, default=400)
     _add_common(graph)
 
+    init = sub.add_parser(
+        "init", help="write a pipeline file with every option written out (same as: raglib-py --production)"
+    )
+    init.add_argument("path", nargs="?", default="rag_pipeline.py", help="file (or folder) to write")
+    init.add_argument("--preset", default="production", help="preset to start from (default: production)")
+    init.add_argument("--llm", default="openai", help="provider or provider/model (default: openai)")
+    init.add_argument("--docs", default="docs/", help="documents to index (default: docs/)")
+    init.add_argument("--force", action="store_true", help="overwrite an existing file")
+
+    sub.add_parser("presets", help="list configuration presets and their settings")
+
     providers = sub.add_parser("providers", help="list supported LLM providers (and custom ones)")
     _add_providers_option(providers)
     return parser
@@ -76,21 +92,38 @@ def _make_rag(args: argparse.Namespace, sources: Sequence[str]):
 
     from raglib.facade import RAG
 
+    options = {}
+    if args.top_k is not None:
+        options["top_k"] = args.top_k  # only when given, so a preset's top_k applies otherwise
+    if args.preset:
+        options["preset"] = args.preset
     return RAG(
         sources[0] if len(sources) == 1 else list(sources),
         llm=args.llm,
         embedding_llm=args.embedding,
         rag_type="graph" if args.command == "graph" else args.rag_type,
-        top_k=args.top_k,
         web_search_provider=args.web,
         offline=True if args.offline else None,
         memory=True if args.command == "chat" else None,
+        **options,
     )
+
+
+def _preset_names() -> List[str]:
+    """Names usable as ``raglib-py --<preset>``."""
+
+    from raglib.presets import PRESETS
+
+    return list(PRESETS)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point."""
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0].startswith("--") and argv[0][2:] in _preset_names():
+        # raglib-py --production [PATH] [--llm ...]  ==  raglib init [PATH] --preset production [--llm ...]
+        argv = ["init", "--preset", argv[0][2:], *argv[1:]]
     args = _build_parser().parse_args(argv)
     if getattr(args, "providers", None):
         from raglib.llm.providers import load_providers
@@ -100,6 +133,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         except (ValueError, FileNotFoundError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+    if args.command == "init":
+        from raglib.scaffold import next_steps, write_scaffold
+
+        try:
+            written = write_scaffold(args.path, preset=args.preset, llm=args.llm, docs=args.docs, force=args.force)
+        except (FileExistsError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(next_steps(written, args.docs, args.llm))
+        return 0
+    if args.command == "presets":
+        from raglib.presets import PRESETS, PRESETS_DOCS_URL, describe_preset
+
+        print("\n\n".join(describe_preset(name) for name in PRESETS))
+        print(f"\nUse RAG(..., preset=NAME) or RAG.production(...). Details: {PRESETS_DOCS_URL}")
+        return 0
     if args.command == "providers":
         from raglib.llm.providers import provider_table
 
