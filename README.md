@@ -210,7 +210,9 @@ rag = RAG(
 | `"cross_encoder"` (local `BAAI/bge-reranker-base`) | `reranker` | `"none"` |
 | 3 chunks sent to the LLM | `top_k` | 5 |
 | tier 0 guardrails on every stage (see [Guardrails](#guardrails)) | `input_guards` / `retrieval_guards` / `output_guards` / `tool_policy` | off |
-| answers capped at 1024 generated tokens | `llm_max_tokens` | provider default |
+| `llm_max_tokens=1024`: each answer stops after 1024 generated tokens (~750 words), which caps its cost | `llm_max_tokens` | provider default |
+
+`preset="production"` sets `llm_max_tokens=1024`. That is plenty for cited answers, but apps that generate long summaries or reports should raise it, e.g. `RAG(..., preset="production", llm_max_tokens=4096)`. Otherwise long outputs are cut off mid-text. The cap applies to the chat, cheap and fallback models that raglib builds from a provider name. GraphRAG extraction has its own limit (`graph_kwargs={"extraction_max_tokens": ...}`). `MaxOutputTokens` is different: it only trims what is shown, after the tokens were paid for.
 
 `raglib init [PATH] --preset production` does the same as `raglib-py --production`. Both refuse to overwrite a file unless you pass `--force`. The cross-encoder needs `pip install raglib-py[rerank]`. Without it raglib logs a warning and keeps the hybrid order.
 
