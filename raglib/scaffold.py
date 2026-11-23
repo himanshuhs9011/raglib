@@ -92,9 +92,13 @@ rag = RAG(
     chunk_size=<<CHUNK_SIZE>>,                        # tokens per chunk
     chunk_overlap=<<CHUNK_OVERLAP>>,                     # tokens shared by neighbouring chunks (20% keeps ideas whole)
     chunking_strategy="fixed",             # "fixed" | "recursive" | "embedding" (semantic: ~2x embedding cost) | "llm" (LLM calls)
-    semantic_breakpoint="percentile",      # chunking_strategy="embedding": "percentile" | "fixed" (cosine similarity cut-off)
-    semantic_threshold=None,               # percentile (default 95) or similarity (default 0.75) where a new chunk starts
-    semantic_min_tokens=None,              # smallest semantic chunk (default chunk_size // 4)
+    semantic_breakpoint="percentile",      # embedding chunks: "percentile" | "fixed" | "standard_deviation" | "interquartile" | "gradient"
+    semantic_threshold=None,               # default per type: 95 | 0.75 (similarity) | 3 | 1.5 | 95
+    semantic_buffer_size=2,                # sentences compared on each side of a gap (bigger = smoother, fewer breaks)
+    semantic_number_of_chunks=None,        # e.g. 8: aim for about 8 chunks per document (overrides the threshold)
+    sentence_splitter=None,                # a regex or callable; default: multilingual splitter with abbreviations
+    semantic_overlap_sentences=0,          # repeat the last N sentences of a chunk in the next (more tokens, fewer cut ideas)
+    semantic_min_tokens=None,              # smallest semantic chunk (default min(32, chunk_size // 8))
     token_counter=<<TOKEN_COUNTER>>,                 # "units" = words (not model tokens) | "tiktoken" | "auto" | callable
     on_embedding_failure=<<ON_FAILURE>>,           # "raise": fail ingestion | "fallback": recursive split, counted in ingest_usage()
     abbreviations=None,                    # words that do not end a sentence (default: Dr., Mr., e.g., i.e., Inc., No., ...)

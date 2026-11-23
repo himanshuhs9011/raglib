@@ -294,6 +294,10 @@ class RAG:
         token_counter: Union[str, Callable[[str], int]] = "units",
         on_embedding_failure: str = "fallback",
         abbreviations: Optional[Sequence[str]] = None,
+        semantic_buffer_size: int = 2,
+        semantic_number_of_chunks: Optional[int] = None,
+        sentence_splitter: Any = None,
+        semantic_overlap_sentences: int = 0,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -339,7 +343,9 @@ class RAG:
           sections of up to ``parent_chunk_size`` tokens.
         * ``chunking_strategy="embedding"``: semantic chunking with ``semantic_breakpoint`` /
           ``semantic_threshold`` / ``semantic_min_tokens``; ``on_embedding_failure="raise"`` makes a
-          failed embedding call fail ingestion instead of falling back (see ``ChunkSplitter``).
+          failed embedding call fail ingestion instead of falling back; ``semantic_buffer_size``,
+          ``semantic_number_of_chunks``, ``sentence_splitter`` and ``semantic_overlap_sentences``
+          tune it (see ``ChunkSplitter``).
         * ``token_counter``: how chunk sizes are measured - ``"units"`` (words; default),
           ``"tiktoken"``, ``"auto"`` or a callable; the embedding cost estimate uses the same one.
         * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
@@ -440,6 +446,10 @@ class RAG:
             on_embedding_failure=on_embedding_failure,
             abbreviations=abbreviations,
             on_fallback=self._chunking_fallback,
+            buffer_size=semantic_buffer_size,
+            number_of_chunks=semantic_number_of_chunks,
+            sentence_splitter=sentence_splitter,
+            semantic_overlap_sentences=semantic_overlap_sentences,
         )
         self._chunking_fallbacks: List[Dict[str, str]] = []
         if isinstance(self._embedding, CachedEmbedding) and self._splitter.token_counter_name != "units":

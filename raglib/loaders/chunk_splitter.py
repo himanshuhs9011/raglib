@@ -6,8 +6,9 @@ import hashlib
 import logging
 import math
 import re
+import statistics
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple, Union
 
 from raglib.core.text import has_no_space_script, resolve_token_counter, unit_spans
 from raglib.embedding.base_embedding import BaseEmbedding
@@ -17,7 +18,15 @@ from raglib.schemas import Document
 logger = logging.getLogger(__name__)
 
 SUPPORTED_CHUNKING_STRATEGIES = ("fixed", "recursive", "llm", "embedding")
-SEMANTIC_BREAKPOINTS = ("percentile", "fixed")
+SEMANTIC_BREAKPOINTS = ("percentile", "fixed", "standard_deviation", "interquartile", "gradient")
+SEMANTIC_THRESHOLD_DEFAULTS: Dict[str, float] = {
+    "percentile": 95.0,  # break above this percentile of the gap distances
+    "fixed": 0.75,  # break where cosine similarity is below this
+    "standard_deviation": 3.0,  # break above mean + N standard deviations of the distances
+    "interquartile": 1.5,  # break above mean + N x interquartile range of the distances
+    "gradient": 95.0,  # break above this percentile of the distance gradient (sharp changes)
+}
+SentenceSplitter = Union[str, Pattern, Callable[[str], Sequence[Any]], None]
 EMBEDDING_FAILURE_POLICIES = ("fallback", "raise")
 FALLBACK_STRATEGY_LABEL = "recursive_fallback"
 
@@ -104,6 +113,10 @@ class ChunkSplitter:
         on_embedding_failure: str = "fallback",
         abbreviations: Optional[Iterable[str]] = None,
         on_fallback: Optional[FallbackHook] = None,
+        buffer_size: int = 2,
+        number_of_chunks: Optional[int] = None,
+        sentence_splitter: SentenceSplitter = None,
+        semantic_overlap_sentences: int = 0,
     ):
         """Configure chunk size, overlap, strategy, and optional LLM client / embedding model.
 
@@ -113,14 +126,28 @@ class ChunkSplitter:
         ``"auto"`` (tiktoken when installed, else units) or a callable ``text -> int``.
 
         ``strategy="embedding"`` (semantic chunking with embeddings): at every gap between two
-        sentences, embed the two sentences before it and the two after it, and start a new chunk
-        where their similarity drops - so chunks end where the topic changes. ``semantic_breakpoint``:
+        sentences, embed the ``buffer_size`` sentences before it and the ``buffer_size`` after it
+        (a window centred on the gap; default 2), and start a new chunk where their similarity
+        drops - so chunks end where the topic changes. ``semantic_breakpoint`` (with its default
+        ``semantic_threshold``), computed over the gap distances (1 - similarity) of each document:
 
-        * ``"percentile"`` (default): break where the distance to the next sentence is above the
-          ``semantic_threshold``-th percentile of all distances in the document (default 95).
-        * ``"fixed"``: break where the cosine similarity is below ``semantic_threshold`` (default 0.75).
+        * ``"percentile"`` (95): break above that percentile of the distances.
+        * ``"fixed"`` (0.75): break where the cosine similarity is below the threshold.
+        * ``"standard_deviation"`` (3): break above mean + N standard deviations.
+        * ``"interquartile"`` (1.5): break above mean + N x the interquartile range.
+        * ``"gradient"`` (95): break above that percentile of the distance gradient - finds sharp
+          changes in documents whose topics drift slowly (legal, medical).
 
-        Chunks are kept between ``semantic_min_tokens`` (default ``chunk_size // 4``) and
+        ``number_of_chunks`` (approximate target) overrides the threshold: the
+        ``number_of_chunks - 1`` largest gaps become breaks, then size limits apply.
+        ``sentence_splitter``: a regex (its matches are the boundaries) or a callable
+        ``text -> list of sentences`` (strings, or ``(start, end)`` offsets); default: the built-in
+        multilingual splitter. ``semantic_overlap_sentences`` repeats the last N sentences of each
+        chunk at the start of the next one (default 0; never beyond ``chunk_size``).
+
+        Chunks are kept between ``semantic_min_tokens`` (default ``min(32, chunk_size // 8)``: a
+        larger minimum swallows short topic sections - with ``chunk_size // 4`` boundary F1 fell from
+        0.69 to 0.23 at chunk_size=500 in ``benchmarks/chunking/compare_langchain.py``) and
         ``chunk_size``; no overlap is added (boundaries are topic changes). Pass a
         ``CachedEmbedding`` (RAG does) so re-ingesting unchanged text costs nothing.
 
@@ -167,16 +194,36 @@ class ChunkSplitter:
         self.on_fallback = on_fallback
         if semantic_breakpoint not in SEMANTIC_BREAKPOINTS:
             raise ValueError(f"semantic_breakpoint must be one of {list(SEMANTIC_BREAKPOINTS)}")
-        if semantic_breakpoint == "percentile" and semantic_threshold is not None and not 0 < semantic_threshold < 100:
-            raise ValueError("a percentile semantic_threshold must be between 0 and 100")
-        if semantic_breakpoint == "fixed" and semantic_threshold is not None and not -1 <= semantic_threshold <= 1:
-            raise ValueError("a fixed semantic_threshold is a cosine similarity between -1 and 1")
+        if semantic_threshold is not None:
+            if semantic_breakpoint in {"percentile", "gradient"} and not 0 <= semantic_threshold <= 100:
+                raise ValueError(f"a {semantic_breakpoint} semantic_threshold must be between 0 and 100")
+            if semantic_breakpoint == "fixed" and not -1 <= semantic_threshold <= 1:
+                raise ValueError("a fixed semantic_threshold is a cosine similarity between -1 and 1")
+            if semantic_breakpoint in {"standard_deviation", "interquartile"} and semantic_threshold < 0:
+                raise ValueError(f"a {semantic_breakpoint} semantic_threshold must not be negative")
+        if buffer_size < 1:
+            raise ValueError("buffer_size must be at least 1")
+        if number_of_chunks is not None and number_of_chunks < 1:
+            raise ValueError("number_of_chunks must be at least 1")
+        if semantic_overlap_sentences < 0:
+            raise ValueError("semantic_overlap_sentences must not be negative")
         self._embedding = embedding
         self._semantic_breakpoint = semantic_breakpoint
         self._semantic_threshold = (
-            semantic_threshold if semantic_threshold is not None else (95.0 if semantic_breakpoint == "percentile" else 0.75)
+            semantic_threshold if semantic_threshold is not None else SEMANTIC_THRESHOLD_DEFAULTS[semantic_breakpoint]
         )
-        self._semantic_min_tokens = max(1, semantic_min_tokens if semantic_min_tokens is not None else chunk_size // 4)
+        self._buffer_size = buffer_size
+        self._number_of_chunks = number_of_chunks
+        self._semantic_overlap = semantic_overlap_sentences
+        if sentence_splitter is None or callable(sentence_splitter):
+            self._sentence_re: Pattern = _SENTENCE_BOUNDARY_RE
+            self._sentence_fn = sentence_splitter
+        else:
+            self._sentence_re = re.compile(sentence_splitter) if isinstance(sentence_splitter, str) else sentence_splitter
+            self._sentence_fn = None
+        self._semantic_min_tokens = max(
+            1, semantic_min_tokens if semantic_min_tokens is not None else min(32, chunk_size // 8)
+        )
         if self._strategy == "embedding" and self._embedding is None:
             if on_embedding_failure == "raise":
                 raise ValueError("chunking_strategy='embedding' needs an embedding model (on_embedding_failure='raise')")
@@ -559,7 +606,9 @@ class ChunkSplitter:
         spans: List[Tuple[int, int]] = []
         position = start
         region = text[start:end]
-        for match in _SENTENCE_BOUNDARY_RE.finditer(region):
+        if self._sentence_fn is not None:
+            return self._custom_sentence_spans(text, start, region)
+        for match in self._sentence_re.finditer(region):
             boundary = start + match.end()
             if boundary <= position:
                 continue
@@ -573,6 +622,28 @@ class ChunkSplitter:
         if text[position:end].strip():
             spans.append(_trim(text, position, end))
         return [(a, b) for a, b in spans if b > a]
+
+    def _custom_sentence_spans(self, text: str, start: int, region: str) -> List[Tuple[int, int]]:
+        """Spans from a user ``sentence_splitter`` callable (strings are located in order)."""
+
+        spans: List[Tuple[int, int]] = []
+        cursor = 0
+        for item in self._sentence_fn(region) or []:  # type: ignore[misc]
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                a, b = int(item[0]), int(item[1])
+            else:
+                piece = str(item).strip()
+                if not piece:
+                    continue
+                a = region.find(piece, cursor)
+                if a < 0:
+                    raise ValueError(f"sentence_splitter returned text that is not in the document: {piece[:60]!r}")
+                b = a + len(piece)
+            cursor = max(cursor, b)
+            span = _trim(text, start + a, start + b)
+            if span[1] > span[0]:
+                spans.append(span)
+        return spans
 
     def _ends_with_abbreviation(self, sentence: str) -> bool:
         """True when the last word of ``sentence`` is a known abbreviation (case-insensitive)."""
@@ -624,12 +695,14 @@ class ChunkSplitter:
             start, end = units[0]
             return [_Piece(content[start:end], start, end)]
         texts = [content[start:end] for start, end in units]
-        # For the gap after unit i, compare the two units before it with the two after it
-        # (single sentences are too short to embed reliably; overlapping windows blur the boundary).
-        # right(i) == left(i + 2), so de-duplicated this is about one embedding per unit.
+        # For the gap after unit i, compare the buffer_size units before it with the buffer_size
+        # units after it (a window centred on the gap; single sentences are too short to embed
+        # reliably). right(i) == left(i + buffer_size), so de-duplicated this is about one
+        # embedding per unit.
         gaps = range(len(units) - 1)
-        lefts = [" ".join(texts[max(0, i - 1) : i + 1]) for i in gaps]
-        rights = [" ".join(texts[i + 1 : i + 3]) for i in gaps]
+        width = self._buffer_size
+        lefts = [" ".join(texts[max(0, i - width + 1) : i + 1]) for i in gaps]
+        rights = [" ".join(texts[i + 1 : i + 1 + width]) for i in gaps]
         unique = list(dict.fromkeys(lefts + rights))
         try:
             vectors = dict(zip(unique, self._embedding.embed_documents(unique)))
@@ -639,45 +712,87 @@ class ChunkSplitter:
                 raise EmbeddingChunkingError(f"embedding chunking failed for document {document.id!r}: {exc}") from exc
             self._report_fallback(document, exc)
             return None
-        if self._semantic_breakpoint == "percentile":
-            distances = [1.0 - value for value in similarities]
-            cutoff = _percentile(distances, self._semantic_threshold)
-            breaks = {i for i, distance in enumerate(distances) if distance > cutoff}
-        else:
-            breaks = {i for i, value in enumerate(similarities) if value < self._semantic_threshold}
+        breaks = self._breakpoints(similarities)
 
-        groups: List[List[int]] = []
-        current: List[int] = []
+        ranges: List[Tuple[int, int]] = []
+        first = 0
         for index in range(len(units)):
-            if current and self._count_tokens(content[units[current[0]][0] : units[index][1]]) > self._chunk_size:
-                groups.append(current)
-                current = []
-            current.append(index)
-            if index in breaks and self._count_tokens(content[units[current[0]][0] : units[index][1]]) >= self._semantic_min_tokens:
-                groups.append(current)
-                current = []
-        if current:
-            groups.append(current)
-        spans = [(units[group[0]][0], units[group[-1]][1]) for group in groups]
-        spans = self._merge_small(content, spans, self._semantic_min_tokens)
-        spans = self._merge_small(content, spans, self._min_tokens)
+            if index > first and self._count_tokens(content[units[first][0] : units[index][1]]) > self._chunk_size:
+                ranges.append((first, index - 1))
+                first = index
+            if index in breaks and self._count_tokens(content[units[first][0] : units[index][1]]) >= self._semantic_min_tokens:
+                ranges.append((first, index))
+                first = index + 1
+        if first < len(units):
+            ranges.append((first, len(units) - 1))
+        ranges = self._merge_small(content, units, ranges, self._semantic_min_tokens)
+        ranges = self._merge_small(content, units, ranges, self._min_tokens)
+        spans = self._with_overlap(content, units, ranges)
         return [_Piece(content[start:end], start, end) for start, end in spans]
 
-    def _merge_small(self, content: str, spans: List[Tuple[int, int]], minimum: int) -> List[Tuple[int, int]]:
-        """Merge spans smaller than ``minimum`` into a neighbour when the result fits ``chunk_size``."""
+    def _breakpoints(self, similarities: List[float]) -> set:
+        """Gap indexes where a new chunk starts, for the configured threshold type."""
+
+        distances = [1.0 - value for value in similarities]
+        if not distances:
+            return set()
+        if self._number_of_chunks is not None:
+            # Approximate target count: the (n - 1) largest gaps become breaks.
+            count = min(max(self._number_of_chunks - 1, 0), len(distances))
+            return set(sorted(range(len(distances)), key=lambda i: distances[i], reverse=True)[:count])
+        kind, amount = self._semantic_breakpoint, self._semantic_threshold
+        if kind == "fixed":
+            return {i for i, value in enumerate(similarities) if value < amount}
+        if kind == "gradient":
+            if len(distances) < 2:
+                return set()
+            values = _gradient(distances)
+            cutoff = _percentile(values, amount)
+            # A sharp rise flags the gap just *before* the distance peak (central differences), so
+            # each flagged gap breaks at the larger of its own and the next distance: the real boundary.
+            flagged = [i for i, value in enumerate(values) if value > cutoff]
+            return {i + 1 if i + 1 < len(distances) and distances[i + 1] > distances[i] else i for i in flagged}
+        if kind == "standard_deviation":
+            cutoff = statistics.fmean(distances) + amount * statistics.pstdev(distances)
+        elif kind == "interquartile":
+            spread = _percentile(distances, 75) - _percentile(distances, 25)
+            cutoff = statistics.fmean(distances) + amount * spread
+        else:
+            cutoff = _percentile(distances, amount)
+        return {i for i, distance in enumerate(distances) if distance > cutoff}
+
+    def _merge_small(
+        self, content: str, units: List[Tuple[int, int]], ranges: List[Tuple[int, int]], minimum: int
+    ) -> List[Tuple[int, int]]:
+        """Merge unit ranges smaller than ``minimum`` into a neighbour when the result fits ``chunk_size``."""
+
+        def size(first: int, last: int) -> int:
+            return self._count_tokens(content[units[first][0] : units[last][1]])
 
         merged: List[Tuple[int, int]] = []
-        for start, end in spans:
-            if merged and self._count_tokens(content[start:end]) < minimum:
-                previous = merged[-1]
-                if self._count_tokens(content[previous[0] : end]) <= self._chunk_size:
-                    merged[-1] = (previous[0], end)
-                    continue
-            merged.append((start, end))
-        if len(merged) >= 2 and self._count_tokens(content[merged[0][0] : merged[0][1]]) < minimum:
-            if self._count_tokens(content[merged[0][0] : merged[1][1]]) <= self._chunk_size:
-                merged[0:2] = [(merged[0][0], merged[1][1])]
+        for first, last in ranges:
+            if merged and size(first, last) < minimum and size(merged[-1][0], last) <= self._chunk_size:
+                merged[-1] = (merged[-1][0], last)
+                continue
+            merged.append((first, last))
+        if len(merged) >= 2 and size(*merged[0]) < minimum and size(merged[0][0], merged[1][1]) <= self._chunk_size:
+            merged[0:2] = [(merged[0][0], merged[1][1])]
         return merged
+
+    def _with_overlap(
+        self, content: str, units: List[Tuple[int, int]], ranges: List[Tuple[int, int]]
+    ) -> List[Tuple[int, int]]:
+        """Character spans of the ranges, each starting ``semantic_overlap_sentences`` units early."""
+
+        spans: List[Tuple[int, int]] = []
+        for position, (first, last) in enumerate(ranges):
+            start = first
+            if position and self._semantic_overlap:
+                start = max(ranges[position - 1][0] + 1, first - self._semantic_overlap)
+                while start < first and self._count_tokens(content[units[start][0] : units[last][1]]) > self._chunk_size:
+                    start += 1  # the overlap never pushes a chunk over chunk_size
+            spans.append((units[start][0], units[last][1]))
+        return spans
 
     def _report_fallback(self, document: Document, error: Exception) -> None:
         """Log and report a recursive fallback (RAG counts it and emits an ``on_event`` warning)."""
@@ -890,3 +1005,14 @@ def _trim(text: str, start: int, end: int) -> Tuple[int, int]:
     while end > start and text[end - 1].isspace():
         end -= 1
     return start, end
+
+
+def _gradient(values: Sequence[float]) -> List[float]:
+    """Discrete gradient (NumPy's ``np.gradient``: central differences, one-sided at the ends)."""
+
+    if len(values) < 2:
+        return [0.0] * len(values)
+    gradient = [values[1] - values[0]]
+    gradient += [(values[i + 1] - values[i - 1]) / 2.0 for i in range(1, len(values) - 1)]
+    gradient.append(values[-1] - values[-2])
+    return gradient

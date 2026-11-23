@@ -293,10 +293,14 @@ rag = RAG(
     semantic_breakpoint="percentile",   # chunking_strategy="embedding": "percentile" | "fixed"
     semantic_threshold=None,            # percentile (95) or cosine similarity (0.75) where a chunk ends
     prices=None,                        # PriceTable: USD cost per stage in result.usage
-    semantic_min_tokens=None,           # smallest embedding-based chunk (default chunk_size // 4)
+    semantic_min_tokens=None,           # smallest embedding-based chunk (default min(32, chunk_size // 8))
     token_counter="units",              # "units" (words, not model tokens) | "tiktoken" | "auto" | callable
     on_embedding_failure="fallback",    # "raise": a failed embedding call fails ingestion instead of falling back
     abbreviations=None,                 # words that don't end a sentence (default Dr., Mr., e.g., i.e., Inc., No., ...)
+    semantic_buffer_size=2,             # sentences compared on each side of a gap
+    semantic_number_of_chunks=None,     # approximate number of chunks per document (overrides the threshold)
+    sentence_splitter=None,             # regex or callable (default: multilingual splitter)
+    semantic_overlap_sentences=0,       # repeat the last N sentences of a chunk in the next one
     on_event=None,                      # callback(TraceEvent) for every pipeline stage
     output_dir=None,                    # write each query result as JSON
     **rag_type_kwargs,                  # forwarded to the orchestrator (e.g. max_hops=3, search_mode="global")
@@ -352,7 +356,7 @@ rag = RAG(
 | :--- | :--- | :--- | :--- |
 | **`"fixed"`** *(default)* | `"fixed_size"`, `"sliding"`, `"sentence"` | Packs complete sentences up to `chunk_size` with sentence-aware `chunk_overlap`. | Clean prose, fast ingestion. |
 | **`"recursive"`** | `"recursive_character"` | Splits along structural separators (`"\n\n"`, `"\n"`, `". "`, ... `""`) to keep paragraphs together, then applies overlap. | Markdown, structured reports. |
-| **`"embedding"`** | `"semantic_embedding"` | At every gap between sentences, embeds the two sentences before and after it and starts a new chunk where their similarity drops (`semantic_breakpoint="percentile"` cuts above the 95th percentile of distances, `"fixed"` below a cosine similarity). Chunks stay between `chunk_size // 4` and `chunk_size` tokens. | Legal, medical and financial documents. **Trade-off:** ~2x the corpus in embedding tokens and slower ingestion, for chunks that end at topic changes. |
+| **`"embedding"`** | `"semantic_embedding"` | At every gap between sentences, embeds the two sentences before and after it and starts a new chunk where their similarity drops (`semantic_breakpoint="percentile"` cuts above the 95th percentile of distances, `"fixed"` below a cosine similarity). Chunks stay between `semantic_min_tokens` (default `min(32, chunk_size // 8)`) and `chunk_size`. | Legal, medical and financial documents. **Trade-off:** ~2x the corpus in embedding tokens and slower ingestion, for chunks that end at topic changes. |
 | **`"llm"`** | `"semantic"`, `"llm_semantic"` | The LLM groups numbered sentences at topic shifts (`CHUNK: start-end`); falls back to `"recursive"` without an LLM. | High-value documents with shifting topics. |
 
 **Small-to-big (parent sections).** `RAG(parent_retrieval="heading", chunk_size=200, parent_chunk_size=2000)` embeds and searches small child chunks for precise matches. The LLM then gets each child's whole parent section, split at Markdown or numbered headings (`"fixed"` uses fixed windows instead). Duplicate sections are removed, and `metadata["child_ids"]` lists the children that matched. **Trade-off:** answers see whole sections, but each source is bigger, so prompts grow and fewer sources fit in `max_context_tokens`. `neighbor_window` remains a separate, lighter option.
@@ -364,6 +368,10 @@ rag = RAG(
 - **Tables and lists stay whole:** a Markdown table, or a run of list items (with indented continuation lines and blank lines between items), is one unit. It is only split, at row or item borders, when it is larger than `chunk_size`.
 - **Abbreviations:** sentences don't end after `abbreviations` ("Dr. Sharma", "Acme Inc. in 2020", "e.g. tables"; set your own list).
 - **Hindi:** the danda `।` / `॥` ends a sentence.
+- **Thresholds:** `semantic_breakpoint` is one of `"percentile"` (default 95), `"fixed"` (cosine similarity, 0.75), `"standard_deviation"` (mean + 3 sd), `"interquartile"` (mean + 1.5 IQR) or `"gradient"` (95th percentile of the distance gradient, for slowly drifting topics). `semantic_number_of_chunks=8` instead takes the 7 largest gaps, so the count is approximate because size limits still apply.
+- **Window:** `semantic_buffer_size=N` compares the N sentences before each gap with the N after it. Bigger windows are smoother and make fewer breaks.
+- **Overlap:** `semantic_overlap_sentences=N` repeats the last N sentences of a chunk in the next one, never beyond `chunk_size`. **Trade-off:** more tokens to embed and send, fewer ideas cut at a boundary.
+- **Custom splitter:** `sentence_splitter=r"(?<=[.?!])\s+"` (a regex whose matches are boundaries), or a callable `text -> [sentences]` such as a spaCy or NLTK splitter.
 - **Failures:** if the embedding call fails, `on_embedding_failure="fallback"` (default) splits that document recursively, labels its chunks `chunking_strategy="recursive_fallback"`, emits a `chunking_fallback` warning event to `on_event`, and counts it in `rag.ingest_usage()["chunking_fallbacks"]`. `"raise"` (production) raises `EmbeddingChunkingError` instead.
 
 **Document versions.** Every chunk (and parent section) carries `metadata["document_version"]`, a hash of its document's content and permissions. Stale vectors can be found in the vector store, or excluded with `filters={"document_version": rag.document_version(doc_id)}`.

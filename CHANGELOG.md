@@ -50,6 +50,16 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 - `document_version` is stamped on every chunk and parent section.
 - `semantic_min_tokens` is exposed on `RAG(...)`.
 
+**Embedding chunker options.**
+- `semantic_buffer_size`: the window centred on each gap. The default of 2 keeps the previous behaviour.
+- New threshold types: `standard_deviation` (3), `interquartile` (1.5) and `gradient` (95), next to `percentile` and `fixed`.
+- `semantic_number_of_chunks`: an approximate target count.
+- `sentence_splitter`: a regex or a callable.
+- `semantic_overlap_sentences`: carries the last N sentences of each chunk into the next.
+- `benchmarks/chunking/compare_langchain.py` compares the chunker with LangChain's `SemanticChunker` offline.
+- The default `semantic_min_tokens` is now `min(32, chunk_size // 8)` instead of `chunk_size // 4`. The larger minimum swallowed short topic sections: boundary F1 was 0.23 at `chunk_size=500` in the comparison, and 0.69 with the new default.
+- `gradient` breaks at the distance peak, not one gap before it as the literal rule does.
+
 **Behaviour change: personalized queries are no longer cached.** With the default `cache_personalized=False`, queries that pass `user=` or `filters=` skip the LLM cache and the answer cache. Answers are identical, but repeated personalized questions are no longer served from cache. Pass `cache_personalized=True` for the old behaviour. The README's "Trade-offs" table lists what every new option costs.
 
 **Other changes (not breaking):**
