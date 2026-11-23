@@ -45,7 +45,7 @@ from raglib.constants import (
     SUPPORTED_VISION_PROVIDERS,
     WEB_REQUIRED_RAG_TYPES,
 )
-from raglib.core.runtime import UsageMeter, usage_scope
+from raglib.core.runtime import UsageMeter, guard_gate, usage_scope
 from raglib.core.text import token_set
 from raglib.core.tracing import OnEvent, Tracer, active_tracer, run_tags
 from raglib.costs import PriceTable
@@ -63,6 +63,7 @@ from raglib.guards import (
     guard_scope,
 )
 from raglib.guards.defaults import guard_tip, secure_defaults_options, with_secure_defaults
+from raglib.guards.parallel import GuardCancelled, ParallelInputGuards
 from raglib.llm.base_client import (
     BaseLLMClient,
     CachedLLMClient,
@@ -324,6 +325,7 @@ class RAG:
         guard_store: Optional[GuardStore] = None,
         stream_holdback_chars: int = 64,
         secure_defaults: Union[bool, Mapping[str, bool]] = True,
+        guard_models: Optional[Mapping[str, Any]] = None,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -405,6 +407,10 @@ class RAG:
           ``"injection_flags"`` (question) / ``"secret_flags"`` (secrets in the answer), reported in
           ``result.guard_flags``. Turn one off with e.g. ``secure_defaults={"injection_flags": False}``.
           A guard of the same kind that you configure yourself replaces the default one.
+        * ``guard_models``: local models for model-based guards, e.g.
+          ``{"injection": "protectai/deberta-v3-base-prompt-injection-v2", "nli": ...}`` (a model id that
+          is already downloaded, or a callable). Optional: without one, a guard uses your cheapest
+          configured API model, or is skipped with a one-time tip. Nothing is ever downloaded for you.
         """
 
         if top_k <= 0:
@@ -660,12 +666,11 @@ class RAG:
         if preset is None and input_guards is None and retrieval_guards is None and output_guards is None:
             guard_tip()
         self._guard_signature: Optional[str] = None
-        if self._guards is not None:
-            self._guards.bind(self)
-            self._guard_signature = self._guards.signature()
+        self._guard_models: Dict[str, Any] = dict(guard_models or {})
 
         # Tier routing: FAQ (answer cache) -> cheap model -> full pipeline.
         self._cheap_rag: Optional[Any] = None
+        self._cheap_llm: Optional[Any] = None
         if cheap_llm is not None:
             cheap_provider = parse_model_string(cheap_llm)[0] if isinstance(cheap_llm, str) else None
             cheap_raw = self._resolve_chat_llm(
@@ -679,6 +684,7 @@ class RAG:
             if prompt_caching:
                 _enable_prompt_caching(cheap_raw)
             cheap = CachedLLMClient(cheap_raw, ttl=llm_cache_ttl) if llm_cache else cheap_raw
+            self._cheap_llm = cheap
             self._cheap_rag = self._build_orchestrator(
                 "advanced",
                 {
@@ -698,6 +704,12 @@ class RAG:
             self._answer_cache.version_of = self.document_version
         routing = self._answer_cache is not None or self._cheap_rag is not None or tier_router is not None
         self._tier_router: Optional[TierRouter] = (tier_router or HeuristicTierRouter()) if routing else None
+
+        # Bound last: model-based guards pick their model (local -> cheapest API -> skipped) from
+        # everything configured above, including cheap_llm.
+        if self._guards is not None:
+            self._guards.bind(self)
+            self._guard_signature = self._guards.signature()
 
         if source is not None:
             self.add(source)
@@ -779,32 +791,65 @@ class RAG:
         tracer = Tracer(on_event=self._rag.on_event)
         context = self._guard_context(question, session_id, filters, user, user_id, request)
         with usage_scope() as meter, active_tracer(tracer):
-            question, scope, blocked, mapping = self._run_input_guards(question, context)
+            question, scope, blocked, mapping, pending = self._run_input_guards(question, context)
             if blocked is not None:
                 result = self._input_blocked(blocked, tracer, meter)
             else:
-                with guard_scope(scope), cache_bypass(personalized and not self._cache_personalized):
-                    result = self._answer(question, session_key, filters, personalized, tracer=tracer, meter=meter)
+                try:
+                    with guard_scope(scope), guard_gate(pending), cache_bypass(personalized and not self._cache_personalized):
+                        result = self._answer(question, session_key, filters, personalized, tracer=tracer, meter=meter)
+                        if pending is not None:
+                            pending.join()  # e.g. an answer-cache hit made no LLM call that waited
+                except GuardCancelled as cancelled:
+                    result = self._input_blocked(cancelled.decision, tracer, meter, cancelled=True)
+                finally:
+                    self._merge_parallel(scope, pending)
         self._after_guards(result, scope)
         return result, question, mapping
 
-    def _run_input_guards(self, question: str, context: GuardContext) -> Tuple[str, GuardScope, Any, Dict[str, str]]:
-        """Input guards on the raw question; the PII map is taken out of the decisions right away."""
+    def _run_input_guards(
+        self, question: str, context: GuardContext
+    ) -> Tuple[str, GuardScope, Any, Dict[str, str], Optional[ParallelInputGuards]]:
+        """Input guards on the raw question; the PII map is taken out of the decisions right away.
+
+        Tier 0 rules and non-parallel tier 1 guards (``TopicGuard``) run here, in order. Parallel
+        tier 1 guards (classifiers) are started on the masked question and returned as the query's
+        gate: they run while retrieval does, and every LLM call waits for them.
+        """
 
         guards = self._guards
         assert guards is not None
-        masked, decisions, blocked = guards.runner.run("input", guards.input, question, context)
+        sequential = [guard for guard in guards.input if not (guard.tier >= 1 and getattr(guard, "parallel", False))]
+        parallel = [guard for guard in guards.input if guard not in sequential]
+        masked, decisions, blocked = guards.runner.run("input", sequential, question, context)
         mapping: Dict[str, str] = {}
         for decision in decisions:
             if decision.private:
                 mapping.update(decision.private.get("pii_map", {}))
                 decision.private = None
+        masked_context = replace(context, question=masked)
         scope = GuardScope(
-            runner=guards.runner, context=replace(context, question=masked), retrieval_guards=guards.retrieval,
+            runner=guards.runner, context=masked_context, retrieval_guards=guards.retrieval,
             output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
             stream_holdback=self._stream_holdback,
         )
-        return masked, scope, blocked, mapping
+        pending = None
+        if blocked is None and parallel:
+            pending = ParallelInputGuards(guards.runner, parallel, masked, masked_context)
+        return masked, scope, blocked, mapping, pending
+
+    @staticmethod
+    def _merge_parallel(scope: GuardScope, pending: Optional[ParallelInputGuards]) -> None:
+        """Put the parallel input guards' decisions after the sequential input ones."""
+
+        if pending is None:
+            return
+        try:
+            pending.join()
+        except GuardCancelled:
+            pass
+        position = sum(1 for decision in scope.decisions if decision.stage == "input")
+        scope.decisions[position:position] = pending.decisions()
 
     def _after_guards(self, result: GenerationResult, scope: GuardScope) -> None:
         self._attach_guards(result, scope)
@@ -842,10 +887,16 @@ class RAG:
         context.user_key = str(key) if key else None
         return context
 
-    def _input_blocked(self, decision: Any, tracer: Tracer, meter: UsageMeter) -> GenerationResult:
-        """The result for a question an input guard refused: its message, no retrieval, no LLM call."""
+    def _input_blocked(self, decision: Any, tracer: Tracer, meter: UsageMeter, cancelled: bool = False) -> GenerationResult:
+        """The result for a question an input guard refused: its message, no LLM call.
+
+        ``cancelled``: a parallel guard blocked while retrieval was running; the stages that had
+        already finished stay in the trace, the rest never started.
+        """
 
         tracer.tag("blocked_by", decision.guard)
+        if cancelled:
+            tracer.tag("retrieval_cancelled", True)
         costs: Dict[str, Any] = {}
         if self._prices is not None:
             from raglib.costs import price_run
@@ -1017,17 +1068,28 @@ class RAG:
         tracer = Tracer(on_event=self._rag.on_event)
         context = self._guard_context(question, session_id, filters, user, user_id, request)
         with usage_scope() as meter, active_tracer(tracer):
-            question, scope, blocked, mapping = self._run_input_guards(question, context)
+            question, scope, blocked, mapping, pending = self._run_input_guards(question, context)
             if blocked is not None:
                 result = self._input_blocked(blocked, tracer, meter)
                 yield result.answer
             else:
-                with guard_scope(scope), cache_bypass(bypass):
-                    tokens = self._rag.stream(question, session_id=session_key, filters=filters, tracer=tracer, meter=meter)
-                    if mapping:
-                        result = yield from _restoring(tokens, PlaceholderRestorer(mapping))
-                    else:
-                        result = yield from tokens
+                cancelled = None
+                try:
+                    with guard_scope(scope), guard_gate(pending), cache_bypass(bypass):
+                        tokens = self._rag.stream(question, session_id=session_key, filters=filters, tracer=tracer, meter=meter)
+                        if mapping:
+                            result = yield from _restoring(tokens, PlaceholderRestorer(mapping))
+                        else:
+                            result = yield from tokens
+                        if pending is not None:
+                            pending.join()
+                except GuardCancelled as stop:
+                    cancelled = stop
+                finally:
+                    self._merge_parallel(scope, pending)
+                if cancelled is not None:  # no token was shown: generation waits for the guards
+                    result = self._input_blocked(cancelled.decision, tracer, meter, cancelled=True)
+                    yield result.answer
         if result is not None:
             self._after_guards(result, scope)
         return result, question, mapping

@@ -240,3 +240,38 @@ def report_degraded(component: str, exc: BaseException, log: Optional[logging.Lo
         raise exc
     with state._lock:
         state.degraded.append({"component": component, "error": f"{type(exc).__name__}: {str(exc)[:300]}"})
+
+
+# ------------------------------------------------------------------ guard gate
+# Tier 1 input guards run in parallel with retrieval. While they run, a "gate" is active for the
+# query: every traced stage polls it (a guard that already blocked cancels the stage) and every LLM
+# call joins it (waits for the guards first), so a blocked question never reaches a model.
+
+_GUARD_GATE: ContextVar[Optional[Any]] = ContextVar("raglib_guard_gate", default=None)
+
+
+@contextmanager
+def guard_gate(gate: Optional[Any]) -> Iterator[Optional[Any]]:
+    """Activate ``gate`` (an object with ``poll()`` and ``join()``) for the block."""
+
+    token = _GUARD_GATE.set(gate)
+    try:
+        yield gate
+    finally:
+        _reset(_GUARD_GATE, token)
+
+
+def guard_poll() -> None:
+    """Raise when a parallel guard has already blocked the query (never waits)."""
+
+    gate = _GUARD_GATE.get()
+    if gate is not None:
+        gate.poll()
+
+
+def guard_join() -> None:
+    """Wait for the query's parallel guards; raise when one blocked. Call before any LLM call."""
+
+    gate = _GUARD_GATE.get()
+    if gate is not None:
+        gate.join()

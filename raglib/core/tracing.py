@@ -84,8 +84,14 @@ class Tracer:
 
     @contextmanager
     def stage(self, name: str, **meta: Any) -> Iterator[Dict[str, Any]]:
-        """Time a pipeline stage; callers may add fields to the yielded meta dict."""
+        """Time a pipeline stage; callers may add fields to the yielded meta dict.
 
+        A stage that starts after a parallel guard blocked the query is cancelled (``guard_poll``).
+        """
+
+        from raglib.core.runtime import guard_poll
+
+        guard_poll()
         details: Dict[str, Any] = dict(meta)
         parent = _STAGE.get()
         token = _STAGE.set((name, details))

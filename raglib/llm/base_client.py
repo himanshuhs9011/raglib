@@ -107,7 +107,9 @@ class CachedLLMClient(BaseLLMClient):
         """Return a cached completion or call the wrapped client."""
 
         from raglib.cache import caching_allowed
+        from raglib.core.runtime import guard_join
 
+        guard_join()  # parallel input guards decide before any model call
         if not caching_allowed():
             return self.inner.complete(prompt=prompt, system=system)
         key = hashlib.sha256(f"{system}\x00{prompt}".encode("utf-8")).hexdigest()
@@ -125,7 +127,9 @@ class CachedLLMClient(BaseLLMClient):
         import json
 
         from raglib.cache import caching_allowed
+        from raglib.core.runtime import guard_join
 
+        guard_join()
         if not caching_allowed():
             value = self.inner.complete_json(prompt, system=system, default=_MISSING)
             return default if value is _MISSING else value
@@ -153,11 +157,17 @@ class CachedLLMClient(BaseLLMClient):
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Delegate chat calls without caching (transcripts rarely repeat)."""
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()
         return self.inner.chat(messages)
 
     def stream(self, prompt: str, system: str = "") -> Iterator[str]:
         """Delegate streaming to the wrapped client."""
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()
         return self.inner.stream(prompt=prompt, system=system)
 
     def __getattr__(self, name: str) -> Any:

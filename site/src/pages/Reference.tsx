@@ -1,5 +1,5 @@
 import { Code } from "../components/Code";
-import { METHODS, PARAM_GROUPS, TOTAL_PARAMS, TYPE_OPTIONS, type Param } from "../reference";
+import { GUARD_MODELS, GUARD_PARAMS, METHODS, PARAM_GROUPS, TOTAL_PARAMS, TYPE_OPTIONS, type Param } from "../reference";
 
 const MINIMAL = `
 from raglib import RAG
@@ -87,6 +87,7 @@ export function Reference() {
         {PARAM_GROUPS.map((group) => (
           <a key={group.id} href={`#/reference/${group.id}`}>{group.title}</a>
         ))}
+        <a href="#/reference/guardrails">Guardrails</a>
         <a href="#/reference/type-options">Per rag_type options</a>
         <a href="#/reference/methods">Methods</a>
         <a href="#/reference/production">Production vs offline</a>
@@ -113,6 +114,41 @@ export function Reference() {
             <ParamTable rows={group.params} />
           </section>
         ))}
+
+        <section id="guardrails">
+          <h2>Guardrails</h2>
+          <p className="muted">
+            Layered checks, cheapest first; <code>preset="production"</code> turns on the free tier 0 rules. Tier 1 model checks
+            are opt-in. Each picks a local model if you configured one, otherwise your cheapest API model, otherwise it is
+            skipped with a one-time tip. Local models are a recommendation for lower cost and latency, never a requirement.
+          </p>
+          <ParamTable rows={GUARD_PARAMS} />
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Guard</th>
+                  <th>Recommended local model</th>
+                  <th>Local cost / latency</th>
+                  <th>API alternative</th>
+                  <th>API cost / latency</th>
+                </tr>
+              </thead>
+              <tbody>
+                {GUARD_MODELS.map((row) => (
+                  <tr key={row.guard}>
+                    <td><code>{row.guard}</code></td>
+                    <td><code>{row.local}</code></td>
+                    <td className="muted">{row.localCost}</td>
+                    <td className="muted">{row.api}</td>
+                    <td className="muted">{row.apiCost}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="muted">Rough per-question figures; they depend on hardware, text length and your model prices. Measure with LatencyStats and CostReport.</p>
+        </section>
 
         <section id="type-options">
           <h2>Per rag_type options</h2>

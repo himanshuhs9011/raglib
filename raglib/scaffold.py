@@ -188,6 +188,7 @@ rag = RAG(
     guard_store=None,                      # GuardStore for limit counters (default: in this process only)
     stream_holdback_chars=64,              # streamed text may trail the model this far while output guards check it (min 40)
     secure_defaults=True,                  # always-on protections; e.g. {"injection_flags": False} turns one off
+    guard_models=None,                     # optional local guard models, e.g. {"injection": "protectai/deberta-v3-base-prompt-injection-v2"}
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back

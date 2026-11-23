@@ -147,6 +147,31 @@ export const PARAM_GROUPS: ParamGroup[] = [
   },
 ];
 
+export const GUARD_PARAMS: Param[] = [
+  { name: "input_guards", default: "None", text: 'Checks on the question, cheapest first: PIIMasker, MaxQuestionTokens, InjectionHeuristic, UserRateLimit, UserDailyBudget (tier 0, free), TopicGuard, InjectionClassifier, ToxicityClassifier (tier 1). "default" = the production set.' },
+  { name: "retrieval_guards", default: "None", text: 'NothingRelevant: answers "I couldn\'t find this in the documents" without calling the LLM.' },
+  { name: "output_guards", default: "None", text: "OutputLeakGuard, CitationAccessGuard, JSONSchemaGuard, MaxOutputTokens, GroundingGuard." },
+  { name: "tool_policy", default: "None", text: "Agent: allowed tools per role, max tool calls per question, argument limits." },
+  { name: "guard_models", default: "None", text: 'Optional local models for tier 1 guards, e.g. {"injection": "protectai/deberta-v3-base-prompt-injection-v2"}. Never downloaded for you; without one a guard uses your cheapest API model, or is skipped with a tip.' },
+  { name: "secure_defaults", default: "True", text: "Always-on protections that never change normal answers: citation access (with access_control), a 10-call agent limit, injection and secret flags." },
+];
+
+export interface GuardModelRow {
+  guard: string;
+  local: string;
+  localCost: string;
+  api: string;
+  apiCost: string;
+}
+
+// Recommendations, not requirements: every guard works without a local model (API fallback or skipped with a tip).
+export const GUARD_MODELS: GuardModelRow[] = [
+  { guard: "TopicGuard", local: "none: reuses the query embedding", localCost: "$0, under 1 ms", api: "none needed", apiCost: "$0 extra (the embedding call retrieval makes anyway)" },
+  { guard: "InjectionClassifier", local: "protectai/deberta-v3-base-prompt-injection-v2", localCost: "$0, ~20-60 ms CPU / ~5 ms GPU", api: "cheapest configured chat model", apiCost: "~$0.00002-0.0001, ~0.3-1 s (parallel with retrieval)" },
+  { guard: "ToxicityClassifier", local: "unitary/toxic-bert", localCost: "$0, ~15-40 ms CPU", api: "OpenAI moderation (free) or cheapest chat model", apiCost: "$0 / ~$0.00002, ~0.1-1 s" },
+  { guard: "GroundingGuard", local: "cross-encoder/nli-deberta-v3-small", localCost: "$0, ~0.1-0.5 s per answer, every answer", api: "cheapest chat model on 5% of answers", apiCost: "~$0.0002-0.001 per checked answer, ~0.5-1.5 s" },
+];
+
 export const TYPE_OPTIONS: Param[] = [
   { name: "search_mode", default: '"auto"', text: 'graph: "local" (entities), "global" (themes) or "auto".' },
   { name: "fuse_with_chunks", default: "True", text: "graph: also add normal hybrid chunk results to graph context." },

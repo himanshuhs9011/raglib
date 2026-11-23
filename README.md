@@ -300,6 +300,7 @@ rag = RAG(
     guard_store=None,                   # GuardStore for limit counters (default: in this process only)
     stream_holdback_chars=64,           # how far streamed text may trail the model while output guards check it (min 40)
     secure_defaults=True,               # always-on protections (citation access, tool limit, injection/secret flags)
+    guard_models=None,                  # optional local models for tier 1 guards (never downloaded for you)
     embedding_cache_ttl=None,           # seconds before a cached embedding expires
     cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
     answer_cache=None,                  # True: question-level answer cache (FAQ tier)
@@ -1081,7 +1082,7 @@ rag.query("Holiday policy?")                                # anonymous: "public
 
 ## Guardrails
 
-Layered checks on the question, the retrieved documents, the answer and the agent's tool calls. They run cheapest first and stop at the first block. Each guard returns **allow**, **block** (with a message for the user) or **modify** (e.g. the question with PII masked), plus a confidence. This release ships tier 0: rules that need no model and cost nothing (microseconds per check).
+Layered checks on the question, the retrieved documents, the answer and the agent's tool calls. They run cheapest first and stop at the first block. Each guard returns **allow**, **block** (with a message for the user) or **modify** (e.g. the question with PII masked), plus a confidence. Tier 0 rules need no model and cost nothing (microseconds per check); tier 1 guards use a small model, local or API, and are opt-in (see below).
 
 ```python
 from raglib import RAG
@@ -1160,7 +1161,48 @@ rag.query("Holiday policy?", request={"api_key_id": "key_8f2"})
 
 **Custom guards.** Subclass `raglib.guards.Guard`, set `name`, `stages` (`("input",)`, `("retrieval",)`, `("output",)`), `tier`, `kind` (`"security"` or `"quality"`) and `cacheable`, and return `allow()`, `block(message)` or `modify(value)` from `check(value, context)`. `context` has the question, `user`, `user_id`, `user_key`, `session_id`, `request`, `filters`, `permission_filter` and `documents`. For output guards, set `streaming_safe = True` when `check` works on a piece of the answer (state across pieces goes in `check_stream(chunk, context, state)`).
 
-Coming next: tier 1 (a topic check that reuses the query embedding, injection and toxicity classifiers, and a grounding check) and tier 2 (an LLM judge that runs only when tier 1 is unsure). Local models will always be optional.
+### Tier 1: cheap model checks (opt-in)
+
+Tier 1 guards use a small model. They are opt-in and never required: each one picks its model in this order, and records the choice as `mode` on every decision and on its trace stage.
+
+1. **local**: a local model you configured, with `local_model=` on the guard or `RAG(guard_models={"injection": ..., "toxicity": ..., "nli": ...})`. It can be a callable (your own scorer) or a Hugging Face model id that is already downloaded. raglib loads model ids with `local_files_only=True` and **never downloads a model** unless you pass `allow_download=True`.
+2. **api**: your already-configured models. Toxicity uses OpenAI's free moderation endpoint when your chat provider is OpenAI; everything else uses the cheapest configured chat model (`cheap_llm`, then `graph_llm`, then the main model; with `prices=`, the lowest input price wins). `api=False` turns this step off.
+3. **skipped**: the guard allows the question and records `mode="skipped"`. A one-time `GuardSkippedWarning` says what was skipped, which local model to install and which setting enables it.
+
+```python
+from raglib.guards import TopicGuard, InjectionClassifier, ToxicityClassifier, GroundingGuard
+
+rag = RAG(
+    "docs/", llm="openai/gpt-4.1-mini", cheap_llm="openai/gpt-4.1-nano",
+    input_guards=["default",
+                  TopicGuard({"billing": ["How do I pay an invoice?"], "shipping": ["Where is my parcel?"]}),
+                  InjectionClassifier(),                     # local if configured, else gpt-4.1-nano
+                  ToxicityClassifier()],                     # OpenAI moderation (free)
+    output_guards=["default", GroundingGuard(grounding_sample_rate=0.05)],
+    # Optional and recommended: local models cost nothing per question and answer in milliseconds.
+    # pip install raglib-py[guards] && huggingface-cli download protectai/deberta-v3-base-prompt-injection-v2
+    guard_models={"injection": "protectai/deberta-v3-base-prompt-injection-v2"},
+)
+```
+
+| Guard | What it checks | Recommended local model (optional) | Local: cost / latency | API alternative | API: cost / latency |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `TopicGuard(topics, threshold=0.35)` | The question is close to one of your example questions (cosine of the query embedding) | none: reuses the query embedding | $0, under 1 ms (examples embedded once) | none needed | $0 extra: retrieval's own `embed_query` call, served from the embedding cache |
+| `InjectionClassifier(threshold=0.5)` | Prompt-injection attempts | `protectai/deberta-v3-base-prompt-injection-v2` (184M) | $0, ~20-60 ms CPU / ~5 ms GPU | cheapest chat model, one JSON call | ~$0.00002-0.0001 per question, ~0.3-1 s (in parallel with retrieval) |
+| `ToxicityClassifier(threshold=0.7)` | Abuse, hate, threats; `check_answers=True` also checks answers | `unitary/toxic-bert` (110M) | $0, ~15-40 ms CPU | OpenAI moderation (`omni-moderation-latest`, free) when the chat provider is OpenAI, else the cheapest chat model | $0 / ~$0.00002, ~0.1-1 s |
+| `GroundingGuard(min_supported=0.5)` | Share of answer sentences supported by the sources | `cross-encoder/nli-deberta-v3-small` (140M), on every answer | $0, ~20-40 ms per sentence-source pair (~0.1-0.5 s per answer) | cheapest chat model as a judge, on `grounding_sample_rate` of answers (default 5%) | ~$0.0002-0.001 per checked answer (the sources are in the prompt), ~0.5-1.5 s; ~$0.00001-0.00005 per answer on average at 5% |
+
+These figures are rough: they depend on hardware, text length and your model prices. Measure your own with `LatencyStats` (each guard is its own stage) and `CostReport` (each guard on its own line).
+
+**Parallel with retrieval.** Tier 1 input classifiers (`InjectionClassifier`, `ToxicityClassifier`, or any guard with `tier >= 1` and `parallel = True`) start in worker threads while retrieval runs:
+- Every LLM call waits for them first: generation, and also the agent's planner, the query rewriter and the router. A blocked question therefore never reaches a model.
+- When a guard blocks, the next pipeline stage to start (a vector search, the reranker, a tool call) is cancelled instead of running. The result carries `blocked_by` and a `retrieval_cancelled` tag on the trace.
+- The trade-off: retrieval work that had already started (embedding the query, a vector search) is paid for even when the question is then blocked. A model call never is.
+- `TopicGuard` runs first, not in parallel, because its embedding call is the one retrieval then reuses.
+
+**Grounding.** `GroundingGuard` is not streaming-safe, so with it `rag.stream(...)` delivers the checked answer in one piece. In API mode, answers that were not sampled are recorded as `mode="skipped"` with reason "not sampled". Sampling measures your grounding rate; it does not police every answer. To check every answer, use a local NLI model, which is free per answer, or set `grounding_sample_rate=1.0`. Small NLI models can misjudge paraphrases and numbers, so calibrate `min_supported` / `entailment_threshold` on your own answers first.
+
+Coming next: tier 2, an LLM judge that runs only when tier 1 is unsure or the request is high-risk.
 
 ## Scaling & Concurrency
 

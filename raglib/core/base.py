@@ -409,8 +409,10 @@ class BaseRAG:
     def _check_retrieval(self, ctx: PipelineContext, documents: List[Document]) -> None:
         """Run the query's retrieval guards; raises ``GuardBlockedError`` (no LLM call follows) on a block."""
 
+        from raglib.core.runtime import guard_join
         from raglib.guards.base import current_scope
 
+        guard_join()  # a parallel input guard's block wins over the "nothing relevant" exit
         scope = current_scope()
         if scope is None or not scope.retrieval_guards:
             return
@@ -578,6 +580,9 @@ class BaseRAG:
     def _finish(self, ctx: PipelineContext, result: GenerationResult) -> GenerationResult:
         """Run output guards, persist memory and attach diagnostics."""
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()  # nothing is stored for a question a parallel input guard blocked
         result = self._check_output(ctx, result)
         if self.use_memory:
             memory = self.memory_for(ctx.session_id)

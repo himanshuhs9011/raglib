@@ -761,6 +761,13 @@ _BY_NAME: Dict[str, Callable[[], Guard]] = {
     "citation_access": CitationAccessGuard,
 }
 
+# Tier 1 model guards by name (opt-in; TopicGuard needs your topics, so it has no name).
+_MODEL_GUARDS = {
+    "injection_classifier": "InjectionClassifier",
+    "toxicity": "ToxicityClassifier",
+    "grounding": "GroundingGuard",
+}
+
 _DEFAULTS = {"input": default_input_guards, "retrieval": default_retrieval_guards, "output": default_output_guards}
 
 
@@ -779,8 +786,12 @@ def resolve_guards(spec: Union[str, Guard, Sequence[Union[str, Guard]], None], s
             guards.extend(_DEFAULTS[stage]())
         elif isinstance(item, str) and item in _BY_NAME:
             guards.append(_BY_NAME[item]())
+        elif isinstance(item, str) and item in _MODEL_GUARDS:
+            from raglib.guards import classifiers
+
+            guards.append(getattr(classifiers, _MODEL_GUARDS[item])())
         else:
-            raise ValueError(f"Unknown guard {item!r}; use a Guard object, 'default', or one of {sorted(_BY_NAME)}")
+            raise ValueError(f"Unknown guard {item!r}; use a Guard object, 'default', or one of {sorted({*_BY_NAME, *_MODEL_GUARDS})}")
     wrong = [g.name for g in guards if stage not in g.stages]
     if wrong:
         raise ValueError(f"{stage}_guards got guards for another stage: {wrong}")

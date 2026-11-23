@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Guardrails, tier 1 (cheap model checks, opt-in).** See README "Guardrails" for the model table.
+- `TopicGuard(topics)`: compares the question with example questions per topic, using the query embedding retrieval makes anyway (served from the embedding cache). No extra model call. It runs before retrieval and blocks off-topic questions.
+- `InjectionClassifier` and `ToxicityClassifier`: a local classifier if you configured one, else your cheapest configured chat model (toxicity: OpenAI's free moderation endpoint when the chat provider is OpenAI), else skipped.
+- `GroundingGuard`: a local NLI model on every answer, else the cheapest chat model on `grounding_sample_rate` of answers (default 5%), else skipped. It is a quality guard and is not streaming-safe.
+- Model choice is local, then api, then skipped. The mode is recorded on every decision and trace stage. A skipped guard gives a one-time `GuardSkippedWarning` naming the local model to install and the setting to add. Local models come from `local_model=` or the new `RAG(guard_models={...})`. A model id is loaded with `local_files_only=True`, so nothing is downloaded unless you pass `allow_download=True`. New extra: `pip install raglib-py[guards]`.
+- Tier 1 input classifiers run in parallel with retrieval. Every LLM call (generation, agent planning, query rewriting, routing) waits for them, and a block cancels the next retrieval stage. A blocked question never reaches a model. Cancellation raises `GuardCancelled` (a `BaseException`), so components that degrade on errors cannot swallow it. Retrieval work that had already started is still paid for.
+- Guard API calls are traced in the guard's own stage, so they get their own `CostReport` line. The offline mock LLM answers the guard prompts with simple heuristics, for demos and tests.
+
 **Security: secure by default.** Every `RAG(...)` now gets four protections. None of them changes the answer to a normal question: with them on, plain `RAG(...)` gives the same answers, sources and trace stages as before, and still streams token by token.
 - `CitationAccessGuard` whenever `access_control=True`. It withholds an answer that cites a document the user may not read, which only happens when a custom retriever, tool or cache slips past the retrieval filters. Turn off with `secure_defaults={"citation_access": False}`.
 - An agent tool limit, `ToolPolicy(max_tool_calls=10)`. It stops a looping agent; the default `max_steps=4` never reaches it. Turn off with `secure_defaults={"tool_limit": False}`, or pass your own `tool_policy=`.

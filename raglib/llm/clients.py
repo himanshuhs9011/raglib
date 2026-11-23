@@ -186,6 +186,9 @@ class HTTPChatClient(BaseLLMClient):
         text is flowing, errors propagate, because a retry would repeat text already yielded.
         """
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()
         url, headers, payload = self._request([{"role": "user", "content": prompt}], system, True, False)
 
         def open_stream():
@@ -236,6 +239,9 @@ class HTTPChatClient(BaseLLMClient):
     def _call(self, messages: List[Message], system: str, prompt_text: str, json_mode: bool = False) -> str:
         """POST one request with rate limiting and retries, then record usage."""
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()  # parallel input guards decide before any model call
         url, headers, payload = self._request(messages, system, False, json_mode)
         body = retry_call(
             post_json,

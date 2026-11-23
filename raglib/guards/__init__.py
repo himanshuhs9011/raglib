@@ -41,6 +41,9 @@ from raglib.guards.base import (
     guard_scope,
     modify,
 )
+from raglib.guards.classifiers import GroundingGuard, InjectionClassifier, ModelGuard, TopicGuard, ToxicityClassifier
+from raglib.guards.models import RECOMMENDED_LOCAL_MODELS, ModerationClient
+from raglib.guards.parallel import GuardCancelled, ParallelInputGuards
 from raglib.guards.rules import (
     NOTHING_RELEVANT_THRESHOLDS,
     CitationAccessGuard,
@@ -135,18 +138,27 @@ __all__ = [
     "GuardContext",
     "GuardRunner",
     "GuardScope",
+    "GroundingGuard",
+    "GuardCancelled",
     "GuardSkippedWarning",
     "GuardStore",
     "InMemoryGuardStore",
     "StreamingOutput",
+    "InjectionClassifier",
     "InjectionHeuristic",
     "JSONSchemaGuard",
     "MaxOutputTokens",
     "MaxQuestionTokens",
+    "ModelGuard",
+    "ModerationClient",
     "NothingRelevant",
     "OutputLeakGuard",
     "PIIMasker",
+    "ParallelInputGuards",
+    "RECOMMENDED_LOCAL_MODELS",
     "ToolPolicy",
+    "TopicGuard",
+    "ToxicityClassifier",
     "UserDailyBudget",
     "UserRateLimit",
     "allow",

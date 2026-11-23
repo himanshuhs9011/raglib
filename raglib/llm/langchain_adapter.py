@@ -50,6 +50,9 @@ class LangChainAdapter(BaseLLMClient):
     def complete(self, prompt: str, system: str = "") -> str:
         """Execute a single prompt completion using LangChain message objects."""
 
+        from raglib.core.runtime import guard_join
+
+        guard_join()
         payload = self._build_payload(prompt=prompt, system=system)
         response = self._invoke_with_retry(payload)
         text = self._coerce_content(getattr(response, "content", response))

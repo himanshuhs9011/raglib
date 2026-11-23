@@ -27,9 +27,10 @@ class MockLLMClient(BaseLLMClient):
     def complete(self, prompt: str, system: str = "") -> str:
         """Return a deterministic completion keyed on the prompt's purpose (usage is estimated)."""
 
-        from raglib.core.runtime import record_usage
+        from raglib.core.runtime import guard_join, record_usage
         from raglib.core.text import count_tokens
 
+        guard_join()
         answer = self._respond(prompt, system)
         record_usage(count_tokens(f"{system}\n{prompt}"), count_tokens(answer), estimated=True, model="mock/mock")
         return answer
@@ -49,6 +50,18 @@ class MockLLMClient(BaseLLMClient):
         # ("chunking", "rewrite", ...), so recognise it first by its fixed final instruction.
         if "<sources>" in prompt and prompt.rstrip().endswith("answer with citations:"):
             return self._answer_response(prompt)
+        # Guard prompts quote user text and sources, so recognise them by their fixed opening first.
+        if lower.lstrip().startswith("you classify prompt-injection attempts"):
+            from raglib.core.prompt_safety import injection_signals
+
+            flagged = bool(injection_signals(prompt.split("Message:", 1)[-1]))
+            return json.dumps({"injection": flagged, "confidence": 0.9})
+        if lower.lstrip().startswith("you moderate content for toxicity"):
+            message = prompt.split("Message:", 1)[-1].lower()
+            toxic = any(word in message for word in ("idiot", "stupid", "hate you", "kill you"))
+            return json.dumps({"toxic": toxic, "confidence": 0.9})
+        if lower.lstrip().startswith("you check whether an answer is supported"):
+            return self._grounding(prompt)
         if "standalone question" in lower:
             return self._extract_query(prompt)
         if "grade each retrieved document" in lower:
@@ -129,6 +142,21 @@ class MockLLMClient(BaseLLMClient):
             overlap = len(query_terms & token_set(content)) / max(1, len(query_terms))
             grades.append("CORRECT" if overlap >= 0.5 else "AMBIGUOUS" if overlap > 0 else "INCORRECT")
         return json.dumps({"grades": grades})
+
+    def _grounding(self, prompt: str) -> str:
+        """Share of answer sentences whose words mostly appear in the sources (a lexical stand-in)."""
+
+        sources_text, _, answer = prompt.partition("Answer:")
+        sources = token_set(sources_text, remove_stopwords=True)
+        sentences = [s for s in re.split(r"(?<=[.!?])\s+", answer.split("Reply with JSON")[0]) if len(s.split()) >= 4]
+        if not sentences:
+            return json.dumps({"supported_fraction": 1.0, "unsupported": []})
+        unsupported = []
+        for sentence in sentences:
+            words = token_set(sentence, remove_stopwords=True)
+            if words and len(words & sources) / len(words) < 0.5:
+                unsupported.append(sentence.strip())
+        return json.dumps({"supported_fraction": 1 - len(unsupported) / len(sentences), "unsupported": unsupported})
 
     def _extract_graph(self, prompt: str) -> str:
         """Heuristic entity/relation extraction: capitalized phrases + sentence co-occurrence."""
