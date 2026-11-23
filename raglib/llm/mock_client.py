@@ -148,7 +148,7 @@ class MockLLMClient(BaseLLMClient):
 
         sources_text, _, answer = prompt.partition("Answer:")
         sources = token_set(sources_text, remove_stopwords=True)
-        sentences = [s for s in re.split(r"(?<=[.!?])\s+", answer.split("Reply with JSON")[0]) if len(s.split()) >= 4]
+        sentences = [s for s in re.split(r"(?<=[.!?])\s+", answer.split("Reply with exactly one JSON")[0]) if len(s.split()) >= 4]
         if not sentences:
             return json.dumps({"supported_fraction": 1.0, "unsupported": []})
         unsupported = []

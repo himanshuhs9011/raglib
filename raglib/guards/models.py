@@ -21,7 +21,6 @@ trace stage meta.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -163,13 +162,3 @@ def moderation_client(rag: Any) -> Optional[ModerationClient]:
     return ModerationClient(api_key=key) if key else None
 
 
-def ask_json(client: Any, prompt: str, default: Dict[str, Any]) -> Dict[str, Any]:
-    """``complete_json`` with a dict fallback (an unparseable reply counts as the default)."""
-
-    data = client.complete_json(prompt, default=default)
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except ValueError:
-            return default
-    return data if isinstance(data, dict) else default

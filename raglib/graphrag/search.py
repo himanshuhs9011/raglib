@@ -426,7 +426,7 @@ def inherited_access(search: Any, chunk_ids: Sequence[str]) -> Dict[str, Any]:
     for chunk_id in ids:
         chunk = lookup(chunk_id) if lookup is not None else None
         metadatas.append(dict(chunk.metadata) if chunk is not None else {})
-    return {**access.strictest(metadatas), "source_chunk_ids": ids[:MAX_LISTED_SOURCES]}
+    return {**access.strictest(metadatas), "source_chunk_ids": ids[:MAX_LISTED_SOURCES], "source_chunk_count": len(ids)}
 
 
 def _digest(text: str) -> str:

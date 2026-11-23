@@ -543,6 +543,11 @@ class CitationAccessGuard(Guard):
     global points) carry the strictest tags of the chunks they were built from
     (``AccessControl.strictest``), so they are checked the same way; a summary without tags is
     denied, like any untagged document.
+
+    ``summary_rule="all_sources"`` uses the more precise rule for summaries: visible when the user may
+    read *every* source chunk (looked up by ``source_chunk_ids``), so a user in two departments can
+    see a summary that mixes both. Summaries with more than 200 sources (ids not all listed) keep
+    the strictest-tags rule. The default ``"strictest"`` needs no chunk lookups.
     """
 
     name = "citation_access"
@@ -551,14 +556,32 @@ class CitationAccessGuard(Guard):
     stream_holdback = 8  # only whole "[123]" markers matter: streams with about one word of lag
     block_message = "The answer referenced a document you do not have access to, so it was withheld."
 
+    def __init__(self, summary_rule: str = "strictest", **kwargs: Any):
+        super().__init__(**kwargs)
+        if summary_rule not in {"strictest", "all_sources"}:
+            raise ValueError("summary_rule must be 'strictest' or 'all_sources'")
+        self.summary_rule = summary_rule
+
     def bind(self, rag: Any) -> None:
         self._access = getattr(rag, "_access", None)
+        retriever = getattr(rag, "_retriever", None)
+        self._chunk_lookup = getattr(retriever, "get", None)
 
     def _visible(self, document: Any, permission_filter: Mapping[str, Any]) -> bool:
         from raglib.vectorstores.base_store import matches_filter
 
         metadata = dict(getattr(document, "metadata", {}) or {})
         access = getattr(self, "_access", None)
+        ids = metadata.get("source_chunk_ids")
+        lookup = getattr(self, "_chunk_lookup", None)
+        if (
+            self.summary_rule == "all_sources" and ids and lookup is not None
+            and metadata.get("source_chunk_count", len(ids)) == len(ids)
+        ):
+            chunks = [lookup(chunk_id) for chunk_id in ids]
+            return all(
+                chunk is not None and self._visible(chunk, permission_filter) for chunk in chunks
+            )
         if access is not None:
             metadata = access.tag(metadata)  # re-derive the _acl_* keys from the access tags
         return matches_filter(metadata, permission_filter, array_contains=True)
