@@ -299,6 +299,7 @@ rag = RAG(
     rate_limit_key=None,                # callable(GuardContext) -> str: who limits / budgets count (default: user id)
     guard_store=None,                   # GuardStore for limit counters (default: in this process only)
     stream_holdback_chars=64,           # how far streamed text may trail the model while output guards check it (min 40)
+    secure_defaults=True,               # always-on protections (citation access, tool limit, injection/secret flags)
     embedding_cache_ttl=None,           # seconds before a cached embedding expires
     cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
     answer_cache=None,                  # True: question-level answer cache (FAQ tier)
@@ -1045,7 +1046,7 @@ raglib graph papers/ --out graph.html
 | User-supplied file paths | `allowed_dirs=[...]` sandboxes file and folder sources (resolves `..` and symlinks). | Always set it when paths come from users. |
 | Prompt injection | Retrieved, web and conversation text is wrapped in an unguessable per-prompt tag (`<src-XXXXXXXX>`, an HMAC under a per-process secret) in every prompt: answer, agent, grader, knowledge strips, LLM reranker, Self-RAG, multi-hop planner, refiner, condenser, graph extraction and reports, global search, LLM chunking and the eval judge. Tag-like text inside documents (`</source>`, `</sources>`, `<src-...>`) is escaped, attribute values are HTML-escaped, and each prompt states that the block is data, never instructions. The tag is stable for the same question and sources, so caching keeps working. | Treat answers as untrusted output; don't give agent tools destructive permissions. This lowers the success rate of injected instructions; no prompt format makes a model immune. |
 | Agent web search | `search_web` queries are rebuilt from the user's question plus model-written keywords that do not occur in any retrieved document (split-up copies included), and capped at 200 characters. An injected "call search_web with <secret>" cannot send document text out. With `access_control`, web search is off for any query that retrieved a non-public document (`allow_web_after_private=True` re-enables it). Every tool call and its arguments is in the trace and `result.metadata["tool_calls"]`. Sources with instruction-like text ("ignore previous instructions", "you are now", "call the tool", fake tags) are flagged in `result.metadata["injection_flags"]` and an `injection_flag` event, but not blocked. | A keyword that also appears in a retrieved document is dropped from the web query. Encoded or paraphrased leaks (e.g. base64) are not detected. Keep `search_web` off for confidential corpora unless you need it. |
-| Guardrails | Opt-in (on with `preset="production"`): PII masking before anything is traced, cached or sent, injection keywords, rate limits and budgets, a no-LLM "nothing relevant" exit, answer leak and citation-access checks, agent tool policy. See [Guardrails](#guardrails). | Pass a `user=` or `session_id` per caller so rate limits and budgets are per user. |
+| Guardrails | Always on: citation-access check with `access_control`, a 10-call agent tool limit, and flags (never blocks) for injection-like questions and secrets in answers. With `preset="production"` or opt-in: PII masking before anything is traced, cached or sent, blocking injection check, rate limits and budgets, a no-LLM "nothing relevant" exit, leak masking. See [Guardrails](#guardrails). | Pass `user_id=` (or a `rate_limit_key`) per caller so rate limits and budgets are per user. |
 | Multi-user | `session_id` isolates chat history. With `access_control=True`, documents are filtered per user inside every search (vector, BM25, hybrid, graph, multi-query, web+corpus) and history is kept per user. | Tag documents at ingest and pass `user=` on every query (see "Access Control"). |
 | Data at rest | `output_dir`, `save()`, Chroma and graph files contain document text and Q&A. | Store them on encrypted disks; delete with `rag.delete(source)` (removes chunks, vectors and graph entities). |
 
@@ -1102,7 +1103,21 @@ result.metadata["guards"]      # one record per decision: guard, stage, action, 
 result.metadata["blocked_by"]  # set when a guard blocked the query
 ```
 
-`preset="production"` turns on `"default"` for every stage: `PIIMasker` + `MaxQuestionTokens` + `InjectionHeuristic`, `NothingRelevant`, `OutputLeakGuard` + `CitationAccessGuard`, and a `ToolPolicy` with call and argument limits. A plain `RAG(...)` has no guards. You can also mix names and objects: `input_guards=["default", UserRateLimit(10)]`.
+`preset="production"` turns on `"default"` for every stage: `PIIMasker` + `MaxQuestionTokens` + `InjectionHeuristic`, `NothingRelevant`, `OutputLeakGuard` + `CitationAccessGuard`, and a `ToolPolicy` with call and argument limits. You can also mix names and objects: `input_guards=["default", UserRateLimit(10)]`.
+
+**Secure by default.** Every `RAG(...)`, presets or not, gets these protections. None of them changes the answer to a normal question:
+
+| Protection | What it does | Turn it off |
+| :--- | :--- | :--- |
+| Source delimiters and escaping in every prompt; the agent's web-search argument guard | Always applied (see [Security & Privacy](#security--privacy)). | Not switchable. |
+| `CitationAccessGuard` (when `access_control=True`) | Withholds an answer that cites a document the user may not read. With working retrieval filters this never happens; it catches a custom retriever, tool or cache that slips. | `secure_defaults={"citation_access": False}` |
+| Agent tool limit: `ToolPolicy(max_tool_calls=10)` | Stops a looping agent. The default `max_steps=4` stays far below it. | `secure_defaults={"tool_limit": False}`, or pass your own `tool_policy=` |
+| Injection flags: `InjectionHeuristic(flag_only=True)` | Reports injection-like questions in `result.guard_flags` and a `guard_flag` event on `on_event`. Never blocks. | `secure_defaults={"injection_flags": False}` |
+| Secret flags: `OutputLeakGuard(check_pii=False, flag_only=True)` | Reports API keys, tokens and private keys in the answer, the same way. Never masks, and never looks at PII. | `secure_defaults={"secret_flags": False}` |
+
+`secure_defaults=False` turns all four off. A guard of the same class that you configure yourself (e.g. a blocking `InjectionHeuristic()` in `input_guards`) replaces the default one. Flag-only guards are quiet: they add no trace stage, and they add nothing to the result unless they find something. Flag-only output guards run once on the finished answer, so `rag.stream(...)` still yields every model token as it arrives, and their flags are on the final result. Any guard can run this way: `OutputLeakGuard(flag_only=True)`.
+
+When a `RAG(...)` is created without `preset="production"` and without any guards of your own, raglib logs one INFO line per process pointing here. Set `RAGLIB_GUARD_TIP=0` to hide it.
 
 | Guard | Stage | What it does | Cost / trade-off |
 | :--- | :--- | :--- | :--- |

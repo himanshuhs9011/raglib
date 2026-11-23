@@ -536,23 +536,41 @@ class CitationAccessGuard(Guard):
     slip). A cited document the user may not read blocks the answer (security: fail closed).
     A marker pointing past the source list (``[7]`` with 3 sources) is stripped from the text.
     Streaming-safe: in ``rag.stream`` a block stops the stream at the offending piece.
+
+    A source's permission comes from its access tags (``access_level``, ``department``,
+    ``allowed_roles``), so copies of a chunk that lost the internal ``_acl_*`` keys (e.g. GraphRAG's
+    chunk view) are judged correctly. Derived context marked ``metadata["supplementary"]``
+    (GraphRAG entity / relation / community summaries) is built per user by the graph's own access
+    rules and has no tags of its own, so it is not re-checked here.
     """
 
     name = "citation_access"
     stages = ("output",)
     streaming_safe = True
+    stream_holdback = 8  # only whole "[123]" markers matter: streams with about one word of lag
     block_message = "The answer referenced a document you do not have access to, so it was withheld."
 
-    def check(self, value: str, context: GuardContext) -> Decision:
+    def bind(self, rag: Any) -> None:
+        self._access = getattr(rag, "_access", None)
+
+    def _visible(self, document: Any, permission_filter: Mapping[str, Any]) -> bool:
         from raglib.vectorstores.base_store import matches_filter
 
+        metadata = dict(getattr(document, "metadata", {}) or {})
+        if metadata.get("supplementary"):
+            return True
+        access = getattr(self, "_access", None)
+        if access is not None:
+            metadata = access.tag(metadata)  # re-derive the _acl_* keys from the access tags
+        return matches_filter(metadata, permission_filter, array_contains=True)
+
+    def check(self, value: str, context: GuardContext) -> Decision:
         sources = list(context.documents)
         cited = sorted({int(m.group(1)) for m in _CITATION_RE.finditer(value or "")})
         if context.permission_filter is not None:
             denied = [
                 n for n in cited
-                if 1 <= n <= len(sources)
-                and not matches_filter(getattr(sources[n - 1], "metadata", {}) or {}, context.permission_filter, array_contains=True)
+                if 1 <= n <= len(sources) and not self._visible(sources[n - 1], context.permission_filter)
             ]
             if denied:
                 return block(self.block_message, reason=f"cited inaccessible source(s) {denied}")

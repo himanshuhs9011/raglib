@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Security: secure by default.** Every `RAG(...)` now gets four protections. None of them changes the answer to a normal question: with them on, plain `RAG(...)` gives the same answers, sources and trace stages as before, and still streams token by token.
+- `CitationAccessGuard` whenever `access_control=True`. It withholds an answer that cites a document the user may not read, which only happens when a custom retriever, tool or cache slips past the retrieval filters. Turn off with `secure_defaults={"citation_access": False}`.
+- An agent tool limit, `ToolPolicy(max_tool_calls=10)`. It stops a looping agent; the default `max_steps=4` never reaches it. Turn off with `secure_defaults={"tool_limit": False}`, or pass your own `tool_policy=`.
+- Injection flags: `InjectionHeuristic(flag_only=True)` on the question. Turn off with `secure_defaults={"injection_flags": False}`.
+- Secret flags: `OutputLeakGuard(check_pii=False, flag_only=True)` on the answer, for API keys, tokens and private keys (never PII). Turn off with `secure_defaults={"secret_flags": False}`.
+- `secure_defaults=False` turns all four off. A guard of the same class that you configure yourself replaces the default one.
+
+Flag-only guards never block or modify. Their findings go to the new `result.guard_flags` and to a `guard_flag` event on `on_event`. They add no trace stage, and nothing at all when they find nothing. Flag-only output guards run once on the finished answer, so they never hold back a stream. Any guard accepts `flag_only=True`.
+
+Two protections were already unconditional and stay that way: source delimiters and escaping in every prompt, and the agent's web-search argument guard. A `RAG(...)` created without `preset="production"` and without guards of your own logs one INFO line per process pointing to the guardrails docs (hide it with `RAGLIB_GUARD_TIP=0`). `CitationAccessGuard` now judges a source by its access tags, so chunk copies without the internal `_acl_*` keys are handled. GraphRAG's derived summaries (`metadata["supplementary"]`) are not re-checked, because the graph filters them per user. PII masking, the "nothing relevant" exit, the question length limit and JSON schema checks stay in `preset="production"` or opt-in, and rate limits and budgets stay opt-in.
+
 **Guardrails, tier 0 (free rules).** New `raglib.guards` and `RAG(input_guards=..., retrieval_guards=..., output_guards=..., tool_policy=..., guard_cache_ttl=3600)`. Guards run cheapest tier first and stop at the first block. Each returns allow / block (with a user-facing message) / modify, plus a confidence. See README "Guardrails".
 - Input: `PIIMasker` (e-mail, phone, Aadhaar, PAN and card numbers, with checksums; it runs before the question reaches traces, `LatencyStats` tags, caches, memory or the LLM), `MaxQuestionTokens`, `UserRateLimit`, `UserDailyBudget` (priced like `CostReport`; skipped with a one-time `GuardSkippedWarning` without `prices=`), `InjectionHeuristic`.
 - Retrieval: `NothingRelevant` answers "I couldn't find this in the documents." without an LLM call when the best chunk is below a threshold. The default threshold depends on the score type: cosine 0.15, Cohere 0.02, cross-encoder logit -7.
@@ -9,7 +20,7 @@
 - Agent: `ToolPolicy`, with a tool allowlist per role, a cap on tool calls per question and argument limits.
 - Security guards fail closed and quality guards fail open; `fail_closed=` overrides this. Deterministic decisions are cached by input hash.
 - Every decision is in `result.metadata["guards"]` (plus `blocked_by` / `block_reason` on a block) and is traced as its own stage `guard.<name>`. Guard stages appear in `on_event`, `LatencyStats` (listed first; the `total` event has a new `blocked_by` run tag) and `CostReport` (each guard on its own line, $0 for tier 0).
-- `preset="production"` turns on the defaults for every stage. This preset is unreleased, so the change is not breaking. A plain `RAG(...)` is unchanged: no guards.
+- `preset="production"` turns on the defaults for every stage. This preset is unreleased, so the change is not breaking. A plain `RAG(...)` gets only the secure defaults (see "Security: secure by default").
 - With output guards, `stream()` yields the checked answer in one piece instead of token by token.
 - `BaseRAG.run` / `stream` accept optional `tracer=` / `meter=` to continue a caller's trace and usage, and `usage_scope(meter)` reuses an active meter without double counting.
 - An answer refused by a guard is not stored in the answer cache.

@@ -52,7 +52,10 @@ class StreamingOutput:
     def __init__(self, guards: Sequence[Guard], context: GuardContext, holdback: int = DEFAULT_STREAM_HOLDBACK):
         self.guards = sorted(guards, key=guard_sort_key)
         self.context = context
-        self.holdback = check_holdback(holdback)
+        configured = check_holdback(holdback)
+        # Only guards that look for secrets need the full window; citation checks need a few chars.
+        needs = [guard.stream_holdback if guard.stream_holdback is not None else configured for guard in self.guards]
+        self.holdback = max(needs) if needs else configured
         self.blocked: Optional[Decision] = None
         self.stopped = False  # True after a block or once MaxOutputTokens is exhausted
         self._pending = ""

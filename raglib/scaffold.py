@@ -187,6 +187,7 @@ rag = RAG(
     rate_limit_key=None,                   # callable(GuardContext) -> str: who a rate limit / budget counts (default: query(user_id=...))
     guard_store=None,                      # GuardStore for limit counters (default: in this process only)
     stream_holdback_chars=64,              # streamed text may trail the model this far while output guards check it (min 40)
+    secure_defaults=True,                  # always-on protections; e.g. {"injection_flags": False} turns one off
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back

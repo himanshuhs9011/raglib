@@ -62,6 +62,7 @@ from raglib.guards import (
     ToolPolicy,
     guard_scope,
 )
+from raglib.guards.defaults import guard_tip, secure_defaults_options, with_secure_defaults
 from raglib.llm.base_client import (
     BaseLLMClient,
     CachedLLMClient,
@@ -322,6 +323,7 @@ class RAG:
         rate_limit_key: Optional[Callable[[GuardContext], Optional[str]]] = None,
         guard_store: Optional[GuardStore] = None,
         stream_holdback_chars: int = 64,
+        secure_defaults: Union[bool, Mapping[str, bool]] = True,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -397,6 +399,12 @@ class RAG:
           process memory, so each worker process counts on its own.
         * ``stream_holdback_chars``: how far (in characters) streamed text may trail the model while
           streaming-safe output guards check it (default 64, minimum 40; see ``raglib.guards.streaming``).
+        * ``secure_defaults`` (on unless ``False``): protections added to every ``RAG`` that never
+          change a normal answer - ``"citation_access"`` (``CitationAccessGuard`` with access control),
+          ``"tool_limit"`` (agent: at most 10 tool calls per question), and flag-only
+          ``"injection_flags"`` (question) / ``"secret_flags"`` (secrets in the answer), reported in
+          ``result.guard_flags``. Turn one off with e.g. ``secure_defaults={"injection_flags": False}``.
+          A guard of the same kind that you configure yourself replaces the default one.
         """
 
         if top_k <= 0:
@@ -640,9 +648,17 @@ class RAG:
         self._stream_holdback = check_holdback(stream_holdback_chars)
         self._rate_limit_key = rate_limit_key
         self._guard_store: GuardStore = guard_store or InMemoryGuardStore()
-        self._guards: Optional[GuardConfig] = GuardConfig.build(
-            input_guards, retrieval_guards, output_guards, tool_policy, cache_ttl=guard_cache_ttl
+        self._secure_defaults = secure_defaults_options(secure_defaults)
+        inputs, retrievals, outputs, tool_policy = with_secure_defaults(
+            self._secure_defaults, access_control=self._access is not None,
+            input_guards=input_guards, retrieval_guards=retrieval_guards, output_guards=output_guards,
+            tool_policy=tool_policy,
         )
+        self._guards: Optional[GuardConfig] = GuardConfig.build(
+            inputs, retrievals, outputs, tool_policy, cache_ttl=guard_cache_ttl
+        )
+        if preset is None and input_guards is None and retrieval_guards is None and output_guards is None:
+            guard_tip()
         self._guard_signature: Optional[str] = None
         if self._guards is not None:
             self._guards.bind(self)
@@ -852,7 +868,9 @@ class RAG:
     def _attach_guards(result: GenerationResult, scope: GuardScope) -> None:
         """``result.metadata["guards"]``: every decision (no checked values); ``blocked_by`` if any."""
 
-        result.metadata["guards"] = [decision.summary() for decision in scope.decisions]
+        if scope.decisions:  # quiet flag-only guards that found nothing leave no record
+            result.metadata["guards"] = [decision.summary() for decision in scope.decisions]
+        result.guard_flags = [decision.summary() for decision in scope.decisions if decision.flag]
         blocking = next((d for d in scope.decisions if d.action == "block"), None)
         if blocking is not None:
             result.metadata["blocked_by"] = blocking.guard

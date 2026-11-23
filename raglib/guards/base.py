@@ -57,6 +57,8 @@ class Decision:
     cached: bool = False
     error: Optional[str] = None
     latency_ms: float = 0.0
+    # Flag-only guards: what the guard would have done ("block" / "modify"); the action stays "allow".
+    flag: Optional[str] = None
     # Request-private data (the PII placeholder map): never traced, cached, logged or returned.
     private: Any = field(default=None, repr=False, compare=False)
 
@@ -118,12 +120,20 @@ class Guard:
     stages: Tuple[str, ...] = ("input",)
     cacheable = False
     streaming_safe = False
+    # Characters a streaming-safe guard needs held back (None = RAG(stream_holdback_chars=...)).
+    stream_holdback: Optional[int] = None
     block_message = "This request was blocked by a safety check."
 
-    def __init__(self, fail_closed: Optional[bool] = None, message: Optional[str] = None):
-        """``fail_closed`` overrides the kind default; ``message`` overrides the user-facing block message."""
+    def __init__(self, fail_closed: Optional[bool] = None, message: Optional[str] = None, flag_only: bool = False):
+        """``fail_closed`` overrides the kind default; ``message`` overrides the user-facing block message.
+
+        ``flag_only=True``: never block or modify; what the guard would have done is reported in
+        ``result.guard_flags`` and as a ``guard_flag`` event on ``on_event``. Flag-only output
+        guards run once on the finished answer, so they never hold back a stream.
+        """
 
         self._fail_closed = fail_closed
+        self.flag_only = flag_only
         if message is not None:
             self.block_message = message
 
@@ -215,7 +225,8 @@ class GuardRunner:
         decisions: List[Decision] = []
         for guard in sorted((g for g in guards if stage in g.stages), key=guard_sort_key):
             decision = self._check(guard, stage, value, context)
-            decisions.append(decision)
+            if decision.flag or not guard.flag_only:
+                decisions.append(decision)  # a flag-only guard that found nothing leaves no record
             if decision.action == MODIFY:
                 value = decision.value
                 if stage == "input" and isinstance(value, str):
@@ -225,6 +236,14 @@ class GuardRunner:
         return value, decisions, None
 
     def _check(self, guard: Guard, stage: str, value: Any, context: GuardContext) -> Decision:
+        if guard.flag_only:
+            # Flag-only guards are quiet: no trace stage, no cache; a finding becomes an on_event notice.
+            started = time.perf_counter()
+            decision = run_guarded(guard, lambda: guard.check(value, context), value)
+            decision.guard, decision.stage = guard.name, stage
+            decision.latency_ms = round((time.perf_counter() - started) * 1000, 3)
+            _report_flag(decision)
+            return decision
         key = None
         if self.cache is not None and guard.cacheable:
             raw = json.dumps([guard.name, stage, _fingerprint(value), guard.cache_scope(context)], default=str)
@@ -234,6 +253,7 @@ class GuardRunner:
                 decision = replace(cached, cached=True, latency_ms=0.0)
                 with trace_stage(f"guard.{guard.name}", **_meta(decision)):
                     pass
+                _report_flag(decision)
                 return decision
         started = time.perf_counter()
         with trace_stage(f"guard.{guard.name}", stage=stage, tier=guard.tier) as meta:
@@ -243,7 +263,23 @@ class GuardRunner:
             meta.update(_meta(decision))
         if key is not None and decision.error is None:
             self.cache.set(key, replace(decision, private=None))
+        _report_flag(decision)
         return decision
+
+
+def _report_flag(decision: Decision) -> None:
+    """A flag-only guard's finding as an ``on_event`` notice (``stage="guard_flag"``)."""
+
+    if not decision.flag:
+        return
+    from raglib.core.tracing import current_tracer
+
+    tracer = current_tracer()
+    if tracer is not None:
+        tracer.notice(
+            "guard_flag", guard=decision.guard, guard_stage=decision.stage, would=decision.flag,
+            reason=decision.reason, confidence=round(decision.confidence, 3),
+        )
 
 
 def run_guarded(guard: Guard, call: Any, raw: Any) -> Decision:
@@ -265,6 +301,8 @@ def run_guarded(guard: Guard, call: Any, raw: Any) -> Decision:
     decision.reason = sanitize(decision.reason, raw) or ""
     if decision.action == BLOCK:
         decision.message = sanitize(decision.message or guard.block_message, raw)
+    if getattr(guard, "flag_only", False) and decision.action in (BLOCK, MODIFY):
+        decision.flag, decision.action, decision.value, decision.private = decision.action, ALLOW, None, None
     return decision
 
 
@@ -283,6 +321,7 @@ def _meta(decision: Decision) -> Dict[str, Any]:
         "confidence": round(decision.confidence, 3),
         "cached": decision.cached,
         "reason": decision.reason,
+        **({"flag": decision.flag} if decision.flag else {}),
         **({"error": decision.error} if decision.error else {}),
     }
 

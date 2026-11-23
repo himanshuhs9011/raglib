@@ -79,3 +79,6 @@ class GenerationResult:
     trace_events: List[TraceEvent] = field(default_factory=list)
     usage: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Findings of flag-only guards (e.g. an injection-like question, a secret in the answer): they
+    # never changed the answer. Each entry is a guard decision with ``flag`` = what it would have done.
+    guard_flags: List[Dict[str, Any]] = field(default_factory=list)

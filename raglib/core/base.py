@@ -241,7 +241,9 @@ class BaseRAG:
         from raglib.guards.streaming import StreamingOutput, stream_context, streaming_mode
 
         scope = current_scope()
-        mode = streaming_mode(scope.output_guards if scope is not None else ())
+        # Flag-only guards run once on the finished answer (in _finish), so they never hold the stream.
+        enforcing = [guard for guard in scope.output_guards if not guard.flag_only] if scope is not None else []
+        mode = streaming_mode(enforcing)
         buffered = mode == "buffered"
         tracer = tracer or Tracer(on_event=self.on_event)
         with run_scope(self.strict) as state, usage_scope(meter) as meter, active_tracer(tracer):
@@ -259,7 +261,7 @@ class BaseRAG:
                 context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
                 monitor = (
                     StreamingOutput(
-                        scope.output_guards, stream_context(scope.context, ctx.query, context_docs), holdback=scope.stream_holdback
+                        enforcing, stream_context(scope.context, ctx.query, context_docs), holdback=scope.stream_holdback
                     )
                     if mode == "incremental" and scope is not None
                     else None
@@ -438,10 +440,13 @@ class BaseRAG:
         from raglib.guards.base import current_scope
 
         scope = current_scope()
-        if scope is None or not scope.output_guards or ctx.output_checked or ctx.metadata.get("blocked_by"):
+        if scope is None or not scope.output_guards or ctx.metadata.get("blocked_by"):
+            return result
+        guards = [guard for guard in scope.output_guards if guard.flag_only] if ctx.output_checked else list(scope.output_guards)
+        if not guards:
             return result
         answer, blocked = scope.run(
-            "output", scope.output_guards, result.answer, question=ctx.query, documents=list(result.sources), result=result
+            "output", guards, result.answer, question=ctx.query, documents=list(result.sources), result=result
         )
         if blocked is not None:
             ctx.metadata["blocked_by"] = blocked.guard
