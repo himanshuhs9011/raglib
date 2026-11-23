@@ -110,8 +110,8 @@ def test_ingest_usage_counts_embedding_tokens_and_cost() -> None:
 
 def test_cohere_rerank_and_web_search_calls_are_billable_searches(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeCohere:
-        def __init__(self, api_key: str) -> None:
-            pass
+        def __init__(self, api_key: str, timeout: float = None) -> None:
+            self.timeout = timeout
 
         def rerank(self, model: str, query: str, documents: List[str]):
             return types.SimpleNamespace(

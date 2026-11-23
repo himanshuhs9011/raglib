@@ -47,6 +47,8 @@ class Reranker:
         max_chars_per_doc: int = 1500,
         skip_threshold: Optional[float] = None,
         skip_margin: Optional[float] = None,
+        timeout: float = 10.0,
+        max_retries: int = 2,
     ):
         """Configure the reranking backend.
 
@@ -80,6 +82,11 @@ class Reranker:
         self.max_chars_per_doc = max_chars_per_doc
         self.skip_threshold = skip_threshold
         self.skip_margin = skip_margin
+        # API rerankers (Cohere): per-request timeout and retries for transient errors. When they are
+        # exhausted the query keeps the first-stage order and the failure is listed in
+        # result.metadata["degraded"] (or raised with strict=True).
+        self.timeout = timeout
+        self.max_retries = max(0, max_retries)
 
     @staticmethod
     def confidence(documents: Sequence[Document]) -> Optional[Tuple[float, Optional[float]]]:
@@ -183,8 +190,17 @@ class Reranker:
         api_key = self.api_key or os.getenv("COHERE_API_KEY") or os.getenv("CO_API_KEY")
         if not api_key:
             raise ValueError("cohere reranker requires api_key or COHERE_API_KEY")
-        client = cohere.ClientV2(api_key=api_key)
-        response = client.rerank(model=self.model_name or DEFAULT_COHERE_MODEL, query=query, documents=list(texts))
+        from raglib.llm.resilience import retry_call
+
+        client = cohere.ClientV2(api_key=api_key, timeout=self.timeout)
+        response = retry_call(
+            client.rerank,
+            model=self.model_name or DEFAULT_COHERE_MODEL,
+            query=query,
+            documents=list(texts),
+            max_retries=self.max_retries,
+            label="reranker:cohere",
+        )
         from raglib.core.runtime import record_search_usage
 
         # Cohere bills "search units": one query over up to 100 documents.

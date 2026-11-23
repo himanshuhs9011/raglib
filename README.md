@@ -281,7 +281,12 @@ rag = RAG(
     rerank_candidates=None,             # chunks retrieved for the reranker to cut to top_k
     rerank_skip_threshold=None,         # skip the reranker when the top hit's cosine similarity is >= this
     rerank_skip_margin=None,            # ...and at least this far above the runner-up
-    llm_cache_ttl=None,                 # seconds before a cached LLM response expires
+    llm_cache_ttl=86400,                # seconds before a cached LLM response expires (24 h; None = never)
+    embedding_timeout=None,             # seconds per embedding API request (raglib-built models)
+    reranker_timeout=10.0,              # seconds per Cohere rerank request (then first-stage order + warning)
+    embedding_max_tokens=None,          # embedding model input limit (default: known per model)
+    oversized_chunks="split",           # chunk longer than the embedding model reads: "split" | "raise"
+    allow_web_after_private=False,      # agent web search after retrieving non-public documents
     embedding_cache_ttl=None,           # seconds before a cached embedding expires
     cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
     answer_cache=None,                  # True: question-level answer cache (FAQ tier)
@@ -873,6 +878,7 @@ rag.on_document_update(doc_ids=["policy.md"])   # a document changed elsewhere
 rag.invalidate("policy.md"); rag.invalidate_all()
 ```
 
+- **Caches and invalidation are per process for now.** The LLM cache, embedding cache and answer cache live in the memory of one Python process, and `invalidate()` / `on_document_update()` / `delete()` only reach that process. With several workers or servers, each keeps its own caches: an update made through one worker does not clear the others, which keep serving cached answers until their TTL (24 h for the LLM cache by default). Until a shared backend (e.g. Redis) exists, run ingestion and queries in one process, call `on_document_update()` on every worker, or lower `llm_cache_ttl`.
 - Every document has a version (a hash of its content and permissions). A cached answer is served only while the versions of all its sources are unchanged. Re-ingesting a changed document also drops the LLM responses and vectors built from it.
 - **Public tier only:** a query with `user=` or `filters=` never reads or writes the LLM cache or the answer cache, unless you pass `cache_personalized=True`.
 - `prompt_caching=True` sends Anthropic `cache_control` on the system prompt. It does nothing for other providers, which cache automatically or not at all.
@@ -1061,7 +1067,7 @@ rag.query("Holiday policy?")                                # anonymous: "public
 
 ## Scaling & Concurrency
 
-- **Many users at once:** one `RAG` instance is thread-safe. Queries run in parallel (read lock) while `add` / `delete` take a short write lock. Embedding calls happen outside the lock. Give every chat window its own `session_id`. Tested with 16 concurrent sessions plus a writer thread: 0 errors, 0 history leaks.
+- **Many users at once:** one `RAG` instance is thread-safe. Queries run in parallel (read lock) while `add` / `delete` take a short write lock. Embedding calls happen outside the lock. Give every chat window its own `session_id`. Tested with 16 concurrent sessions plus a writer thread: 0 errors, 0 history leaks. Caches, rate limits and invalidation are per process (see "Caching").
 - **Large collections:** `rag.add("folder/", batch_size=256, on_progress=print)` streams files in batches, embeds up to 4 batches concurrently, and keeps everything indexed so far if a run fails. Re-running resumes, skipping unchanged documents.
 - **Memory:** the in-memory store keeps float32 vectors (about 1 GB of RAM per 30,000 chunks of 1536-dim embeddings including the keyword index and text). Above roughly 100,000 chunks use `vector_db="chroma"` with a persist directory or server, or another dedicated vector database.
 - **GraphRAG cost:** one LLM call per chunk at ingestion (parallel, cached), so for very large corpora start with `rag_type="advanced"` and enable the graph for the subset that needs relationship questions.

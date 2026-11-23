@@ -279,7 +279,7 @@ class RAG:
         rerank_candidates: Optional[int] = None,
         rerank_skip_threshold: Optional[float] = None,
         rerank_skip_margin: Optional[float] = None,
-        llm_cache_ttl: Optional[float] = None,
+        llm_cache_ttl: Optional[float] = 24 * 3600.0,
         embedding_cache_ttl: Optional[float] = None,
         cache_personalized: bool = False,
         answer_cache: Union[bool, AnswerCache, None] = None,
@@ -302,6 +302,8 @@ class RAG:
         allow_web_after_private: bool = False,
         embedding_max_tokens: Optional[int] = None,
         oversized_chunks: str = "split",
+        embedding_timeout: Optional[float] = None,
+        reranker_timeout: float = 10.0,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -337,7 +339,10 @@ class RAG:
 
         * ``rerank_skip_threshold`` / ``rerank_skip_margin``: skip the reranker when the top hit's
           dense cosine similarity is already this high (see ``Reranker``).
-        * ``llm_cache_ttl`` / ``embedding_cache_ttl``: seconds before cached LLM responses / vectors expire.
+        * ``llm_cache_ttl`` (default 24 h) / ``embedding_cache_ttl``: seconds before cached LLM responses /
+          vectors expire. All caches, and their invalidation, are per process for now.
+        * ``embedding_timeout``: seconds per embedding API request (models raglib builds);
+          ``reranker_timeout``: seconds per Cohere rerank request (default 10).
         * ``cache_personalized=False``: LLM and answer caches are skipped for queries with a ``user``
           or caller ``filters`` (only the public tier is cached).
         * ``answer_cache``: question-level answer cache (FAQ tier); on by default with tier routing.
@@ -410,6 +415,7 @@ class RAG:
         self._prices: Optional[PriceTable] = PriceTable.coerce(prices)
         self._ingest_meter = UsageMeter()
 
+        self._embedding_timeout = embedding_timeout
         self._embedding = self._resolve_embedding(
             embedding_llm=embedding_llm,
             api_key=embedding_api_key,
@@ -538,6 +544,8 @@ class RAG:
             api_key=reranker_api_key,
             skip_threshold=rerank_skip_threshold,
             skip_margin=rerank_skip_margin,
+            timeout=reranker_timeout,
+            max_retries=llm_max_retries,
         )
         self._conversations = conversation_store or ConversationStore(
             max_turns=max_history_turns, max_tokens=max_history_tokens
@@ -1477,7 +1485,10 @@ class RAG:
         """
 
         if isinstance(embedding_llm, BaseEmbedding):
-            return embedding_llm if isinstance(embedding_llm, CachedEmbedding) else CachedEmbedding(embedding_llm)
+            if isinstance(embedding_llm, CachedEmbedding):
+                return embedding_llm
+            # Your own model gets the same retry policy as the LLM (llm_max_retries).
+            return CachedEmbedding(embedding_llm, max_retries=self._llm_max_retries)
 
         if embedding_llm is None:
             chat_spec = PROVIDERS.get(chat_provider or "")
@@ -1509,7 +1520,10 @@ class RAG:
         if provider in {"none", "bm25", "sparse"}:
             return None
         if provider in {"mock", "huggingface", "free", "local"}:
-            return CachedEmbedding(EmbeddingFactory.build(provider=provider, model_name=model_name, base_url=base_url))
+            return CachedEmbedding(
+                EmbeddingFactory.build(provider=provider, model_name=model_name, base_url=base_url, timeout=self._embedding_timeout),
+                max_retries=self._llm_max_retries,
+            )
         if provider in PROVIDERS and PROVIDERS[provider].custom and PROVIDERS[provider].protocol == "anthropic":
             raise ValueError(
                 f"Provider '{provider}' uses the Anthropic API, which has no embeddings endpoint; "
@@ -1545,9 +1559,12 @@ class RAG:
                 headers=spec.resolve_headers(),
                 input_types=spec.embedding_input_types,
                 extra_params=spec.embedding_params,
+                timeout=self._embedding_timeout,
             )
         elif provider in {"openai", "google", "ollama"}:
-            embedding = EmbeddingFactory.build(provider=provider, api_key=key, model_name=resolved_model, base_url=base_url)
+            embedding = EmbeddingFactory.build(
+                provider=provider, api_key=key, model_name=resolved_model, base_url=base_url, timeout=self._embedding_timeout
+            )
         else:
             if not resolved_model:
                 raise ValueError(
@@ -1561,6 +1578,7 @@ class RAG:
                 base_url=spec.resolve_base_url(base_url),
                 input_types=spec.embedding_input_types,
                 extra_params=spec.embedding_params,
+                timeout=self._embedding_timeout,
             )
         return CachedEmbedding(embedding, max_retries=getattr(self, "_llm_max_retries", 2), rate_limiter=limiter)
 

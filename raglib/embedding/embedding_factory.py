@@ -27,12 +27,16 @@ class EmbeddingFactory:
         headers: Optional[Dict[str, str]] = None,
         input_types: Optional[Sequence[str]] = None,
         extra_params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> BaseEmbedding:
         """Return the configured embedding implementation for a provider name.
 
         ``headers`` are extra HTTP headers (custom providers) for the OpenAI-style and Google APIs;
         ``input_types`` / ``extra_params`` are passed to OpenAI-style embeddings (see ``OpenAIEmbedding``).
+        ``timeout`` (seconds per request) applies to the HTTP embedding APIs.
         """
+
+        http = {"timeout": timeout} if timeout is not None else {}
 
         provider_name = (provider or "mock").strip().lower()
 
@@ -46,7 +50,7 @@ class EmbeddingFactory:
 
         if provider_name == "openai":
             logger.info("EmbeddingFactory selected provider='openai'")
-            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url)
+            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, **http)
 
         if provider_name == "openai_compatible":
             if not base_url or not model_name:
@@ -60,19 +64,20 @@ class EmbeddingFactory:
                 extra_headers=headers,
                 input_types=input_types,
                 extra_params=extra_params,
+                **http,
             )
 
         if provider_name == "azure":
             if not base_url or not model_name:
                 raise ValueError("Azure embeddings require the endpoint (base_url / AZURE_OPENAI_ENDPOINT) and deployment")
-            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, azure=True)
+            return OpenAIEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, azure=True, **http)
 
         if provider_name == "google":
             logger.info("EmbeddingFactory selected provider='google'")
-            return GoogleEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, extra_headers=headers)
+            return GoogleEmbedding(api_key=api_key, model_name=model_name, base_url=base_url, extra_headers=headers, **http)
 
         if provider_name == "ollama":
             logger.info("EmbeddingFactory selected provider='ollama'")
-            return OllamaEmbedding(model_name=model_name, base_url=base_url)
+            return OllamaEmbedding(model_name=model_name, base_url=base_url, **http)
 
         raise ValueError(f"Unknown embedding provider '{provider_name}'.")

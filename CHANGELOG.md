@@ -87,6 +87,12 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 - OpenAI inputs are checked before the API call.
 - New `BaseEmbedding.max_input_tokens` / `count_input_tokens()`.
 
+**Reliability fixes.**
+- The Cohere reranker has a request timeout (`reranker_timeout`, default 10 s) and the same retries as LLM calls. After the retries it keeps the first-stage order and records the failure in `result.metadata["degraded"]`.
+- Embedding models you pass yourself now get `llm_max_retries` instead of the default 2. New `embedding_timeout` for the embedding APIs raglib builds.
+- **Behaviour change:** the LLM response cache now expires after 24 hours by default (`llm_cache_ttl=86400`). Before, entries never expired. `llm_cache_ttl=None` keeps the old behaviour.
+- The README states that caches, rate limits and invalidation are per process.
+
 **Other changes (not breaking):**
 - New optional parameters: `RAG(access_control=)`, `query/aquery/stream(user=)`, `add(access=, metadata=)`, `reset_memory(user=)`. New `rag.permission_filter(user)`.
 - `GraphRetriever.retrieve`, `LocalSearch.search`, `GlobalSearch.search` and `WebRetriever.retrieve` accept `filters=`. `GlobalSearch` takes an optional `chunk_lookup`, which it needs to serve filtered queries.

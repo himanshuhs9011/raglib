@@ -81,6 +81,7 @@ rag = RAG(
     embedding_api_key=<<EMBEDDING_KEY>>,
     embedding_model=None,                  # e.g. "text-embedding-3-large"
     embedding_base_url=None,
+    embedding_timeout=None,                # seconds per embedding API request (None = the client default, 60 s)
     embedding_max_tokens=None,             # model input limit (default: known per model, e.g. bge 512, OpenAI 8191)
     oversized_chunks=<<OVERSIZED>>,               # chunk longer than the model reads: "raise" | "split" (never silently truncated)
 
@@ -127,12 +128,13 @@ rag = RAG(
     reranker_model=None,                   # default cross-encoder: BAAI/bge-reranker-base
     reranker_api_key=None,                 # os.getenv("COHERE_API_KEY") for reranker="cohere"
     rerank_candidates=<<RERANK_CANDIDATES>>,                 # chunks retrieved for the reranker, which keeps the best top_k
+    reranker_timeout=10.0,                 # seconds per Cohere rerank request; on failure: first-stage order + warning
     rerank_skip_threshold=None,            # e.g. 0.9: skip reranking when the top hit's cosine similarity is that high
     rerank_skip_margin=None,               # e.g. 0.1: ...and that far above the runner-up (calibrate on an eval set)
 
     # ---------------------------------------------------------------- caching
     embedding_cache_ttl=<<EMBEDDING_TTL>>,               # seconds a cached embedding is reused (None = until evicted)
-    llm_cache_ttl=None,                    # seconds a cached LLM response is reused (keys include the sources, so no stale hits)
+    llm_cache_ttl=86400.0,                 # seconds a cached LLM response is reused (24 h; caches are per process)
     cache_personalized=False,              # False: never cache answers of queries with user= or filters= (public tier only)
     answer_cache=None,                     # True: cache whole answers per question (FAQ tier; dropped when a source changes)
     prompt_caching=False,                  # True: Anthropic cache_control on the system prompt (no-op for other providers)
