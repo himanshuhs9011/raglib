@@ -8,12 +8,16 @@ answer (``output``) or a tool call (``tool``) - and returns a ``Decision``:
 * ``modify`` - continue with ``value`` (e.g. the question with PII masked).
 
 Tiers order the work by cost: tier 0 rules (free), tier 1 cheap checks, tier 2 LLM judge. The
-runner sorts guards by tier, stops at the first block, caches decisions of ``cacheable`` guards by
+runner sorts guards by ``(tier, order)`` - PII masking has ``order=-1``, so no other guard ever
+sees the raw question - stops at the first block, caches decisions of ``cacheable`` guards by
 input hash, and traces every guard as its own stage ``guard.<name>`` (so it shows up in the trace,
 ``on_event``, ``LatencyStats`` and - when it calls a model - ``CostReport``).
 
 Failure policy: a guard that raises is *fail closed* (blocks) when ``kind="security"`` and
 *fail open* (allows, error recorded) when ``kind="quality"``; ``fail_closed=`` overrides it.
+
+Nothing a guard reports (message, reason, error, log line) can carry the checked text: the runner
+removes the raw value from it and masks PII and secrets before it is traced, logged or returned.
 """
 
 from __future__ import annotations
@@ -21,11 +25,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from raglib.cache import TTLCache
 from raglib.core.tracing import trace_stage
@@ -52,12 +57,15 @@ class Decision:
     cached: bool = False
     error: Optional[str] = None
     latency_ms: float = 0.0
+    # Request-private data (the PII placeholder map): never traced, cached, logged or returned.
+    private: Any = field(default=None, repr=False, compare=False)
 
     def summary(self) -> Dict[str, Any]:
-        """JSON-safe record for ``result.metadata["guards"]`` (no checked values)."""
+        """JSON-safe record for ``result.metadata["guards"]`` (no checked values, nothing private)."""
 
-        info = asdict(self)
+        info = asdict(replace(self, value=None, private=None))
         info.pop("value", None)
+        info.pop("private", None)
         return info
 
 
@@ -80,7 +88,11 @@ class GuardContext:
     stage: str = "input"
     question: str = ""
     user: Any = None  # raglib.access.UserContext or None
-    user_key: str = "anonymous"  # rate limits and budgets are kept per user_key
+    # Identity for rate limits and budgets: RAG(rate_limit_key=fn), else the user id; None = anonymous.
+    user_key: Optional[str] = None
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    request: Mapping[str, Any] = field(default_factory=dict)  # query(..., request={"ip": ..., "tenant": ...})
     filters: Optional[Dict[str, Any]] = None
     permission_filter: Optional[Dict[str, Any]] = None  # the user's access-control filter (None = off)
     documents: Sequence[Any] = ()
@@ -95,13 +107,17 @@ class Guard:
 
     ``cacheable=True`` means the decision depends only on the checked value (and ``cache_scope``),
     so the runner may reuse it for the same input within ``RAG(guard_cache_ttl=...)``.
+    ``streaming_safe=True`` (output guards) means the guard can check an answer piece by piece
+    (``check_stream``), so ``rag.stream`` keeps streaming; otherwise the answer is buffered.
     """
 
     name = "guard"
     tier = 0
+    order = 0  # within a tier, lower runs first
     kind = "security"  # "security" guards fail closed, "quality" guards fail open
     stages: Tuple[str, ...] = ("input",)
     cacheable = False
+    streaming_safe = False
     block_message = "This request was blocked by a safety check."
 
     def __init__(self, fail_closed: Optional[bool] = None, message: Optional[str] = None):
@@ -118,16 +134,71 @@ class Guard:
     def check(self, value: Any, context: GuardContext) -> Decision:
         raise NotImplementedError
 
+    def check_stream(self, chunk: str, context: GuardContext, state: Dict[str, Any]) -> Decision:
+        """Check one released piece of a streamed answer (``state`` persists for the whole stream)."""
+
+        return self.check(chunk, context)
+
     def cache_scope(self, context: GuardContext) -> str:
         """Extra cache-key material besides the value (e.g. the user's permissions)."""
 
         return ""
 
     def bind(self, rag: Any) -> None:
-        """Called once by ``RAG`` (e.g. to pick up its price table or models)."""
+        """Called once by ``RAG`` (e.g. to pick up its price table, store or models)."""
 
     def after(self, result: Any, context: GuardContext) -> None:
         """Called after the query finished (stateful guards: budgets)."""
+
+    def config(self) -> Dict[str, Any]:
+        """The guard's settings (public attributes), for the configuration hash of the answer cache."""
+
+        settings = {key: _plain(value) for key, value in sorted(vars(self).items()) if not key.startswith("_")}
+        return {
+            "type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "name": self.name,
+            "tier": self.tier,
+            "fail_closed": self.fail_closed,
+            "message": self.block_message,
+            **settings,
+        }
+
+
+def _plain(value: Any) -> Any:
+    """A stable, JSON-able description of a setting (objects by type, functions by name)."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(_plain(v)) for v in value)
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, re.Pattern):
+        return value.pattern
+    if callable(value) and hasattr(value, "__qualname__"):
+        return f"{getattr(value, '__module__', '')}.{value.__qualname__}"
+    return type(value).__qualname__
+
+
+def sanitize(text: Optional[str], raw: Any = None) -> Optional[str]:
+    """``text`` without the raw checked value and with PII / secrets masked (safe to trace and log)."""
+
+    if not text:
+        return text
+    from raglib.guards.pii import redact
+
+    values: List[str] = []
+    if isinstance(raw, str):
+        values.append(raw)
+    elif isinstance(raw, (list, tuple)):
+        values.extend(item for item in raw if isinstance(item, str))
+    return redact(text, *values)
+
+
+def guard_sort_key(guard: Guard) -> Tuple[int, int]:
+    return guard.tier, guard.order
 
 
 class GuardRunner:
@@ -142,11 +213,13 @@ class GuardRunner:
         """``(possibly modified value, decisions, the blocking decision or None)``."""
 
         decisions: List[Decision] = []
-        for guard in sorted((g for g in guards if stage in g.stages), key=lambda g: g.tier):
+        for guard in sorted((g for g in guards if stage in g.stages), key=guard_sort_key):
             decision = self._check(guard, stage, value, context)
             decisions.append(decision)
             if decision.action == MODIFY:
                 value = decision.value
+                if stage == "input" and isinstance(value, str):
+                    context = replace(context, question=value)  # later guards see the masked question only
             elif decision.action == BLOCK:
                 return value, decisions, decision
         return value, decisions, None
@@ -164,24 +237,35 @@ class GuardRunner:
                 return decision
         started = time.perf_counter()
         with trace_stage(f"guard.{guard.name}", stage=stage, tier=guard.tier) as meta:
-            try:
-                decision = guard.check(value, context)
-            except Exception as exc:  # noqa: BLE001 - the failure policy decides
-                logger.warning("Guard %s failed (%s: %s)", guard.name, type(exc).__name__, exc)
-                decision = (
-                    block("This request could not be checked safely. Please try again.", reason="guard error")
-                    if guard.fail_closed
-                    else allow(reason="guard error (fail open)")
-                )
-                decision.error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            decision = run_guarded(guard, lambda: guard.check(value, context), value)
             decision.guard, decision.stage = guard.name, stage
-            if decision.tier == 0 and guard.tier:
-                decision.tier = guard.tier
             decision.latency_ms = round((time.perf_counter() - started) * 1000, 3)
             meta.update(_meta(decision))
         if key is not None and decision.error is None:
-            self.cache.set(key, decision)
+            self.cache.set(key, replace(decision, private=None))
         return decision
+
+
+def run_guarded(guard: Guard, call: Any, raw: Any) -> Decision:
+    """Call a guard with the failure policy applied and its texts sanitized."""
+
+    try:
+        decision = call()
+    except Exception as exc:  # noqa: BLE001 - the failure policy decides
+        error = sanitize(f"{type(exc).__name__}: {str(exc)[:200]}", raw)
+        logger.warning("Guard %s failed (%s)", guard.name, error)
+        decision = (
+            block("This request could not be checked safely. Please try again.", reason="guard error")
+            if guard.fail_closed
+            else allow(reason="guard error (fail open)")
+        )
+        decision.error = error
+    if decision.tier == 0 and guard.tier:
+        decision.tier = guard.tier
+    decision.reason = sanitize(decision.reason, raw) or ""
+    if decision.action == BLOCK:
+        decision.message = sanitize(decision.message or guard.block_message, raw)
+    return decision
 
 
 def _fingerprint(value: Any) -> str:

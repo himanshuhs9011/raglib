@@ -13,6 +13,13 @@
 - With output guards, `stream()` yields the checked answer in one piece instead of token by token.
 - `BaseRAG.run` / `stream` accept optional `tracer=` / `meter=` to continue a caller's trace and usage, and `usage_scope(meter)` reuses an active meter without double counting.
 - An answer refused by a guard is not stored in the answer cache.
+- PII masking is reversible: typed placeholders (`<EMAIL_1>`), a per-request map that is never traced, logged or cached, and the real values restored in the answer returned to the caller (`PIIMasker(restore=True)`). Stored copies (caches, memory, `output_dir`, traces) keep the placeholders. `PIIMasker` always runs before every other guard.
+- The default PII set is e-mail, card (Luhn), Aadhaar (Verhoeff, consistent separators) and PAN (strict format). Phone numbers are opt-in (`phone=True`). Every number pattern is bounded, so order ids, invoice numbers, dates, prices and version numbers are not masked.
+- Streaming with output guards: guards declare `streaming_safe`, and the safe ones (leak masking, citation access, truncation) check the answer piece by piece, so `stream()` keeps streaming, the production preset included. Pieces are released per sentence, with a 64-character hold-back that never cuts through a secret, card number, citation or placeholder. Only non-streaming-safe guards (`JSONSchemaGuard`) buffer the whole answer.
+- Rate-limit and budget identity: `RAG(rate_limit_key=fn)`, `query(..., user_id=..., request={...})` (no access control needed), a per-guard `key=`, and `anonymous_policy="skip" | "shared" | "block"` (default `"skip"`). A `session_id` alone no longer counts as an identity. Counters go through a pluggable `GuardStore` (`RAG(guard_store=...)`). The default `InMemoryGuardStore` is per process.
+- The answer-cache key includes a hash of the active guard configuration, so changing guards never serves old cached answers.
+- `preset="production"` sets `llm_max_tokens=1024`, which caps what each answer costs. `MaxOutputTokens` only trims what is shown.
+- Guard messages, reasons, errors and log lines are sanitized: the checked text is removed, and PII and secrets are masked. The internal retrieval-block exception is now `GuardBlockedError` (`GuardBlocked` is kept as an alias).
 
 **Security: filters were not applied on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search, but these paths ignored it and could return documents outside the filter:
 - GraphRAG local and global search (`rag_type="graph"`), the router's `graph` and `hybrid` routes (`rag_type="routing"`), and the agentic `graph_search` tool.

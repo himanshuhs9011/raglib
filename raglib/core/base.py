@@ -59,12 +59,16 @@ logger = logging.getLogger(__name__)
 _INTERNAL_METADATA = {"graph_context_docs"}
 
 
-class GuardBlocked(Exception):
-    """Raised inside a run when a retrieval guard blocks; the run returns the guard's message."""
+class GuardBlockedError(Exception):
+    """Raised inside a run when a retrieval guard blocks; ``run`` / ``stream`` catch it and return
+    the guard's message. Its text is the guard's (sanitized) user-facing message, never the input."""
 
     def __init__(self, decision: Any):
-        super().__init__(decision.message)
+        super().__init__(decision.message or decision.guard)
         self.decision = decision
+
+
+GuardBlocked = GuardBlockedError  # short alias
 
 
 @dataclass
@@ -81,6 +85,7 @@ class PipelineContext:
     metadata: Dict[str, Any] = field(default_factory=dict)
     usage: Optional[UsageMeter] = None
     run_state: Optional[RunState] = None
+    output_checked: bool = False  # the output guards already ran (piece by piece, while streaming)
 
 
 class BaseRAG:
@@ -193,7 +198,7 @@ class BaseRAG:
                 ctx.usage, ctx.run_state = meter, state
                 try:
                     result = self.answer(ctx)
-                except GuardBlocked as blocked:
+                except GuardBlockedError as blocked:
                     result = self._blocked_result(ctx, blocked.decision)
                 return self._finish(ctx, result)
             except Exception as exc:
@@ -220,9 +225,11 @@ class BaseRAG:
     ) -> GeneratorType[str, None, Optional[GenerationResult]]:
         """Yield answer tokens; the generator's return value is the final GenerationResult.
 
-        Strategies that loop over generation (e.g. Self-RAG) yield the final answer once. With
-        output guards configured the answer is checked before anything is shown, so it is yielded
-        once at the end (trade-off: no token-by-token display; time to first token = full answer).
+        Strategies that loop over generation (e.g. Self-RAG) yield the final answer once.
+        Output guards: when all are ``streaming_safe`` (leak masking, citation access, truncation)
+        the answer streams in checked pieces (``raglib.guards.streaming``: up to a sentence behind
+        the model); any other output guard (JSON schema, ...) makes the answer arrive in one piece
+        after it was checked.
         """
 
         if type(self).answer is not BaseRAG.answer or self.generator is None:
@@ -231,9 +238,11 @@ class BaseRAG:
             return result
 
         from raglib.guards.base import current_scope
+        from raglib.guards.streaming import StreamingOutput, stream_context, streaming_mode
 
         scope = current_scope()
-        buffered = scope is not None and bool(scope.output_guards)
+        mode = streaming_mode(scope.output_guards if scope is not None else ())
+        buffered = mode == "buffered"
         tracer = tracer or Tracer(on_event=self.on_event)
         with run_scope(self.strict) as state, usage_scope(meter) as meter, active_tracer(tracer):
             try:
@@ -242,22 +251,48 @@ class BaseRAG:
                 documents = self._prepare_documents(ctx)
                 try:
                     self._check_retrieval(ctx, documents)
-                except GuardBlocked as blocked:
+                except GuardBlockedError as blocked:
                     result = self._finish(ctx, self._blocked_result(ctx, blocked.decision))
                     yield result.answer
                     return result
                 # prompt_build is traced by the generator; "generate" times the streamed LLM reply.
                 context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
+                monitor = (
+                    StreamingOutput(scope.output_guards, stream_context(scope.context, ctx.query, context_docs))
+                    if mode == "incremental" and scope is not None
+                    else None
+                )
                 with ctx.tracer.stage("generate", streaming=True) as meta, usage_scope() as generation:
                     parts: List[str] = []
                     for token in tokens:
                         parts.append(token)
-                        if not buffered:
+                        if monitor is not None:
+                            piece = monitor.feed(token)
+                            if piece:
+                                yield piece
+                            if monitor.stopped:
+                                close = getattr(tokens, "close", None)
+                                if close is not None:
+                                    close()  # stop reading (and paying for) the model's stream
+                                break
+                        elif not buffered:
                             yield token
+                    if monitor is not None:
+                        tail = monitor.close()
+                        if tail:
+                            yield tail
                     meta["docs"] = len(context_docs)
+                answer = monitor.answer if monitor is not None else "".join(parts)
                 result = self.generator.finalize(
-                    "".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
+                    answer, context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
                 )
+                if monitor is not None:
+                    ctx.output_checked = True
+                    scope.decisions.extend(monitor.decisions())  # type: ignore[union-attr]
+                    if monitor.blocked is not None:
+                        ctx.metadata["blocked_by"] = monitor.blocked.guard
+                        ctx.tracer.tag("blocked_by", monitor.blocked.guard)
+                        result.sources, result.citations = [], []
                 result = self.post_generate(result)
                 result = self._finish(ctx, result)
                 if buffered:
@@ -368,7 +403,7 @@ class BaseRAG:
         return result
 
     def _check_retrieval(self, ctx: PipelineContext, documents: List[Document]) -> None:
-        """Run the query's retrieval guards; raises ``GuardBlocked`` (no LLM call follows) on a block."""
+        """Run the query's retrieval guards; raises ``GuardBlockedError`` (no LLM call follows) on a block."""
 
         from raglib.guards.base import current_scope
 
@@ -385,7 +420,7 @@ class BaseRAG:
             reranker=self.reranker.backend if self.reranker is not None else None,
         )
         if blocked is not None:
-            raise GuardBlocked(blocked)
+            raise GuardBlockedError(blocked)
 
     def _blocked_result(self, ctx: PipelineContext, decision: Any) -> GenerationResult:
         """The answer returned when a guard stops the run: the guard's message, no sources."""
@@ -401,7 +436,7 @@ class BaseRAG:
         from raglib.guards.base import current_scope
 
         scope = current_scope()
-        if scope is None or not scope.output_guards or ctx.metadata.get("blocked_by"):
+        if scope is None or not scope.output_guards or ctx.output_checked or ctx.metadata.get("blocked_by"):
             return result
         answer, blocked = scope.run(
             "output", scope.output_guards, result.answer, question=ctx.query, documents=list(result.sources), result=result

@@ -68,7 +68,7 @@ rag = RAG(
     chat_base_url=None,                    # custom or self-hosted endpoint
     llm_key=None,                          # one key shared by chat, embeddings and vision of one provider
     llm_temperature=0.0,                   # 0 = deterministic answers
-    llm_max_tokens=None,                   # cap on answer length (None = provider default)
+    llm_max_tokens=<<LLM_MAX_TOKENS>>,                  # the model stops here: caps cost per answer (None = provider default)
     llm_timeout=60.0,                      # seconds per LLM request
     llm_max_retries=2,                     # retries on 429 / 5xx / timeouts
     llm_rpm=None,                          # requests-per-minute cap (useful on free tiers)
@@ -184,6 +184,8 @@ rag = RAG(
     output_guards=<<OUTPUT_GUARDS>>,               # "default" = OutputLeakGuard + CitationAccessGuard; add JSONSchemaGuard(schema), MaxOutputTokens(800)
     tool_policy=<<TOOL_POLICY>>,                 # agent: ToolPolicy(allowed_tools={"support": ["search_docs"]}, max_tool_calls=8)
     guard_cache_ttl=3600.0,                # seconds a guard decision is reused for the same input (None = off)
+    rate_limit_key=None,                   # callable(GuardContext) -> str: who a rate limit / budget counts (default: query(user_id=...))
+    guard_store=None,                      # GuardStore for limit counters (default: in this process only)
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back
@@ -267,6 +269,7 @@ def render_pipeline(preset: str = "production", llm: str = "openai", docs: str =
         "<<RETRIEVAL_GUARDS>>": _repr(values.get("retrieval_guards")),
         "<<OUTPUT_GUARDS>>": _repr(values.get("output_guards")),
         "<<TOOL_POLICY>>": _repr(values.get("tool_policy")),
+        "<<LLM_MAX_TOKENS>>": _repr(values.get("llm_max_tokens")),
     }
     source = PIPELINE_TEMPLATE
     for token, value in tokens.items():

@@ -126,6 +126,22 @@ class Tracer:
             )
         )
 
+    def record(self, name: str, latency_ms: float, /, **meta: Any) -> None:
+        """Emit a stage measured elsewhere (e.g. a guard summed over a stream) as a timed event."""
+
+        parent = _STAGE.get()
+        self._emit(
+            TraceEvent(
+                stage=name,
+                latency_ms=round(float(latency_ms), 3),
+                meta=dict(meta),
+                error=None,
+                parent=parent[0] if parent else None,
+                run_id=self.run_id,
+                started_at=self._wall_clock(),
+            )
+        )
+
     def tag(self, key: str, value: Any) -> None:
         """Set a run-level tag (reported on the ``total`` event)."""
 
@@ -268,3 +284,11 @@ def add_stage_usage(kind: str, name: str, **counts: int) -> None:
     row = usage.setdefault(kind, {}).setdefault(name, {})
     for key, value in counts.items():
         row[key] = row.get(key, 0) + int(value)
+
+
+def record_stage(name: str, latency_ms: float, /, **meta: Any) -> None:
+    """``Tracer.record`` on the active tracer (no-op outside a run)."""
+
+    tracer = _ACTIVE.get()
+    if tracer is not None:
+        tracer.record(name, latency_ms, **meta)

@@ -42,13 +42,16 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "retrieval_guards": "default",
         "output_guards": "default",
         "tool_policy": "default",
+        # Caps what each answer can cost: the model stops generating here (MaxOutputTokens only
+        # trims what is shown). 1024 tokens is ~750 words, plenty for a cited answer.
+        "llm_max_tokens": 1024,
     },
 }
 
 PRESET_DESCRIPTIONS: Dict[str, str] = {
     "production": (
         "500-token chunks (100 overlap), hybrid search for 10 candidates, cross-encoder rerank to the best 3, "
-        "embeddings cached for 24 hours, tier 0 guardrails on every stage"
+        "embeddings cached for 24 hours, tier 0 guardrails on every stage, answers capped at 1024 tokens"
     ),
 }
 

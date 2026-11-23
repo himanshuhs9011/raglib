@@ -137,9 +137,10 @@ def test_resolve_guards_accepts_defaults_names_and_objects() -> None:
 
 def test_pii_masker_masks_or_blocks_and_skips_lookalikes() -> None:
     context = GuardContext()
-    masked = PIIMasker().check(f"mail {EMAIL}, call {PHONE}, card {CARD}, PAN ABCPE1234F", context)
-    assert masked.action == "modify" and masked.value == "mail [EMAIL], call [PHONE], card [CARD], PAN [PAN]"
+    masked = PIIMasker(phone=True).check(f"mail {EMAIL}, call {PHONE}, card {CARD}, PAN ABCPE1234F", context)
+    assert masked.action == "modify" and masked.value == "mail <EMAIL_1>, call <PHONE_1>, card <CARD_1>, PAN <PAN_1>"
     assert EMAIL not in masked.reason and "EMAIL x1" in masked.reason
+    assert PIIMasker().check(f"call {PHONE}", context).action == "allow"  # phones are opt-in
     assert PIIMasker().check("invoice 123456789012 dated 2026-11-23", context).action == "allow"
     assert PIIMasker(action="block").check(f"I am {EMAIL}", context).action == "block"
     assert mask("Aadhaar 2345 6789 0124")[1] in ({"AADHAAR": 1}, {})  # checksum decides; never a phone
@@ -175,13 +176,13 @@ def test_daily_budget_uses_answer_cost_and_resets_each_day() -> None:
     day = ["2026-11-23"]
     rag = _rag(prices=PriceTable(llm={"mock/mock": (1000.0, 1000.0)}, embedding={"*": 0.0}),
                input_guards=[UserDailyBudget(max_usd=0.01, today=lambda: day[0])])
-    first = rag.query("When do Acme offices close?", session_id="s1")
+    first = rag.query("When do Acme offices close?", user_id="u1")
     assert first.usage["cost_usd"] > 0.01 and "blocked_by" not in first.metadata
-    second = rag.query("When does the Orion window open?", session_id="s1")
+    second = rag.query("When does the Orion window open?", user_id="u1")
     assert second.metadata["blocked_by"] == "user_daily_budget" and second.usage["llm_calls"] == 0
-    assert "blocked_by" not in rag.query("When does the Orion window open?", session_id="s2").metadata  # other user
+    assert "blocked_by" not in rag.query("When does the Orion window open?", user_id="u2").metadata  # other user
     day[0] = "2026-11-24"
-    assert "blocked_by" not in rag.query("When does the Orion window open?", session_id="s1").metadata
+    assert "blocked_by" not in rag.query("When does the Orion window open?", user_id="u1").metadata
 
 
 def test_budget_without_prices_is_skipped_with_a_one_time_warning() -> None:
@@ -189,8 +190,8 @@ def test_budget_without_prices_is_skipped_with_a_one_time_warning() -> None:
     rag = _rag(input_guards=[UserDailyBudget(max_usd=1.0)])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        first = rag.query("When do Acme offices close?")
-        rag.query("When does the Orion window open?")
+        first = rag.query("When do Acme offices close?", user_id="u1")
+        rag.query("When does the Orion window open?", user_id="u1")
     skipped = [w for w in caught if issubclass(w.category, GuardSkippedWarning)]
     assert len(skipped) == 1 and "prices" in str(skipped[0].message)
     decision = first.metadata["guards"][0]
@@ -205,7 +206,7 @@ def test_budget_without_prices_is_skipped_with_a_one_time_warning() -> None:
 def test_pii_never_reaches_traces_caches_memory_or_the_llm() -> None:
     llm, events, latency = RecordingLLM(), [], LatencyStats()
     rag = RAG(CORPUS, chat_llm=llm, embedding_llm="mock", token_counter="units", memory=True, answer_cache=True,
-              input_guards=["pii"], on_event=[events.append, latency])
+              input_guards=[PIIMasker(phone=True)], on_event=[events.append, latency])
     question = f"When do Acme offices close? Reply to {EMAIL} or {PHONE}, card {CARD}"
     result = rag.query(question, session_id="s")
     rag.query(question, session_id="s")  # second run: caches are consulted with the masked text
@@ -219,12 +220,12 @@ def test_pii_never_reaches_traces_caches_memory_or_the_llm() -> None:
         repr(vars(rag._answer_cache._cache)) if rag._answer_cache else "",
         rag._conversations.get("s").get_context(),
         json.dumps(result.metadata, default=str),
-        result.answer,
         repr(result.trace_events),
     ]
     for secret in (EMAIL, PHONE, CARD, "98765"):
         assert all(secret not in text for text in surfaces), secret
-    assert llm.prompts and "[EMAIL]" in "\n".join(llm.prompts)
+    assert llm.prompts and "<EMAIL_1>" in "\n".join(llm.prompts)
+    assert EMAIL in result.answer  # restored for the caller only (the mock echoes the question)
 
 
 # ------------------------------------------------------------------ retrieval: nothing relevant
@@ -327,7 +328,7 @@ def test_json_schema_guard() -> None:
     assert guard.check('{"answer": 3, "confidence": 1}', GuardContext()).action == "block"
 
 
-def test_output_guards_run_in_the_pipeline_and_streaming_is_buffered() -> None:
+def test_output_guards_run_in_the_pipeline_and_while_streaming() -> None:
     class Leaky(MockLLMClient):
         def complete(self, prompt: str, system: str = "") -> str:
             return "Offices close Fridays [1]. Token: sk-live-abcdefghijklmnopqrstuvwxyz0123 [9]"
@@ -341,7 +342,10 @@ def test_output_guards_run_in_the_pipeline_and_streaming_is_buffered() -> None:
     assert [c.index for c in result.citations] == [1]
     assert [d["guard"] for d in result.metadata["guards"]] == ["output_leak", "citation_access"]
     tokens = list(rag.stream("When do Acme offices close?"))
-    assert tokens == ["Offices close Fridays [1]. Token: [API_KEY] "]  # one checked piece, nothing leaked first
+    assert len(tokens) >= 2 and "".join(tokens) == "Offices close Fridays [1]. Token: [API_KEY] "  # streamed, checked
+    assert not any("sk-live" in token for token in tokens)
+    buffered = _rag(Leaky(), output_guards=["default", JSONSchemaGuard({"type": "object"})])
+    assert len(list(buffered.stream("When do Acme offices close?"))) == 1  # not streaming-safe: one piece
 
 
 # ------------------------------------------------------------------ input blocks and observability

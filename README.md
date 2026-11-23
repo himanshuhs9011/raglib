@@ -210,6 +210,7 @@ rag = RAG(
 | `"cross_encoder"` (local `BAAI/bge-reranker-base`) | `reranker` | `"none"` |
 | 3 chunks sent to the LLM | `top_k` | 5 |
 | tier 0 guardrails on every stage (see [Guardrails](#guardrails)) | `input_guards` / `retrieval_guards` / `output_guards` / `tool_policy` | off |
+| answers capped at 1024 generated tokens | `llm_max_tokens` | provider default |
 
 `raglib init [PATH] --preset production` does the same as `raglib-py --production`. Both refuse to overwrite a file unless you pass `--force`. The cross-encoder needs `pip install raglib-py[rerank]`. Without it raglib logs a warning and keeps the hybrid order.
 
@@ -293,6 +294,8 @@ rag = RAG(
     output_guards=None,                 # on the answer: [OutputLeakGuard(), JSONSchemaGuard(schema)] | "default"
     tool_policy=None,                   # agent: ToolPolicy(allowed_tools={role: [...]}, max_tool_calls=8)
     guard_cache_ttl=3600.0,             # seconds a guard decision is reused for the same input (None = off)
+    rate_limit_key=None,                # callable(GuardContext) -> str: who limits / budgets count (default: user id)
+    guard_store=None,                   # GuardStore for limit counters (default: in this process only)
     embedding_cache_ttl=None,           # seconds before a cached embedding expires
     cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
     answer_cache=None,                  # True: question-level answer cache (FAQ tier)
@@ -1090,7 +1093,8 @@ rag = RAG(
     retrieval_guards=[NothingRelevant(message="That isn't covered by our documents.")],
     output_guards=[OutputLeakGuard(), CitationAccessGuard()],
 )
-result = rag.query("My card 4111 1111 1111 1111 was charged twice, why?", session_id="u1")
+result = rag.query("My card 4111 1111 1111 1111 was charged twice, why?", user_id="u1")
+# The model saw "My card <CARD_1> was charged twice, why?"; result.answer has the real number again.
 result.metadata["guards"]      # one record per decision: guard, stage, action, reason, confidence, mode, latency_ms
 result.metadata["blocked_by"]  # set when a guard blocked the query
 ```
@@ -1099,29 +1103,44 @@ result.metadata["blocked_by"]  # set when a guard blocked the query
 
 | Guard | Stage | What it does | Cost / trade-off |
 | :--- | :--- | :--- | :--- |
-| `PIIMasker(action="mask")` | input | Replaces e-mails, phone numbers, Aadhaar (Verhoeff checksum), PAN and card numbers (Luhn checksum) with `[EMAIL]`, `[PHONE]`, ... before the question reaches traces, `on_event`, `LatencyStats` tags, caches, memory or any model. `action="block"` refuses instead. | Free. Regexes miss names, addresses and unusual formats. A masked question can retrieve worse when the PII was the search key. |
+| `PIIMasker(phone=False, restore=True)` | input | Replaces e-mails, card numbers (Luhn checksum), Aadhaar (Verhoeff checksum) and PAN numbers (strict format) with typed placeholders (`<EMAIL_1>`, `<CARD_1>`, ...). It runs before every other guard, so the raw values never reach traces, `on_event`, `LatencyStats`, caches, memory or any model. With `restore=True`, the values are put back into the final answer for the caller (see below). Phone numbers are opt-in (`phone=True`). `action="block"` refuses instead. | Free. Regexes miss names, addresses and unusual formats. A masked question can retrieve worse when the PII was the search key. |
 | `MaxQuestionTokens(1000)` | input | Blocks over-long questions. | Free. Caps prompt cost per query. |
-| `UserRateLimit(30, per_seconds=60)` | input | Sliding window per user: `user.user_id`, else `session_id`, else one shared `"anonymous"` bucket. | Free. In process memory: each worker counts separately, so use your API gateway for a global limit. |
+| `UserRateLimit(30, per_seconds=60)` | input | Sliding window per caller (see "Who is the caller" below). | Free. The default store is per process: each worker counts on its own. For a global limit, pass a shared `GuardStore` or use your API gateway. |
 | `UserDailyBudget(max_usd=1.0)` | input | Blocks a user whose spend today (UTC) reached the budget. Spend is each answer's `usage["cost_usd"]`, the pricing `CostReport` uses. | Free. Needs `prices=`; without them it is skipped with a one-time `GuardSkippedWarning`. Charged after the query, so the last query of a day can overshoot by its own cost. |
 | `InjectionHeuristic()` | input | Keyword patterns ("ignore previous instructions", fake tags, "reveal the system prompt"). Strong or repeated signals block (confidence 0.9). One weak signal is allowed and recorded with low confidence. | Free. Catches copy-paste attacks, not paraphrased or encoded ones. |
 | `NothingRelevant()` | retrieval | When the best retrieved chunk is below the threshold, answers "I couldn't find this in the documents." **without calling the LLM**. | Free, and it saves the answer LLM call for off-topic questions. A threshold set too high refuses answerable questions. |
-| `OutputLeakGuard()` | output | Masks API keys, cloud keys, private keys and JWTs in the answer. It also masks personal data that is *not* in the sources the user could read (a support e-mail from your docs is kept). | Free. Same regex limits as `PIIMasker`. |
+| `OutputLeakGuard()` | output | Masks API keys, cloud keys, private keys and JWTs in the answer. It also masks personal data that is *not* in the sources the user could read (a support e-mail from your docs is kept). Phone numbers with `phone=True`. | Free. Same regex limits as `PIIMasker`. |
 | `CitationAccessGuard()` | output | With access control, withholds an answer that cites a document the user cannot read (defense in depth), and strips `[n]` markers that point past the source list. | Free. |
 | `JSONSchemaGuard(schema)` | output | The answer must be JSON matching `schema` (a code fence is unwrapped). Uses `jsonschema` when it is installed, otherwise a built-in subset (`type`, `required`, `properties`, `items`, `enum`). | Free. It blocks; it does not re-ask the model. |
-| `MaxOutputTokens(800)` | output | Truncates (or with `action="block"`, withholds) long answers. | Free. It limits what is shown, not what you pay: set `llm_max_tokens` to cap cost. |
+| `MaxOutputTokens(800)` | output | Truncates (or with `action="block"`, withholds) long answers. While streaming, the truncating version also stops reading the model's stream. | Free. On `query` it limits what is shown, not what you pay: the tokens were already generated. `llm_max_tokens` (1024 in `preset="production"`) is what caps cost, because the model stops there. |
 | `ToolPolicy(...)` | agent | `allowed_tools={"support": ["search_docs"]}` (the union over the user's roles; `default_tools` applies to everyone else), `max_tool_calls=8` per question, `max_argument_chars=1000`, and `argument_checks={"sql": fn}`. A blocked call is sent back to the agent as the tool's answer. | Free. A tool the user may not call is never offered to the model. |
+
+**PII look-alikes.** Every number pattern is bounded on both sides, so it never matches inside a longer word or number, a decimal, version or price (`1.2.3`, `4,111.50`), a path or an id (`ORD-4111111111111111`). Card numbers must pass Luhn and use one kind of separator. Aadhaar numbers must pass Verhoeff (a random 12-digit invoice number fails about 90% of the time) and use consistent separators. PAN numbers must be upper case with a valid holder-type letter (`AAAPA9999A`). Phone numbers are off by default, because order ids, invoice numbers and dates look too much like them.
+
+**Restoring PII for the caller.** The placeholder map is created for one request and lives only in that call. It is never traced, logged or cached, and it never appears in `result.metadata`. The answer returned by `query` / `stream` has the real values back. Everything stored keeps the placeholders: the LLM and answer caches, conversation memory, `output_dir` files and trace events. While streaming, a placeholder cut across tokens (`<EMA` + `IL_1>`) is held back until it is complete. Placeholders are numbered per request, so in a multi-turn chat `<EMAIL_1>` in an earlier turn may stand for a different value. `PIIMasker(restore=False)` keeps the placeholders in the answer too.
+
+**Who is the caller (rate limits and budgets).** The caller is `RAG(rate_limit_key=fn)` when given: `fn(context)` returns a key from `context.user_id`, `context.session_id` or `context.request`, never from the question. Otherwise it is the user id, from `query(..., user_id="u42")` (no access control needed) or `UserContext.user_id`. Pass request data with `query(..., request={"ip": ip, "api_key_id": key_id, "tenant": tenant})`. A guard's own `key=fn` overrides both. A request without a key follows the guard's `anonymous_policy`: `"skip"` (default: not limited, recorded as `mode="skipped"`), `"shared"` (one bucket for all anonymous requests) or `"block"` ("Please sign in"). A `session_id` alone is not an identity, because the client chooses it. Counters live in a `GuardStore`. The default `InMemoryGuardStore` is per process and resets on restart. Implement `hit` / `spent` / `add_spend` on a shared backend and pass it as `RAG(guard_store=...)` (or per guard, `store=`) for limits across workers.
+
+```python
+rag = RAG("docs/", llm="openai", prices=my_prices,
+          input_guards=[UserRateLimit(20, per_seconds=60, anonymous_policy="shared"), UserDailyBudget(max_usd=0.50)],
+          rate_limit_key=lambda c: c.request.get("api_key_id") or c.user_id)
+rag.query("Holiday policy?", request={"api_key_id": "key_8f2"})
+```
 
 **Nothing-relevant thresholds.** With `score="auto"`, the guard uses the reranker score when a Cohere or cross-encoder reranker ran, otherwise the dense cosine similarity of the query and the chunk. The defaults are deliberately low, so only clearly unrelated questions stop: cosine `0.15`, Cohere relevance `0.02`, cross-encoder logit `-7`. BM25-only, fusion-only, web and tool results have no absolute scale, so the check is skipped for them, and so is offline `MockEmbedding`. Embedding models differ (e5 models score unrelated text around 0.7), so check `result.sources[i].metadata["dense_score"]` / `["rerank_score"]` on your own data and set `NothingRelevant(threshold=0.3)` or `threshold={"dense": 0.3, "cross_encoder": -4}`. No documents at all also exits early, except for small talk and "no retrieval needed" decisions.
 
 **Failure policy.** A guard that raises **fails closed** (blocks) when it is a security guard and **fails open** (allows, `error` recorded) when it is a quality guard (`NothingRelevant`, `MaxOutputTokens`, `JSONSchemaGuard`). Override it per guard with `fail_closed=True/False`. Every guard also takes `message=` for its user-facing text.
 
-**Caching.** Decisions of deterministic guards (`MaxQuestionTokens`, `InjectionHeuristic`) are cached by a hash of the input for `guard_cache_ttl` seconds (default 1 h, `None` turns it off). Stateful guards (rate limit, budget) are never cached, and neither are errors. A guard's refusal is never stored in the answer cache, so a document added later can answer the question.
+**Caching.** Decisions of deterministic guards (`MaxQuestionTokens`, `InjectionHeuristic`) are cached by a hash of the input for `guard_cache_ttl` seconds (default 1 h, `None` turns it off). Stateful guards (rate limit, budget) are never cached, and neither are errors. A guard's refusal is never stored in the answer cache, so a document added later can answer the question. The answer-cache key includes a hash of the active guard configuration (every guard's class and settings), so adding, removing or changing a guard never serves an answer cached under the old guards.
+
+**Nothing unmasked in errors, logs or traces.** The runner removes the checked text from every guard message, reason and error, and masks PII and secrets in them, before they are traced, logged or returned. That covers a custom guard that raises `ValueError(f"bad {question}")`. The retrieval exit's internal `GuardBlockedError` carries only the guard's user-facing message. Logs run after masking, and no log line contains the question.
 
 **Observability.** Each guard is its own trace stage `guard.<name>`, with `stage`, `tier`, `action`, `mode` (`rule` / `local` / `api` / `skipped`), `confidence`, `cached` and `reason` in its meta. Guard stages show up in `result.trace_events`, `on_event`, `LatencyStats` (listed first) and `CostReport` (each guard on its own line, tier 0 at $0). The `total` event carries a `blocked_by` tag, so `LatencyStats` samples can be split by it. A blocked question makes no retrieval and no LLM call (`usage["llm_calls"] == 0`).
 
-**Streaming.** With output guards, `rag.stream(...)` checks the answer before showing it and yields it in one piece. The trade-off: no token-by-token display, so the time to first token is the full answer time. Without output guards, streaming is unchanged.
+**Streaming.** Output guards declare `streaming_safe`. When every output guard is streaming-safe (`OutputLeakGuard` masking, `CitationAccessGuard`, truncating `MaxOutputTokens`, which covers the production preset), `rag.stream(...)` keeps streaming. A piece is checked and shown when its sentence ends, or, for a long sentence, once it is 64 characters behind the model. The release point never cuts through a key, a card number, a `[n]` citation or a placeholder, so a secret split across tokens is still caught whole. A block mid-stream cannot take back pieces already shown: the stream stops and the guard's message is appended. A guard that is not streaming-safe (`JSONSchemaGuard`, blocking variants, the grounding check planned for later) makes the answer arrive in one piece after it is checked. The trade-off: the text lags the model by up to one sentence.
 
-**Custom guards.** Subclass `raglib.guards.Guard`, set `name`, `stages` (`("input",)`, `("retrieval",)`, `("output",)`), `tier`, `kind` (`"security"` or `"quality"`) and `cacheable`, and return `allow()`, `block(message)` or `modify(value)` from `check(value, context)`. `context` has the question, `user`, `user_key`, `filters`, `permission_filter` and `documents`.
+**Custom guards.** Subclass `raglib.guards.Guard`, set `name`, `stages` (`("input",)`, `("retrieval",)`, `("output",)`), `tier`, `kind` (`"security"` or `"quality"`) and `cacheable`, and return `allow()`, `block(message)` or `modify(value)` from `check(value, context)`. `context` has the question, `user`, `user_id`, `user_key`, `session_id`, `request`, `filters`, `permission_filter` and `documents`. For output guards, set `streaming_safe = True` when `check` works on a piece of the answer (state across pieces goes in `check_stream(chunk, context, state)`).
 
 Coming next: tier 1 (a topic check that reuses the query embedding, injection and toxicity classifiers, and a grounding check) and tier 2 (an LLM judge that runs only when tier 1 is unsure). Local models will always be optional.
 

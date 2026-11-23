@@ -52,7 +52,16 @@ from raglib.costs import PriceTable
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.embedding.embedding_factory import EmbeddingFactory
-from raglib.guards import GuardConfig, GuardContext, GuardScope, GuardSpec, ToolPolicy, guard_scope
+from raglib.guards import (
+    GuardConfig,
+    GuardContext,
+    GuardScope,
+    GuardSpec,
+    GuardStore,
+    InMemoryGuardStore,
+    ToolPolicy,
+    guard_scope,
+)
 from raglib.llm.base_client import (
     BaseLLMClient,
     CachedLLMClient,
@@ -310,6 +319,8 @@ class RAG:
         output_guards: GuardSpec = None,
         tool_policy: Union[ToolPolicy, str, None] = None,
         guard_cache_ttl: Optional[float] = 3600.0,
+        rate_limit_key: Optional[Callable[[GuardContext], Optional[str]]] = None,
+        guard_store: Optional[GuardStore] = None,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -378,6 +389,11 @@ class RAG:
           question, argument limits); ``"default"`` caps calls and argument length.
         * ``guard_cache_ttl``: seconds a cacheable guard decision is reused for the same input
           (``None`` disables the decision cache).
+        * ``rate_limit_key``: ``callable(GuardContext) -> str | None`` naming the caller for rate
+          limits and budgets (e.g. ``lambda c: c.request.get("api_key_id")``); default: the user id
+          from ``query(..., user_id=...)`` or ``UserContext``.
+        * ``guard_store``: where rate-limit / budget counters live (``GuardStore``); default in
+          process memory, so each worker process counts on its own.
         """
 
         if top_k <= 0:
@@ -616,11 +632,15 @@ class RAG:
         if tools:
             rag_type_kwargs["tools"] = list(tools)
         self._rag = self._build_orchestrator(self._rag_type, rag_type_kwargs)
+        self._rate_limit_key = rate_limit_key
+        self._guard_store: GuardStore = guard_store or InMemoryGuardStore()
         self._guards: Optional[GuardConfig] = GuardConfig.build(
             input_guards, retrieval_guards, output_guards, tool_policy, cache_ttl=guard_cache_ttl
         )
+        self._guard_signature: Optional[str] = None
         if self._guards is not None:
             self._guards.bind(self)
+            self._guard_signature = self._guards.signature()
 
         # Tier routing: FAQ (answer cache) -> cheap model -> full pipeline.
         self._cheap_rag: Optional[Any] = None
@@ -682,12 +702,18 @@ class RAG:
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
         user: Union[UserContext, Mapping[str, Any], None] = None,
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
     ) -> GenerationResult:
         """Answer one question. ``session_id`` isolates conversation memory per user.
 
         With ``access_control`` on, ``user`` (a ``UserContext`` or a dict with ``user_id``,
         ``roles``, ``departments``, ``max_access_level``) decides which documents are visible;
         ``filters`` can only narrow that further.
+
+        ``user_id`` identifies the caller for rate limits and budgets without access control;
+        ``request`` (e.g. ``{"ip": ..., "api_key_id": ..., "tenant": ...}``) is handed to guards and
+        to ``RAG(rate_limit_key=...)``. Both are ignored when no guards are configured.
         """
 
         if not isinstance(question, str) or not question.strip():
@@ -695,15 +721,18 @@ class RAG:
         question = question.strip()
         effective_filters, session_key = self._scope(filters, user, session_id)
         personalized = self._personalized(filters, user)
+        mapping: Dict[str, str] = {}
         if self._guards is None:
             with cache_bypass(personalized and not self._cache_personalized):
                 result = self._answer(question, session_key, effective_filters, personalized)
         else:
-            result, question = self._guarded(question, session_id, effective_filters, user, personalized, session_key)
+            result, question, mapping = self._guarded(
+                question, session_id, effective_filters, user, personalized, session_key, user_id, request
+            )
         result.metadata["session_id"] = session_id
         if self._output_dir:
-            self._save_result(question, result)
-        return result
+            self._save_result(question, result)  # masked: placeholders, never the restored values
+        return _restored(result, mapping)
 
     def _guarded(
         self,
@@ -713,53 +742,82 @@ class RAG:
         user: Any,
         personalized: bool,
         session_key: Optional[str],
-    ) -> Tuple[GenerationResult, str]:
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
+    ) -> Tuple[GenerationResult, str, Dict[str, str]]:
         """Run the input guards, then the pipeline with retrieval / output / tool guards in scope.
 
         One trace and one usage meter cover the guards and the pipeline, so guard stages show up
-        in ``result.trace_events``, ``on_event``, ``LatencyStats`` and ``CostReport``.
+        in ``result.trace_events``, ``on_event``, ``LatencyStats`` and ``CostReport``. Returns the
+        result (masked), the masked question and the request's PII placeholder map.
         """
 
         guards = self._guards
         assert guards is not None
         tracer = Tracer(on_event=self._rag.on_event)
-        context = self._guard_context(question, session_id, filters, user)
+        context = self._guard_context(question, session_id, filters, user, user_id, request)
         with usage_scope() as meter, active_tracer(tracer):
-            question, decisions, blocked = guards.runner.run("input", guards.input, question, context)
-            context = replace(context, question=question)
-            scope = GuardScope(
-                runner=guards.runner, context=context, retrieval_guards=guards.retrieval,
-                output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
-            )
+            question, scope, blocked, mapping = self._run_input_guards(question, context)
             if blocked is not None:
                 result = self._input_blocked(blocked, tracer, meter)
             else:
                 with guard_scope(scope), cache_bypass(personalized and not self._cache_personalized):
                     result = self._answer(question, session_key, filters, personalized, tracer=tracer, meter=meter)
+        self._after_guards(result, scope)
+        return result, question, mapping
+
+    def _run_input_guards(self, question: str, context: GuardContext) -> Tuple[str, GuardScope, Any, Dict[str, str]]:
+        """Input guards on the raw question; the PII map is taken out of the decisions right away."""
+
+        guards = self._guards
+        assert guards is not None
+        masked, decisions, blocked = guards.runner.run("input", guards.input, question, context)
+        mapping: Dict[str, str] = {}
+        for decision in decisions:
+            if decision.private:
+                mapping.update(decision.private.get("pii_map", {}))
+                decision.private = None
+        scope = GuardScope(
+            runner=guards.runner, context=replace(context, question=masked), retrieval_guards=guards.retrieval,
+            output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
+        )
+        return masked, scope, blocked, mapping
+
+    def _after_guards(self, result: GenerationResult, scope: GuardScope) -> None:
         self._attach_guards(result, scope)
+        guards = self._guards
+        assert guards is not None
         for guard in guards.all():
             try:
-                guard.after(result, context)
+                guard.after(result, scope.context)
             except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the answer
-                logger.warning("Guard %s after-hook failed: %s", guard.name, exc)
-        return result, question
+                logger.warning("Guard %s after-hook failed: %s", guard.name, type(exc).__name__)
 
     def _guard_context(
-        self, question: str, session_id: Optional[str], filters: Optional[MetadataFilter], user: Any
+        self,
+        question: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        user: Any,
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
     ) -> GuardContext:
-        """Who is asking: rate limits / budgets are per ``user_id``, else per session, else shared."""
+        """Who is asking. ``user_key`` (rate limits, budgets): ``rate_limit_key(context)``, else the user
+        id (``user_id=`` or ``UserContext.user_id``), else ``None`` (anonymous)."""
 
-        context = UserContext.coerce(user)
-        if context is not None and context.user_id:
-            user_key = f"user:{context.user_id}"
-        elif session_id:
-            user_key = f"session:{session_id}"
-        else:
-            user_key = "anonymous"
-        return GuardContext(
-            stage="input", question=question, user=context, user_key=user_key, filters=filters,
-            permission_filter=self.permission_filter(context) if self._access is not None else None,
+        context_user = UserContext.coerce(user)
+        uid = user_id or (context_user.user_id if context_user is not None else None)
+        context = GuardContext(
+            stage="input", question=question, user=context_user, user_id=uid, session_id=session_id,
+            request=dict(request or {}), filters=filters,
+            permission_filter=self.permission_filter(context_user) if self._access is not None else None,
         )
+        if self._rate_limit_key is not None:
+            key = self._rate_limit_key(replace(context, question=""))  # identity, never the question text
+        else:
+            key = f"user:{uid}" if uid else None
+        context.user_key = str(key) if key else None
+        return context
 
     def _input_blocked(self, decision: Any, tracer: Tracer, meter: UsageMeter) -> GenerationResult:
         """The result for a question an input guard refused: its message, no retrieval, no LLM call."""
@@ -798,6 +856,11 @@ class RAG:
 
         return user is not None or bool(filters)
 
+    def _answer_cache_key(self) -> str:
+        """The answer cache's pipeline key: the rag type plus the guard configuration hash."""
+
+        return self._rag_type if self._guard_signature is None else f"{self._rag_type}|guards:{self._guard_signature}"
+
     def _answer(
         self,
         question: str,
@@ -816,7 +879,8 @@ class RAG:
         # Answers that depend on who asks, or on the conversation so far, are never served from cache.
         cacheable = cache is not None and (self._cache_personalized or not personalized) and not self._rag.use_memory
         scope = json.dumps(filters, sort_keys=True, default=str) if filters else None
-        cached = cache.get(question, scope, self._rag_type) if cacheable and cache is not None else None
+        cache_key = self._answer_cache_key()
+        cached = cache.get(question, scope, cache_key) if cacheable and cache is not None else None
         context = {
             "answer_cached": cached is not None,
             "cheap_available": self._cheap_rag is not None,
@@ -835,13 +899,14 @@ class RAG:
         result.metadata.update({"tier": tier, "tier_reason": decision.reason, "answer_cache_hit": False})
         if cacheable and cache is not None and not result.metadata.get("blocked_by"):
             # A guard's refusal is not cached: new documents may answer the question next time.
-            cache.put(question, result, scope, self._rag_type)
+            cache.put(question, result, scope, cache_key)
         return result
 
     def _faq_result(self, cached: GenerationResult, reason: str, tracer: Optional[Tracer] = None) -> GenerationResult:
         """Return a cached answer, traced as its own short run (tier ``faq``).
 
-        The cached answer already passed the output guards when it was generated.
+        The cached answer already passed the output guards when it was generated (the answer-cache
+        key includes the guard configuration hash, so changed guards never reuse it).
         """
 
         tracer = tracer or Tracer(on_event=self._rag.on_event)
@@ -862,12 +927,14 @@ class RAG:
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
         user: Union[UserContext, Mapping[str, Any], None] = None,
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
     ) -> GenerationResult:
         """Async ``query`` (runs the pipeline in a worker thread)."""
 
         import asyncio
 
-        return await asyncio.to_thread(self.query, question, session_id, filters, user)
+        return await asyncio.to_thread(self.query, question, session_id, filters, user, user_id, request)
 
     def stream(
         self,
@@ -875,25 +942,35 @@ class RAG:
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
         user: Union[UserContext, Mapping[str, Any], None] = None,
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[str]:
-        """Stream answer tokens: ``for token in rag.stream(q): print(token, end="")``."""
+        """Stream answer tokens: ``for token in rag.stream(q): print(token, end="")``.
+
+        ``user_id`` / ``request``: as in ``query``. With output guards the answer streams in
+        checked pieces (see ``raglib.guards.streaming``); a non-streaming-safe output guard
+        (``JSONSchemaGuard``) makes it arrive in one piece.
+        """
 
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
         question = question.strip()
         effective_filters, session_key = self._scope(filters, user, session_id)
         bypass = self._personalized(filters, user) and not self._cache_personalized
+        mapping: Dict[str, str] = {}
         if self._guards is None:
             # Streaming always runs the full pipeline (tier routing and the answer cache are query() features).
             with cache_bypass(bypass):
                 result = yield from self._rag.stream(question, session_id=session_key, filters=effective_filters)
         else:
-            result, question = yield from self._guarded_stream(question, session_id, effective_filters, user, bypass, session_key)
+            result, question, mapping = yield from self._guarded_stream(
+                question, session_id, effective_filters, user, bypass, session_key, user_id, request
+            )
         if result is not None:
             result.metadata["session_id"] = session_id
         if self._output_dir and result is not None:
-            self._save_result(question, result)
-        return result
+            self._save_result(question, result)  # masked
+        return _restored(result, mapping) if result is not None else None
 
     def _guarded_stream(
         self,
@@ -903,36 +980,32 @@ class RAG:
         user: Any,
         bypass: bool,
         session_key: Optional[str],
+        user_id: Optional[str] = None,
+        request: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[str]:
-        """``stream`` with guards: input guards first; output guards make the answer arrive in one piece."""
+        """``stream`` with guards: input guards first, then the pipeline; tokens are restored for the caller."""
+
+        from raglib.guards.pii import PlaceholderRestorer
 
         guards = self._guards
         assert guards is not None
         tracer = Tracer(on_event=self._rag.on_event)
-        context = self._guard_context(question, session_id, filters, user)
+        context = self._guard_context(question, session_id, filters, user, user_id, request)
         with usage_scope() as meter, active_tracer(tracer):
-            question, decisions, blocked = guards.runner.run("input", guards.input, question, context)
-            context = replace(context, question=question)
-            scope = GuardScope(
-                runner=guards.runner, context=context, retrieval_guards=guards.retrieval,
-                output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
-            )
+            question, scope, blocked, mapping = self._run_input_guards(question, context)
             if blocked is not None:
                 result = self._input_blocked(blocked, tracer, meter)
                 yield result.answer
             else:
                 with guard_scope(scope), cache_bypass(bypass):
-                    result = yield from self._rag.stream(
-                        question, session_id=session_key, filters=filters, tracer=tracer, meter=meter
-                    )
+                    tokens = self._rag.stream(question, session_id=session_key, filters=filters, tracer=tracer, meter=meter)
+                    if mapping:
+                        result = yield from _restoring(tokens, PlaceholderRestorer(mapping))
+                    else:
+                        result = yield from tokens
         if result is not None:
-            self._attach_guards(result, scope)
-            for guard in guards.all():
-                try:
-                    guard.after(result, context)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Guard %s after-hook failed: %s", guard.name, exc)
-        return result, question
+            self._after_guards(result, scope)
+        return result, question, mapping
 
     @property
     def access_control(self) -> Optional[AccessControl]:
@@ -2111,6 +2184,33 @@ class RAG:
         }
         target = output_path / f"result_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
         target.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def _restored(result: GenerationResult, mapping: Mapping[str, str]) -> GenerationResult:
+    """A copy of ``result`` with the caller's PII put back into the answer (the original - which
+    caches, memory and ``output_dir`` hold - keeps the placeholders)."""
+
+    if not mapping:
+        return result
+    from raglib.guards.pii import restore
+
+    return replace(result, answer=restore(result.answer, mapping), metadata=dict(result.metadata))
+
+
+def _restoring(tokens: Iterator[str], restorer: Any) -> Iterator[str]:
+    """Yield ``tokens`` with placeholders restored; returns the wrapped generator's return value."""
+
+    while True:
+        try:
+            token = next(tokens)
+        except StopIteration as stop:
+            tail = restorer.flush()
+            if tail:
+                yield tail
+            return stop.value
+        piece = restorer.feed(token)
+        if piece:
+            yield piece
 
 
 def _atomic_write(target: Path, text: str) -> None:

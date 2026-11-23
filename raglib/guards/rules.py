@@ -18,12 +18,12 @@ import re
 import threading
 import time
 import warnings
-from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from raglib.guards import pii
 from raglib.guards.base import Decision, Guard, GuardContext, allow, block, modify
+from raglib.guards.store import GuardStore, InMemoryGuardStore
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +90,65 @@ class MaxQuestionTokens(Guard):
         return str(self.max_tokens)
 
 
-class UserRateLimit(Guard):
-    """At most ``max_requests`` questions per ``per_seconds`` per user (sliding window, in process).
+class _LimitGuard(Guard):
+    """Shared identity handling for per-user limits (rate limit, budget).
 
-    Users are keyed by ``UserContext.user_id``, else the ``session_id``, else ``"anonymous"`` (one
-    shared bucket - pass a user or a session id per caller). Limits live in process memory: with
-    several workers each worker has its own window (use your API gateway for a global limit).
+    The user is ``key(context)`` when given, else ``RAG(rate_limit_key=...)``, else the user id
+    (``query(..., user_id=...)`` or ``UserContext.user_id``). Requests with no key follow
+    ``anonymous_policy``: ``"skip"`` (default: not limited, recorded as ``mode="skipped"``),
+    ``"shared"`` (one bucket for all anonymous requests) or ``"block"``. Counters live in a
+    ``GuardStore`` (``InMemoryGuardStore`` by default: per process, reset on restart).
+    """
+
+    anonymous_message = "Please sign in to use this service."
+
+    def __init__(
+        self,
+        key: Optional[Callable[[GuardContext], Optional[str]]] = None,
+        anonymous_policy: str = "skip",
+        store: Optional[GuardStore] = None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        if anonymous_policy not in {"skip", "shared", "block"}:
+            raise ValueError("anonymous_policy must be 'skip', 'shared' or 'block'")
+        self.key = key
+        self.anonymous_policy = anonymous_policy
+        self.store = store
+
+    def bind(self, rag: Any) -> None:
+        if self.store is None:
+            self.store = getattr(rag, "_guard_store", None)
+
+    def config(self) -> Dict[str, Any]:
+        settings = super().config()
+        settings.pop("store", None)  # where counters live is not part of the guard's behaviour
+        return settings
+
+    def _store(self) -> GuardStore:
+        if self.store is None:
+            self.store = InMemoryGuardStore()
+        return self.store
+
+    def identity(self, context: GuardContext) -> Tuple[Optional[str], Optional[Decision]]:
+        """``(store key, None)``, or ``(None, decision)`` when the request has no key."""
+
+        key = self.key(context) if self.key is not None else context.user_key
+        if key:
+            return f"{self.name}:{key}", None
+        if self.anonymous_policy == "shared":
+            return f"{self.name}:anonymous", None
+        if self.anonymous_policy == "block":
+            return None, block(self.anonymous_message, reason="no user key (anonymous_policy='block')")
+        return None, skipped("no user key (anonymous_policy='skip')")
+
+
+class UserRateLimit(_LimitGuard):
+    """At most ``max_requests`` questions per ``per_seconds`` per user (sliding window).
+
+    See ``_LimitGuard`` for who "the user" is and what happens to anonymous requests. With the
+    default in-memory store each worker process counts on its own: for a global limit use a
+    shared ``GuardStore`` or your API gateway.
     """
 
     name = "user_rate_limit"
@@ -108,32 +161,24 @@ class UserRateLimit(Guard):
         self.max_requests = max_requests
         self.per_seconds = per_seconds
         self._clock = clock
-        self._hits: Dict[str, Deque[float]] = {}
-        self._lock = threading.Lock()
 
     def check(self, value: Any, context: GuardContext) -> Decision:
-        now = self._clock()
-        with self._lock:
-            hits = self._hits.setdefault(context.user_key, deque())
-            while hits and now - hits[0] >= self.per_seconds:
-                hits.popleft()
-            if len(hits) >= self.max_requests:
-                retry = max(0.0, self.per_seconds - (now - hits[0]))
-                return block(self.block_message, reason=f"{len(hits)} requests in {self.per_seconds:g}s; retry in {retry:.0f}s")
-            hits.append(now)
-            if len(self._hits) > 100_000:  # drop idle users so the table cannot grow without bound
-                for key in [k for k, v in self._hits.items() if not v or now - v[-1] >= self.per_seconds][:50_000]:
-                    self._hits.pop(key, None)
-            return allow(reason=f"{len(hits)}/{self.max_requests} in window")
+        key, decision = self.identity(context)
+        if key is None:
+            return decision  # type: ignore[return-value]
+        allowed, count, retry = self._store().hit(key, self._clock(), self.per_seconds, self.max_requests)
+        if not allowed:
+            return block(self.block_message, reason=f"{count} requests in {self.per_seconds:g}s; retry in {retry:.0f}s")
+        return allow(reason=f"{count}/{self.max_requests} in window")
 
 
-class UserDailyBudget(Guard):
+class UserDailyBudget(_LimitGuard):
     """Block a user once their spend today (UTC) reaches ``max_usd``.
 
     Spend is each answer's ``usage["cost_usd"]`` - the same pricing ``CostReport`` aggregates - so
     it needs ``RAG(prices=PriceTable(...))`` (or ``prices=`` here). Without prices the guard is
     skipped with a one-time ``GuardSkippedWarning``. A query is checked before it runs and charged
-    after, so the last query of the day may overshoot the budget by its own cost. In process memory.
+    after, so the last query of the day may overshoot the budget by its own cost.
     """
 
     name = "user_daily_budget"
@@ -146,18 +191,16 @@ class UserDailyBudget(Guard):
         self.max_usd = float(max_usd)
         self.prices = prices
         self._today = today or (lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-        self._spent: Dict[Tuple[str, str], float] = {}
-        self._lock = threading.Lock()
 
     def bind(self, rag: Any) -> None:
+        super().bind(rag)
         if self.prices is None:
             self.prices = getattr(rag, "_prices", None)
 
     def spent(self, user_key: str) -> float:
-        """USD spent today by ``user_key``."""
+        """USD spent today by ``user_key`` (the same key ``RAG`` puts in ``GuardContext.user_key``)."""
 
-        with self._lock:
-            return self._spent.get((user_key, self._today()), 0.0)
+        return self._store().spent(f"{self.name}:{user_key}", self._today())
 
     def check(self, value: Any, context: GuardContext) -> Decision:
         if self.prices is None:
@@ -167,51 +210,70 @@ class UserDailyBudget(Guard):
                 "Enable it with RAG(prices=PriceTable(llm={...}, embedding={...})).",
             )
             return skipped("no prices configured")
-        spent = self.spent(context.user_key)
+        key, decision = self.identity(context)
+        if key is None:
+            return decision  # type: ignore[return-value]
+        spent = self._store().spent(key, self._today())
         if spent >= self.max_usd:
             return block(self.block_message, reason=f"spent ${spent:.4f} of ${self.max_usd:.4f} today")
         return allow(reason=f"spent ${spent:.4f} of ${self.max_usd:.4f} today")
 
     def after(self, result: Any, context: GuardContext) -> None:
         cost = (getattr(result, "usage", None) or {}).get("cost_usd")
-        if not cost:
+        if not cost or self.prices is None:
             return
-        day = self._today()
-        with self._lock:
-            key = (context.user_key, day)
-            self._spent[key] = self._spent.get(key, 0.0) + float(cost)
-            stale = [k for k in self._spent if k[1] != day]
-            for k in stale:
-                del self._spent[k]
+        key, _ = self.identity(context)
+        if key is not None:
+            self._store().add_spend(key, self._today(), float(cost))
 
 
 class PIIMasker(Guard):
-    """Mask e-mails, phone numbers, Aadhaar, PAN and card numbers in the question (``[EMAIL]``, ...).
+    """Replace e-mails, card numbers (Luhn), Aadhaar (Verhoeff) and PAN numbers in the question with
+    typed placeholders (``<EMAIL_1>``, ``<CARD_1>``, ...). Phone numbers with ``phone=True``.
 
-    Runs first, so the raw values never reach traces, ``on_event``, ``LatencyStats`` tags, caches,
-    conversation memory or any model. ``action="block"`` refuses such questions instead.
+    Runs before every other guard (``order=-1``), so the raw values never reach traces,
+    ``on_event``, ``LatencyStats`` tags, caches, conversation memory or any model. With
+    ``restore=True`` (default) the values are put back into the final answer for the caller only:
+    the placeholder map exists for that one request and is never traced, logged or cached
+    (``output_dir`` files and cached answers keep the placeholders). ``action="block"`` refuses
+    such questions instead.
     Trade-off: regexes (with checksums) miss names, addresses and unusual formats; a masked
     question can retrieve worse when the PII was the search key (e.g. "orders of jane@x.com").
+    Placeholders are numbered per request, so in a multi-turn chat ``<EMAIL_1>`` in an earlier turn
+    may stand for a different value.
     """
 
     name = "pii_mask"
-    block_message = "Please do not include personal data (e-mail, phone, ID or card numbers) in your question."
+    order = -1
+    block_message = "Please do not include personal data (e-mail, ID or card numbers) in your question."
 
-    def __init__(self, action: str = "mask", patterns: Sequence[Tuple[str, Any, Any]] = pii.PII_PATTERNS, **kwargs: Any):
+    def __init__(
+        self,
+        action: str = "mask",
+        phone: bool = False,
+        restore: bool = True,
+        patterns: Optional[Sequence[Tuple[str, Any, Any]]] = None,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         if action not in {"mask", "block"}:
             raise ValueError("action must be 'mask' or 'block'")
         self.action = action
-        self.patterns = patterns
+        self.phone = phone
+        self.restore = restore
+        self.patterns = tuple(patterns) if patterns is not None else (pii.ALL_PII_PATTERNS if phone else pii.PII_PATTERNS)
 
     def check(self, value: str, context: GuardContext) -> Decision:
-        masked, counts = pii.mask(value, self.patterns)
+        masked, mapping, counts = pii.mask_reversible(value, self.patterns)
         if not counts:
             return allow()
         reason = "found " + ", ".join(f"{label} x{n}" for label, n in sorted(counts.items()))
         if self.action == "block":
             return block(self.block_message, reason=reason)
-        return modify(masked, reason=reason)
+        decision = modify(masked, reason=reason)
+        if self.restore:
+            decision.private = {"pii_map": mapping}
+        return decision
 
 
 class InjectionHeuristic(Guard):
@@ -346,8 +408,10 @@ class NothingRelevant(Guard):
 class MaxOutputTokens(Guard):
     """Cap the answer at ``max_tokens`` (``action="truncate"`` cuts it, ``"block"`` refuses it).
 
-    Trade-off: this limits what the user sees, not what you pay - the tokens were already
-    generated. To cap cost, set ``RAG(llm_max_tokens=...)`` as well.
+    Trade-off: on ``rag.query`` this limits what the user sees, not what you pay - the tokens were
+    already generated. ``RAG(llm_max_tokens=...)`` (set by ``preset="production"``) is what caps
+    cost: the model stops generating there. In ``rag.stream`` the truncating variant also stops
+    reading the model's stream once the limit is reached.
     """
 
     name = "max_output_tokens"
@@ -363,21 +427,38 @@ class MaxOutputTokens(Guard):
             raise ValueError("action must be 'truncate' or 'block'")
         self.max_tokens, self.action, self.token_counter = max_tokens, action, token_counter
 
+    @property
+    def streaming_safe(self) -> bool:  # type: ignore[override]
+        return self.action == "truncate"
+
     def check(self, value: str, context: GuardContext) -> Decision:
         tokens = _count(value, self.token_counter)
         if tokens <= self.max_tokens:
             return allow(reason=f"{tokens} tokens")
         if self.action == "block":
             return block(self.block_message, reason=f"{tokens} tokens > {self.max_tokens}")
-        words = value.split(" ")
+        return modify(self._prefix(value, self.max_tokens).rstrip() + " …", reason=f"truncated {tokens} -> {self.max_tokens} tokens")
+
+    def check_stream(self, chunk: str, context: GuardContext, state: Dict[str, Any]) -> Decision:
+        used = state.get("tokens", 0)
+        tokens = _count(chunk, self.token_counter)
+        if used + tokens <= self.max_tokens:
+            state["tokens"] = used + tokens
+            return allow(reason=f"{used + tokens} tokens")
+        state["exhausted"] = True
+        kept = self._prefix(chunk, max(0, self.max_tokens - used)).rstrip()
+        return modify(kept + " …", reason=f"truncated at {self.max_tokens} tokens")
+
+    def _prefix(self, text: str, budget: int) -> str:
+        words = text.split(" ")
         low, high = 0, len(words)
-        while low < high:  # longest word prefix within the limit
+        while low < high:  # longest word prefix within the budget
             middle = (low + high + 1) // 2
-            if _count(" ".join(words[:middle]), self.token_counter) <= self.max_tokens:
+            if _count(" ".join(words[:middle]), self.token_counter) <= budget:
                 low = middle
             else:
                 high = middle - 1
-        return modify(" ".join(words[:low]).rstrip() + " …", reason=f"truncated {tokens} -> {self.max_tokens} tokens")
+        return " ".join(words[:low])
 
 
 class OutputLeakGuard(Guard):
@@ -386,7 +467,8 @@ class OutputLeakGuard(Guard):
     Secrets (API keys, cloud keys, private keys, JWTs) are always masked. Personal data that
     appears verbatim in the sources the user was allowed to retrieve is kept when
     ``allow_source_pii=True`` (a support e-mail in your docs is not a leak); anything else -
-    e.g. PII the model recalled or invented - is masked.
+    e.g. PII the model recalled or invented - is masked. Phone numbers with ``phone=True``.
+    Masking is streaming-safe (checked piece by piece in ``rag.stream``); ``action="block"`` is not.
     Trade-off: regex detection, see ``raglib.guards.pii``.
     """
 
@@ -394,18 +476,31 @@ class OutputLeakGuard(Guard):
     stages = ("output",)
     block_message = "The answer contained sensitive data and was withheld."
 
-    def __init__(self, action: str = "mask", check_pii: bool = True, check_secrets: bool = True, allow_source_pii: bool = True, **kwargs: Any):
+    def __init__(
+        self,
+        action: str = "mask",
+        check_pii: bool = True,
+        check_secrets: bool = True,
+        allow_source_pii: bool = True,
+        phone: bool = False,
+        **kwargs: Any,
+    ):
         super().__init__(**kwargs)
         if action not in {"mask", "block"}:
             raise ValueError("action must be 'mask' or 'block'")
         self.action, self.check_pii, self.check_secrets, self.allow_source_pii = action, check_pii, check_secrets, allow_source_pii
+        self.phone = phone
+
+    @property
+    def streaming_safe(self) -> bool:  # type: ignore[override]
+        return self.action == "mask"
 
     def check(self, value: str, context: GuardContext) -> Decision:
         patterns: List[Any] = []
         if self.check_secrets:
             patterns.extend(pii.SECRET_PATTERNS)
         if self.check_pii:
-            patterns.extend(pii.PII_PATTERNS)
+            patterns.extend(pii.ALL_PII_PATTERNS if self.phone else pii.PII_PATTERNS)
         found = pii.find(value, patterns)
         if self.allow_source_pii and found:
             sources = "\n".join(getattr(doc, "content", "") for doc in context.documents)
@@ -440,10 +535,12 @@ class CitationAccessGuard(Guard):
     (defense in depth: retrieval already filters, but caches, custom retrievers or tools can
     slip). A cited document the user may not read blocks the answer (security: fail closed).
     A marker pointing past the source list (``[7]`` with 3 sources) is stripped from the text.
+    Streaming-safe: in ``rag.stream`` a block stops the stream at the offending piece.
     """
 
     name = "citation_access"
     stages = ("output",)
+    streaming_safe = True
     block_message = "The answer referenced a document you do not have access to, so it was withheld."
 
     def check(self, value: str, context: GuardContext) -> Decision:

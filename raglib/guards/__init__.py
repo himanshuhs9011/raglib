@@ -21,6 +21,8 @@ LLM judge) come in later releases and only run when the cheaper tiers are unsure
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Union
 
@@ -58,6 +60,8 @@ from raglib.guards.rules import (
     default_retrieval_guards,
     resolve_guards,
 )
+from raglib.guards.store import GuardStore, InMemoryGuardStore
+from raglib.guards.streaming import StreamingOutput
 
 GuardSpec = Union[str, Guard, Sequence[Union[str, Guard]], None]
 
@@ -105,6 +109,19 @@ class GuardConfig:
         for guard in self.all():
             guard.bind(rag)
 
+    def signature(self) -> str:
+        """Hash of every guard's class and settings: part of the answer-cache key, so adding,
+        removing or changing a guard never serves answers cached under the old configuration."""
+
+        description = {
+            "input": [guard.config() for guard in self.input],
+            "retrieval": [guard.config() for guard in self.retrieval],
+            "output": [guard.config() for guard in self.output],
+            "tool_policy": self.tool_policy.config() if self.tool_policy is not None else None,
+        }
+        raw = json.dumps(description, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
 
 __all__ = [
     "ALLOW",
@@ -119,6 +136,9 @@ __all__ = [
     "GuardRunner",
     "GuardScope",
     "GuardSkippedWarning",
+    "GuardStore",
+    "InMemoryGuardStore",
+    "StreamingOutput",
     "InjectionHeuristic",
     "JSONSchemaGuard",
     "MaxOutputTokens",
