@@ -7,6 +7,7 @@ import threading
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap
 from raglib.core.runtime import report_degraded
 from raglib.core.tracing import trace_stage, trace_tag
 from raglib.llm.base_client import BaseLLMClient
@@ -197,13 +198,14 @@ class Reranker:
         """Listwise LLM reranking in a single call."""
 
         assert self.llm_client is not None
-        passages = "\n".join(
-            f"[{index}] {doc.content[:600].strip()}" for index, doc in enumerate(documents, start=1)
-        )
+        texts = [doc.content[:600] for doc in documents]
+        delimiter = delimiter_for(query, *texts)
+        passages = "\n".join(f"[{index}] {wrap(text, delimiter)}" for index, text in enumerate(texts, start=1))
         prompt = (
             "Rank the passages below by how well they help answer the question.\n"
             f"Question: {query}\n\n"
             f"Passages:\n{passages}\n\n"
+            f"{data_rule(delimiter)}\n"
             'Return JSON only: {"ranking": [passage numbers, most relevant first]}'
         )
         data = self.llm_client.complete_json(prompt, system="You are a precise search relevance ranker.", default={})

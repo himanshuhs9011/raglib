@@ -8,6 +8,7 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from raglib.core.concurrency import parallel_map
+from raglib.core.prompt_safety import data_rule, delimiter_for, escape_text, wrap
 from raglib.graphrag.schemas import (
     Entity,
     ExtractionResult,
@@ -115,8 +116,9 @@ class GraphExtractor:
     def _prompt(self, text: str, already_found: str = "") -> str:
         """Build the extraction prompt."""
 
+        delimiter = delimiter_for(text)
         extra = (
-            f"These entities were already extracted: {already_found}. Return ONLY entities and relations that were missed.\n"
+            f"These entities were already extracted: {escape_text(already_found)}. Return ONLY entities and relations that were missed.\n"
             if already_found
             else ""
         )
@@ -130,8 +132,9 @@ class GraphExtractor:
             f"{extra}"
             'Return JSON: {"entities": [{"name": "...", "type": "...", "description": "..."}], '
             '"relations": [{"source": "...", "target": "...", "type": "SHORT_VERB_PHRASE", '
-            '"description": "...", "weight": 1-10}]}\n\n'
-            f"Text:\n{text}"
+            '"description": "...", "weight": 1-10}]}\n'
+            f"{data_rule(delimiter)}\n\n"
+            f"Text:\n{wrap(text, delimiter)}"
         )
 
     def _call(self, prompt: str) -> Any:

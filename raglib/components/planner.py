@@ -6,6 +6,7 @@ import logging
 import re
 from typing import List, Optional, Sequence
 
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap_inline
 from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
@@ -48,13 +49,15 @@ class Planner:
     def next_step(self, question: str, evidence: Sequence[Document], previous_queries: Sequence[str]) -> Optional[str]:
         """Return the next search query needed, or None when the evidence is sufficient."""
 
-        snippets = "\n".join(f"- {doc.content[:300].strip()}" for doc in evidence[:8]) or "(none yet)"
+        delimiter = delimiter_for(question, *(doc.content[:300] for doc in evidence[:8]))
+        snippets = "\n".join(f"- {wrap_inline(doc.content[:300], delimiter)}" for doc in evidence[:8]) or "(none yet)"
         asked = "\n".join(f"- {q}" for q in previous_queries) or "(none)"
         prompt = (
             "You are planning multi-hop retrieval.\n"
             f"Question: {question}\n\n"
             f"Searches already run:\n{asked}\n\n"
             f"Evidence collected so far:\n{snippets}\n\n"
+            f"{data_rule(delimiter)}\n\n"
             "If the evidence is enough to answer the question, reply with JSON "
             '{"done": true}. Otherwise reply with JSON {"done": false, "next_query": "<the next search query, '
             'using entities found in the evidence>"}.'

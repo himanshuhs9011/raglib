@@ -738,9 +738,13 @@ class GraphContextWindow:
         if len(sentences) <= 1 or self._llm_client is None:
             return []
 
-        numbered = "\n".join(f"{idx}. {sent}" for idx, sent in enumerate(sentences, start=1))
+        from raglib.core.prompt_safety import data_rule, delimiter_for, escape_attr, escape_text
+
+        delimiter = delimiter_for(section_title, *sentences)
+        numbered = "\n".join(f"{idx}. {escape_text(sent)}" for idx, sent in enumerate(sentences, start=1))
+        numbered = f"<{delimiter}>\n{numbered}\n</{delimiter}>\n{data_rule(delimiter)}"
         prompt = (
-            f"Split the numbered sentences from section '{section_title}' into coherent semantic chunks.\n"
+            f"Split the numbered sentences from section '{escape_attr(section_title)}' into coherent semantic chunks.\n"
             f"Keep each chunk under approximately {self._chunk_size} words.\n"
             "Return lines in the format:\n"
             "CHUNK: start-end | SUMMARY: short 10-word summary | KEYWORDS: kw1, kw2, kw3\n\n"

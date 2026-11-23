@@ -10,6 +10,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence
 from raglib.access import FilterNotSupportedError
 from raglib.core.concurrency import parallel_map
 from raglib.core.intents import is_global_question
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap
 from raglib.core.text import token_set
 from raglib.graphrag.indexer import GraphIndexer
 from raglib.graphrag.schemas import Community
@@ -345,12 +346,15 @@ class GlobalSearch:
     def _map(self, query: str, community: Community) -> List[Document]:
         """Extract query-relevant key points from one community report."""
 
+        report = community.report_text()
+        delimiter = delimiter_for(query, report)
         prompt = (
             "Using only the community report below, list the key points that help answer the question, "
             "each with an importance score from 0 (irrelevant) to 100 (essential). Return an empty list if "
             "the report is irrelevant.\n"
+            f"{data_rule(delimiter)}\n"
             f"Question: {query}\n\n"
-            f"Community report:\n{community.report_text()}\n\n"
+            f"Community report:\n{wrap(report, delimiter)}\n\n"
             'Return JSON: {"points": [{"description": "...", "score": 0-100}]}'
         )
         data = self.llm_client.complete_json(prompt, default={})

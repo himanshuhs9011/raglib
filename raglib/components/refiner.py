@@ -6,6 +6,7 @@ import logging
 from typing import List, Optional
 
 from raglib.components.query_rewriter import clean_llm_query
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap_inline
 from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
@@ -25,12 +26,14 @@ class Refiner:
     def refine(self, query: str, failed_docs: Optional[List[Document]] = None) -> str:
         """Generate a refined query from failed retrieval context."""
 
-        snippets = "\n".join(f"- {doc.content[:180]}" for doc in (failed_docs or [])[:3]) or "(no results)"
+        delimiter = delimiter_for(query, *(doc.content[:180] for doc in (failed_docs or [])[:3]))
+        snippets = "\n".join(f"- {wrap_inline(doc.content[:180], delimiter)}" for doc in (failed_docs or [])[:3]) or "(no results)"
         prompt = (
             "The search below returned poor results. Rewrite it as a better search query "
             "(different wording, key entities, synonyms) that keeps the original intent.\n"
             f"Original query: {query}\n"
             f"Poor results:\n{snippets}\n"
+            f"{data_rule(delimiter)}\n"
             "Return only the improved search query."
         )
         try:

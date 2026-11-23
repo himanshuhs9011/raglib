@@ -912,7 +912,11 @@ class ChunkSplitter:
         if len(sentences) <= 1:
             return self._split_recursive(text)
 
-        numbered = "\n".join(f"{index}. {sentence}" for index, sentence in enumerate(sentences, start=1))
+        from raglib.core.prompt_safety import data_rule, delimiter_for, escape_text
+
+        delimiter = delimiter_for(*sentences)
+        numbered = "\n".join(f"{index}. {escape_text(sentence)}" for index, sentence in enumerate(sentences, start=1))
+        numbered = f"<{delimiter}>\n{numbered}\n</{delimiter}>\n{data_rule(delimiter)}"
         prompt = (
             "Split the numbered sentences into coherent semantic chunks for retrieval.\n"
             f"Each chunk should stay under approximately {self._chunk_size} words/tokens.\n"

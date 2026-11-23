@@ -37,6 +37,11 @@ class MockLLMClient(BaseLLMClient):
     def _respond(self, prompt: str, system: str = "") -> str:
         """Pick the templated response for this prompt."""
 
+        from raglib.core.prompt_safety import strip_data_tags
+
+        # Answers parse the data blocks; every other template reads the text without the tags.
+        if not ("<sources>" in prompt and prompt.rstrip().endswith("answer with citations:")):
+            prompt = strip_data_tags(prompt)
         text = f"{system}\n{prompt}"
         lower = text.lower()
 
@@ -205,10 +210,10 @@ class MockLLMClient(BaseLLMClient):
         """Compose an extractive answer from the first source, with a citation."""
 
         query = self._extract_query(prompt)
-        match = re.search(r'<source id="1"[^>]*>\n(.*?)\n</source>', prompt, re.DOTALL)
+        match = re.search(r'<(src-[0-9a-f]{8}|source) id="1"[^>]*>\n(.*?)\n</\1>', prompt, re.DOTALL)
         if not match:
             return f"I don't know based on the available documents (query: {query})."
-        return f"Based on the sources, regarding '{query}': {self._first_sentence(match.group(1))} [1]"
+        return f"Based on the sources, regarding '{query}': {self._first_sentence(match.group(2))} [1]"
 
     @staticmethod
     def _first_sentence(text: str) -> str:

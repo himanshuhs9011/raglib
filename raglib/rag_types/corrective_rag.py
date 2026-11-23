@@ -10,6 +10,7 @@ from raglib.components.grader import LABEL_CORRECT, LABEL_INCORRECT, RelevanceGr
 from raglib.components.query_rewriter import clean_llm_query
 from raglib.components.web_retriever import web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap_inline
 from raglib.core.runtime import report_degraded
 from raglib.core.text import token_set
 from raglib.schemas import Document
@@ -152,10 +153,12 @@ class CorrectiveRAG(BaseRAG):
             flags = [bool(query_terms & token_set(strip)) for strip in strips]
             return flags if any(flags) else [True] * len(strips)
 
-        numbered = "\n".join(f"{index}. {strip}" for index, strip in enumerate(strips, start=1))
+        delimiter = delimiter_for(query, *strips)
+        numbered = "\n".join(f"{index}. {wrap_inline(strip, delimiter)}" for index, strip in enumerate(strips, start=1))
         prompt = (
             f"Query: {query}\n\n"
             f"Knowledge strips:\n{numbered}\n\n"
+            f"{data_rule(delimiter)}\n"
             "Which strip numbers contain information useful for answering the query? "
             "Reply with only the numbers separated by commas (e.g. 1,3,5). "
             "Reply ALL if all are useful, NONE if none are."

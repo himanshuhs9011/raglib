@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List, Optional, Sequence
 
 from raglib.core.concurrency import parallel_map
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.graphrag.schemas import Community
 from raglib.graphrag.store.base import BaseGraphStore
@@ -193,9 +194,11 @@ class CommunityReporter:
             f"- {names.get(r.source, r.source)} --{r.type}--> {names.get(r.target, r.target)}: {r.description[:200]}"
             for r in relations
         )
+        delimiter = delimiter_for(entity_lines, relation_lines)
         prompt = (
-            "Write a community report for this cluster of related entities from a knowledge graph.\n\n"
-            f"Entities:\n{entity_lines}\n\nRelations:\n{relation_lines or '(none)'}\n\n"
+            "Write a community report for this cluster of related entities from a knowledge graph.\n"
+            f"{data_rule(delimiter)}\n\n"
+            f"Entities:\n{wrap(entity_lines, delimiter)}\n\nRelations:\n{wrap(relation_lines or '(none)', delimiter)}\n\n"
             'Return JSON: {"title": "short descriptive title", "summary": "3-5 sentence executive summary of what '
             'this community is about", "findings": ["key insight 1", "key insight 2", "..."], '
             '"rating": <importance from 0 to 10>}'

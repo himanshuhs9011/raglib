@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from raglib.core.concurrency import parallel_map
 from raglib.core.parsing import parse_json
+from raglib.core.prompt_safety import data_rule, delimiter_for, numbered_blocks, wrap_inline
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document, GenerationResult
 
@@ -93,19 +94,24 @@ def _judge(judge: BaseLLMClient, instruction: str) -> Optional[float]:
 def _answer_metrics(judge: BaseLLMClient, question: str, result: GenerationResult, reference: Optional[str]) -> Dict[str, float]:
     """LLM-judged faithfulness, answer relevance, context precision and (with a reference) correctness."""
 
-    context = "\n\n".join(f"[{i}] {doc.content[:800]}" for i, doc in enumerate(result.sources[:8], start=1)) or "(no context)"
+    texts = [doc.content[:800] for doc in result.sources[:8]]
+    delimiter = delimiter_for(question, result.answer, reference or "", *texts)
+    rule = data_rule(delimiter)
+    context = numbered_blocks(texts, delimiter) if texts else "(no context)"
+    answer = wrap_inline(result.answer, delimiter)
     metrics: Dict[str, float] = {}
     checks = {
-        "faithfulness": f"Context:\n{context}\n\nAnswer:\n{result.answer}\n\n"
+        "faithfulness": f"Context:\n{context}\n\nAnswer:\n{answer}\n{rule}\n\n"
         "Score the fraction of factual claims in the answer that are supported by the context.",
-        "answer_relevance": f"Question: {question}\n\nAnswer:\n{result.answer}\n\n"
+        "answer_relevance": f"Question: {question}\n\nAnswer:\n{answer}\n{rule}\n\n"
         "Score how directly and completely the answer addresses the question.",
-        "context_precision": f"Question: {question}\n\nContext:\n{context}\n\n"
+        "context_precision": f"Question: {question}\n\nContext:\n{context}\n{rule}\n\n"
         "Score the fraction of context passages that are relevant to the question.",
     }
     if reference:
         checks["correctness"] = (
-            f"Question: {question}\n\nReference answer:\n{reference}\n\nCandidate answer:\n{result.answer}\n\n"
+            f"Question: {question}\n\nReference answer:\n{wrap_inline(reference, delimiter)}\n\n"
+            f"Candidate answer:\n{answer}\n{rule}\n\n"
             "Score how well the candidate matches the facts of the reference answer."
         )
     for name, instruction in checks.items():

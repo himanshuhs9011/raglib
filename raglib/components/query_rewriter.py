@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap
 from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 
@@ -70,11 +71,13 @@ class QueryCondenser:
 
         if self.llm_client is None or not history.strip():
             return query
+        delimiter = delimiter_for(query, history)
         prompt = (
             "Given the conversation so far and a follow-up message, write a standalone question "
             "that can be understood without the conversation. Resolve pronouns and references. "
             "If the follow-up is already standalone, return it unchanged.\n\n"
-            f"Conversation:\n{history}\n\n"
+            f"Conversation:\n{wrap(history, delimiter)}\n"
+            f"{data_rule(delimiter)}\n\n"
             f"Follow-up message: {query}\n"
             "Standalone question:"
         )

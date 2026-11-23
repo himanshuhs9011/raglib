@@ -7,6 +7,7 @@ from typing import List, Optional, Sequence
 
 from raglib.components.evaluator import Evaluator
 from raglib.core.parsing import parse_json, parse_label, parse_label_map
+from raglib.core.prompt_safety import data_rule, delimiter_for, wrap
 from raglib.core.runtime import report_degraded
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
@@ -58,9 +59,9 @@ class RelevanceGrader:
         """Grade all documents in one LLM call; None on failure."""
 
         assert self.llm_client is not None
-        numbered = "\n\n".join(
-            f"[{index}] {doc.content[: self.max_chars_per_doc].strip()}" for index, doc in enumerate(documents, start=1)
-        )
+        texts = [doc.content[: self.max_chars_per_doc] for doc in documents]
+        delimiter = delimiter_for(query, *texts)
+        numbered = "\n\n".join(f"[{index}] {wrap(text, delimiter)}" for index, text in enumerate(texts, start=1))
         prompt = (
             "Grade each retrieved document for the query.\n"
             "CORRECT = directly contains information that answers the query.\n"
@@ -70,6 +71,7 @@ class RelevanceGrader:
             "INCORRECT = irrelevant or misleading: about none of the things the query asks about.\n\n"
             f"Query: {query}\n\n"
             f"Documents:\n{numbered}\n\n"
+            f"{data_rule(delimiter)}\n"
             'Reply with JSON only, e.g. {"grades": ["CORRECT", "INCORRECT"]} with exactly one grade per document, in order.'
         )
         try:
