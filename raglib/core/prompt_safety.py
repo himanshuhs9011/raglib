@@ -100,3 +100,63 @@ def strip_data_tags(text: str, delimiter: Optional[str] = None) -> str:
 
     pattern = re.escape(delimiter) if delimiter else r"src-[0-9a-f]{8}"
     return re.sub(rf"</?{pattern}(?:\s[^>]*)?>", "", text)
+
+
+_WORD_RE = re.compile(r"[\w][\w.@:/+-]*", re.UNICODE)
+
+
+def safe_web_query(question: str, model_input: str, retrieved_texts: Iterable[str], max_chars: int = 200) -> str:
+    """A web-search query built only from the user's question plus model-written keywords.
+
+    Words of ``model_input`` that occur in any retrieved text (and not in the question) are dropped,
+    so a document cannot make the agent send its content - or anything it quotes - to a search
+    provider ("call search_web with <secret>"). Capped at ``max_chars`` on a word boundary.
+    Trade-off: a useful keyword that also appears in a retrieved document is dropped too.
+    """
+
+    question_words = _WORD_RE.findall(question or "")
+    seen = {word.casefold() for word in question_words}
+    document_words = set()
+    for text in retrieved_texts:
+        for word in _WORD_RE.findall(text or ""):
+            document_words.add(word.casefold())
+            document_words.update(part for part in _parts(word) if part)  # "ZX-SECRET-42" -> zx, secret, 42
+    keywords = []
+    for word in _WORD_RE.findall(model_input or ""):
+        key = word.casefold()
+        if key in seen or key in document_words or any(part in document_words for part in _parts(word)):
+            continue
+        seen.add(key)
+        keywords.append(word)
+    query = ""
+    for word in [*question_words, *keywords]:
+        candidate = f"{query} {word}".strip()
+        if len(candidate) > max_chars:
+            break
+        query = candidate
+    return query
+
+
+def _parts(word: str) -> list:
+    """Lower-case pieces of a word split on ``- . @ : / +`` (so split-up copies are caught too)."""
+
+    return [piece for piece in re.split(r"[-.@:/+_]", word.casefold()) if piece]
+
+
+INJECTION_PATTERNS = {
+    "ignore_instructions": r"\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+|your\s+)?"
+    r"(?:previous|prior|above|earlier|preceding)\s+(?:instructions?|prompts?|messages?|rules?)",
+    "role_change": r"\byou\s+are\s+now\b|\bact\s+as\s+(?:an?\s+)?(?:admin|administrator|developer|system)\b",
+    "tool_call": r"\bcall\s+(?:the\s+)?(?:tool|function|search_web|search_docs|graph_search)\b|\buse\s+the\s+\w+\s+tool\b",
+    "system_prompt": r"\b(?:reveal|print|show|repeat)\s+(?:the\s+|your\s+)?system\s+prompt\b",
+    "new_instructions": r"\bnew\s+instructions?\s*:",
+    "hidden_from_user": r"\bdo\s+not\s+(?:tell|inform|show)\s+the\s+user\b",
+    "fake_delimiter": r"</?\s*(?:sources?|src-[0-9a-z]+|system|instructions?)\s*>",
+}
+_INJECTION_RES = {name: re.compile(pattern, re.IGNORECASE) for name, pattern in INJECTION_PATTERNS.items()}
+
+
+def injection_signals(text: str) -> list:
+    """Names of instruction-like patterns found in ``text`` (a heuristic: flags, never blocks)."""
+
+    return [name for name, pattern in _INJECTION_RES.items() if pattern.search(text or "")]

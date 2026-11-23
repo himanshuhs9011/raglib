@@ -172,6 +172,7 @@ rag = RAG(
 
     # ---------------------------------------------------------------- security
     access_control=None,                   # True: per-document permissions (rag.add(..., access=...), rag.query(..., user=...))
+    allow_web_after_private=False,         # agent web search after retrieving non-public documents (off: no exfiltration path)
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back

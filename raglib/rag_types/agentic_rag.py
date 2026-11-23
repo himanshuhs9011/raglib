@@ -9,7 +9,7 @@ from raglib.components.tools import Tool
 from raglib.components.web_retriever import web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import interleave
-from raglib.core.prompt_safety import data_rule, delimiter_for, wrap_inline
+from raglib.core.prompt_safety import data_rule, delimiter_for, safe_web_query, wrap_inline
 from raglib.core.runtime import report_degraded
 from raglib.schemas import Document
 
@@ -30,12 +30,22 @@ class AgenticRAG(BaseRAG):
     pipeline_name = "agentic"
     uses_decision_engine = False
 
-    def __init__(self, tools: Optional[Sequence[Tool]] = None, max_steps: int = 4, **kwargs: Any):
-        """Initialize the agent."""
+    def __init__(
+        self, tools: Optional[Sequence[Tool]] = None, max_steps: int = 4, max_web_query_chars: int = 200, **kwargs: Any
+    ):
+        """Initialize the agent.
+
+        ``search_web`` is guarded against exfiltration: its query is rebuilt from the user's question
+        plus model-written keywords that do not occur in any retrieved document, capped at
+        ``max_web_query_chars``; with access control, it is disabled for a query that retrieved a
+        non-public document (``RAG(allow_web_after_private=True)`` re-enables it). Every tool call is
+        logged with its arguments in the trace (``tool`` stage meta) and ``result.metadata["tool_calls"]``.
+        """
 
         super().__init__(**kwargs)
         self.extra_tools = [self._as_tool(tool) for tool in tools or []]
         self.max_steps = max(1, max_steps)
+        self.max_web_query_chars = max(20, max_web_query_chars)
 
     def _as_tool(self, tool: Any) -> Tool:
         """Accept ``Tool`` objects and providers of one (e.g. ``SQLTool``); share the agent's LLM."""
@@ -106,14 +116,25 @@ class AgenticRAG(BaseRAG):
                 steps.append({"action": name, "input": tool_input, "observation": f"Unknown tool '{name}'."})
                 ctx.trace.append(f"step_{step_number}:unknown_tool:{name}")
                 continue
-            with ctx.tracer.stage("tool", tool=name, step=step_number) as meta:
-                try:
-                    docs = tool.run(tool_input or ctx.search_query)
-                    observation = self._summarize(docs)
-                except Exception as exc:  # noqa: BLE001
-                    report_degraded(f"tool:{name}", exc, logger)
-                    docs, observation = [], f"Tool error: {exc}"
-                meta["docs"] = len(docs)
+            call: Dict[str, Any] = {"step": step_number, "tool": name, "input": (tool_input or "")[:500]}
+            with ctx.tracer.stage("tool", tool=name, step=step_number, input=call["input"]) as meta:
+                guard = self._guard_web(ctx, name, tool_input, evidence) if name == "search_web" else None
+                if guard is not None and guard[0] is None:
+                    docs, observation = [], guard[1]
+                    call["blocked"] = meta["blocked"] = guard[1]
+                    ctx.trace.append(f"step_{step_number}:search_web_blocked")
+                else:
+                    if guard is not None:
+                        tool_input = guard[0]
+                        call["web_query"] = meta["web_query"] = tool_input
+                    try:
+                        docs = tool.run(tool_input or ctx.search_query)
+                        observation = self._summarize(docs)
+                    except Exception as exc:  # noqa: BLE001
+                        report_degraded(f"tool:{name}", exc, logger)
+                        docs, observation = [], f"Tool error: {exc}"
+                meta["docs"] = call["docs"] = len(docs)
+            ctx.metadata.setdefault("tool_calls", []).append(call)
             evidence.append(docs)
             steps.append({"action": name, "input": tool_input, "observation": observation})
             ctx.trace.append(f"step_{step_number}:{name}({(tool_input or '')[:50]})->{len(docs)}_docs")
@@ -125,6 +146,19 @@ class AgenticRAG(BaseRAG):
         ctx.trace.insert(0, f"plan_steps:{len(steps)}")
         # Each step targets a different part of the question: round-robin keeps every step's best evidence.
         return interleave([docs for docs in evidence if docs])
+
+    def _guard_web(
+        self, ctx: PipelineContext, name: str, tool_input: str, evidence: List[List[Document]]
+    ) -> Optional[tuple]:
+        """``(safe query, None)`` to run a web search, or ``(None, reason)`` to block it."""
+
+        retrieved = [doc for docs in evidence for doc in docs]
+        if self.private_document is not None and not self.allow_web_after_private:
+            if any(self.private_document(doc) for doc in retrieved):
+                logger.info("search_web disabled: the query retrieved non-public documents")
+                return None, "Web search is disabled for this question because it retrieved non-public documents."
+        query = safe_web_query(ctx.query, tool_input, [doc.content for doc in retrieved], self.max_web_query_chars)
+        return (query, None) if query else (None, "Web search needs a query built from the question.")
 
     def _next_action(self, question: str, tools: Dict[str, Tool], steps: List[Dict[str, Any]]):
         """Ask the LLM for the next action; returns (tool_name, input) or None."""

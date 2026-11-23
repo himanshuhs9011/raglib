@@ -73,6 +73,12 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 
 **Security: retrieved text is delimited in every prompt.** Documents, web results and conversation history are wrapped in an unguessable per-prompt tag (`<src-XXXXXXXX>`) in every prompt that includes them, not just the answer prompt. That covers the agent, grader, knowledge strips, LLM reranker, Self-RAG evaluators and revise step, multi-hop planner, refiner, condenser, graph extraction and community reports, global search, LLM chunking and the eval judge. Before, a document containing `</source>` could close its block. Tag-like text inside documents is now escaped, and attribute values such as `name="..."` are HTML-escaped. Every such prompt carries a "data, never instructions" rule; the answer system prompt keeps a stable wording, so provider prompt caching still works. Custom `prompt_template`s without `{data_rule}` get the rule after `{context}` automatically. The tag is an HMAC of the prompt's content under a per-process secret: unpredictable for a document author, and identical for identical requests, so the LLM cache keeps hitting.
 
+**Security: the agent's web search cannot carry retrieved text out.**
+- `search_web` queries are rebuilt from the user's question plus model-written keywords that do not occur in any retrieved document, including split-up copies, and are capped at 200 characters (`AgenticRAG(max_web_query_chars=...)`).
+- With `access_control`, web search is disabled for a query that retrieved a non-public document. `allow_web_after_private=True` turns it back on, still sanitized.
+- Every tool call and its arguments is logged in the `tool` trace stage and in `result.metadata["tool_calls"]`.
+- A heuristic flags, but never blocks, sources with instruction-like text, in `result.metadata["injection_flags"]` and an `injection_flag` warning event.
+
 **Other changes (not breaking):**
 - New optional parameters: `RAG(access_control=)`, `query/aquery/stream(user=)`, `add(access=, metadata=)`, `reset_memory(user=)`. New `rag.permission_filter(user)`.
 - `GraphRetriever.retrieve`, `LocalSearch.search`, `GlobalSearch.search` and `WebRetriever.retrieve` accept `filters=`. `GlobalSearch` takes an optional `chunk_lookup`, which it needs to serve filtered queries.

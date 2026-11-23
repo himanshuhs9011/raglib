@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from typing import Generator as GeneratorType
 
 from raglib.components.context_reducer import ContextReducer
@@ -113,6 +113,8 @@ class BaseRAG:
         strict: bool = False,
         rerank_candidates: Optional[int] = None,
         price_table: Optional[Any] = None,
+        private_document: Optional[Callable[[Document], bool]] = None,
+        allow_web_after_private: bool = False,
     ):
         """Initialize optional pipeline components via dependency injection.
 
@@ -124,6 +126,10 @@ class BaseRAG:
         """
 
         self.price_table = price_table
+        # Access control: which retrieved documents are non-public (web search is then off for the
+        # query unless allow_web_after_private=True). Set by RAG(access_control=...).
+        self.private_document = private_document
+        self.allow_web_after_private = allow_web_after_private
 
         if rerank_candidates is not None and rerank_candidates <= 0:
             raise ValueError("rerank_candidates must be greater than zero")
@@ -383,6 +389,22 @@ class BaseRAG:
             return self.conversation_store.get(session_id)
         return self.memory_module
 
+    def _flag_injections(self, ctx: PipelineContext, result: GenerationResult) -> None:
+        """Flag (never block) sources with instruction-like text: result metadata + an on_event notice."""
+
+        from raglib.core.prompt_safety import injection_signals
+
+        flags = []
+        for doc in result.sources:
+            signals = injection_signals(doc.content)
+            if signals:
+                flags.append({"document_id": doc.id, "source": doc.source, "signals": signals})
+        if not flags:
+            return
+        ctx.metadata["injection_flags"] = flags
+        ctx.tracer.notice("injection_flag", flags=flags, documents=len(flags))
+        logger.warning("%d retrieved source(s) contain instruction-like text: %s", len(flags), flags)
+
     def _start(
         self,
         query: str,
@@ -433,6 +455,7 @@ class BaseRAG:
             memory = self.memory_for(ctx.session_id)
             if memory is not None:
                 memory.add(query=ctx.query, answer=result.answer, documents=result.sources)
+        self._flag_injections(ctx, result)
         costs: Dict[str, Any] = {}
         if ctx.usage is not None and self.price_table is not None:
             from raglib.costs import price_run

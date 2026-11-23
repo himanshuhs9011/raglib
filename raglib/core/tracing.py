@@ -111,6 +111,21 @@ class Tracer:
                 )
             )
 
+    def notice(self, stage: str, error: Optional[str] = None, **meta: Any) -> None:
+        """Emit a warning event (``meta["event"] == "warning"``): a notice, not a timed stage."""
+
+        self._emit(
+            TraceEvent(
+                stage=stage,
+                latency_ms=0.0,
+                meta={"event": "warning", **meta},
+                error=error,
+                parent=None,
+                run_id=self.run_id,
+                started_at=self._wall_clock(),
+            )
+        )
+
     def tag(self, key: str, value: Any) -> None:
         """Set a run-level tag (reported on the ``total`` event)."""
 

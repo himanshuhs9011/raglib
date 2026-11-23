@@ -299,6 +299,7 @@ class RAG:
         semantic_number_of_chunks: Optional[int] = None,
         sentence_splitter: Any = None,
         semantic_overlap_sentences: int = 0,
+        allow_web_after_private: bool = False,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -570,6 +571,8 @@ class RAG:
             "strict": strict,
             "rerank_candidates": rerank_candidates,
             "price_table": self._prices,
+            "private_document": self._private_document if self._access is not None else None,
+            "allow_web_after_private": allow_web_after_private,
         }
         if self._rag_type == "hybrid_web":
             if self._hybrid_retriever is None:
@@ -873,6 +876,12 @@ class RAG:
                 callback(event)
             except Exception as exc:  # noqa: BLE001 - observers must never break ingestion
                 logger.warning("on_event callback failed: %s", exc)
+
+    def _private_document(self, document: Document) -> bool:
+        """True for a retrieved corpus document above the lowest access level (web results have no level)."""
+
+        level = document.metadata.get("access_level")
+        return self._access is not None and level is not None and level != self._access.levels[0]
 
     def chunking_settings(self) -> Dict[str, Any]:
         """Settings that decide chunk boundaries (strategy, sizes, token counter, semantic options)."""
