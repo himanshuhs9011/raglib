@@ -544,10 +544,12 @@ class CitationAccessGuard(Guard):
     (``AccessControl.strictest``), so they are checked the same way; a summary without tags is
     denied, like any untagged document.
 
-    ``summary_rule="all_sources"`` uses the more precise rule for summaries: visible when the user may
-    read *every* source chunk (looked up by ``source_chunk_ids``), so a user in two departments can
-    see a summary that mixes both. Summaries with more than 200 sources (ids not all listed) keep
-    the strictest-tags rule. The default ``"strictest"`` needs no chunk lookups.
+    ``summary_rule="all_sources"`` (default) is the precise rule for summaries: visible when the user
+    may read *every* source chunk (looked up by ``source_chunk_ids``), so a user in two departments
+    can see a summary that mixes both - the same rule retrieval applies. Summaries with more than 200
+    sources (ids not all listed) and summaries without ids use the inherited tags instead.
+    ``summary_rule="strict_tags"`` always uses the inherited tags: no chunk lookups, but a user in
+    several departments may be refused a summary that mixes them.
     """
 
     name = "citation_access"
@@ -556,10 +558,10 @@ class CitationAccessGuard(Guard):
     stream_holdback = 8  # only whole "[123]" markers matter: streams with about one word of lag
     block_message = "The answer referenced a document you do not have access to, so it was withheld."
 
-    def __init__(self, summary_rule: str = "strictest", **kwargs: Any):
+    def __init__(self, summary_rule: str = "all_sources", **kwargs: Any):
         super().__init__(**kwargs)
-        if summary_rule not in {"strictest", "all_sources"}:
-            raise ValueError("summary_rule must be 'strictest' or 'all_sources'")
+        if summary_rule not in {"all_sources", "strict_tags"}:
+            raise ValueError("summary_rule must be 'all_sources' or 'strict_tags'")
         self.summary_rule = summary_rule
 
     def bind(self, rag: Any) -> None:

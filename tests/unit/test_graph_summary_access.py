@@ -78,7 +78,7 @@ def test_summary_from_three_public_and_one_confidential_chunk_is_invisible_to_pu
     )
 
 
-def test_citation_access_guard_checks_summaries_by_their_inherited_tags() -> None:
+def test_citation_access_guard_checks_summaries_by_their_sources_and_tags() -> None:
     rag = _graph_rag()
     report = next(doc for doc in _summaries(rag, CLEARED_USER) if doc.metadata["graph"] == "community")
     guard = next(g for g in rag._guards.output if g.name == "citation_access")
@@ -87,6 +87,10 @@ def test_citation_access_guard_checks_summaries_by_their_inherited_tags() -> Non
     allowed = GuardContext(stage="output", documents=[report], permission_filter=rag.permission_filter(CLEARED_USER))
     assert guard.check("The budget is 42 million [1].", allowed).action == "allow"
     untagged = Document(id="graph-x", content="summary", metadata={"graph": "community", "supplementary": True})
+    strict = CitationAccessGuard(summary_rule="strict_tags")
+    strict.bind(rag)
+    assert strict.check("The budget is 42 million [1].", slipped).action == "block"
+    assert strict.check("The budget is 42 million [1].", allowed).action == "allow"
     lone = CitationAccessGuard()
     lone.bind(rag)
     denied = GuardContext(stage="output", documents=[untagged], permission_filter=rag.permission_filter(CLEARED_USER))

@@ -130,9 +130,14 @@ def test_all_sources_rule_lets_a_two_department_user_see_a_mixed_summary() -> No
         context = GuardContext(stage="output", documents=[summary], permission_filter=rag.permission_filter(user))
         return guard.check("Both notes matter [1].", context).action
 
-    assert verdict("strictest", both) == "block"  # empty department intersection: nobody
+    assert verdict("strict_tags", both) == "block"  # empty department intersection: nobody
     assert verdict("all_sources", both) == "allow"  # the user may read every source
     assert verdict("all_sources", finance_only) == "block"
-    assert verdict("strictest", finance_only) == "block"
+    assert verdict("strict_tags", finance_only) == "block"
+    default = CitationAccessGuard()
+    default.bind(rag)
+    assert default.summary_rule == "all_sources"
+    context = GuardContext(stage="output", documents=[summary], permission_filter=rag.permission_filter(both))
+    assert default.check("Both notes matter [1].", context).action == "allow"
     with pytest.raises(ValueError):
         CitationAccessGuard(summary_rule="loose")
