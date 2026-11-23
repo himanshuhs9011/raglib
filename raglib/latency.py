@@ -169,7 +169,7 @@ class LatencyStats:
         with self._lock:
             names = list(self._samples)
         known = [name for name in STAGE_ORDER if name in names]
-        guards = sorted(name for name in names if name.startswith("guard."))  # input guards run first
+        guards = sorted(name for name in names if name.startswith(("guard.", "judge.")))  # input guards run first
         return guards + known + sorted(name for name in names if name not in STAGE_ORDER and name not in guards)
 
     def samples(self, stage: str) -> List[LatencySample]:

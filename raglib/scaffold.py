@@ -189,6 +189,8 @@ rag = RAG(
     stream_holdback_chars=64,              # streamed text may trail the model this far while output guards check it (min 40)
     secure_defaults=True,                  # always-on protections; e.g. {"injection_flags": False} turns one off
     guard_models=None,                     # optional local guard models, e.g. {"injection": "protectai/deberta-v3-base-prompt-injection-v2"}
+    judge_model=None,                      # tier 2 LLM judge for unsure / high-risk checks (default: your cheapest model)
+    judge_budget=None,                     # e.g. {"max_calls_per_minute": 30, "max_usd_per_day": 1.0}: past it, tier 1 stands
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back

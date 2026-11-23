@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Guardrails, tier 2 (LLM judge, used sparingly).** See README "Tier 2: the LLM judge".
+- Tier 1 guards escalate to the judge only when their confidence is below `escalate_below` (per guard, default 0.6), when their verdict was unsure, or for high-risk requests: a question for an agent with tools, or an answer from non-public documents.
+- There are two hardened judgments. `input_safety` checks injection and toxicity in one shared call. `grounding` runs on `grounding_sample_rate` (default 5%) of normal answers plus every answer that used non-public documents. A local NLI model checks every answer and escalates only when unsure or non-public.
+- `RAG(judge_model=...)` sets the judge (default: the cheapest configured chat model). `RAG(judge_budget=JudgeBudget(...))` caps judge calls or cost per minute or per day; once a cap is reached, the tier-1 verdict stands and the trace records `budget_exhausted`.
+- Unparseable judge output is unsure: input safety fails closed and grounding fails open.
+- Verdicts are cached by input hash plus the judge's configuration (with single-flight, so concurrent escalations of one question make one call). They are never cached for grounding over non-public documents.
+- Each judge call is its own `judge.<kind>` trace stage, marked `escalated` with the reason, so it gets its own `LatencyStats` stage and `CostReport` line. Guard decisions carry `escalated` and `judge`. `GuardContext.high_risk` is new.
+
 **Guardrails, tier 1 (cheap model checks, opt-in).** See README "Guardrails" for the model table.
 - `TopicGuard(topics)`: compares the question with example questions per topic, using the query embedding retrieval makes anyway (served from the embedding cache). No extra model call. It runs before retrieval and blocks off-topic questions.
 - `InjectionClassifier` and `ToxicityClassifier`: a local classifier if you configured one, else your cheapest configured chat model (toxicity: OpenAI's free moderation endpoint when the chat provider is OpenAI), else skipped.

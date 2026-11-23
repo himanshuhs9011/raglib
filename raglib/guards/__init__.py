@@ -42,6 +42,7 @@ from raglib.guards.base import (
     modify,
 )
 from raglib.guards.classifiers import GroundingGuard, InjectionClassifier, ModelGuard, TopicGuard, ToxicityClassifier
+from raglib.guards.judge import JudgeBudget, LLMJudge
 from raglib.guards.models import RECOMMENDED_LOCAL_MODELS, ModerationClient
 from raglib.guards.parallel import GuardCancelled, ParallelInputGuards
 from raglib.guards.rules import (
@@ -145,6 +146,8 @@ __all__ = [
     "InMemoryGuardStore",
     "StreamingOutput",
     "InjectionClassifier",
+    "JudgeBudget",
+    "LLMJudge",
     "InjectionHeuristic",
     "JSONSchemaGuard",
     "MaxOutputTokens",

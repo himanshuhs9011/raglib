@@ -59,6 +59,9 @@ class Decision:
     latency_ms: float = 0.0
     # Flag-only guards: what the guard would have done ("block" / "modify"); the action stays "allow".
     flag: Optional[str] = None
+    # Tier 2: why the guard escalated to the LLM judge, and how that went (ok / cached / budget / unsure).
+    escalated: Optional[str] = None
+    judge: Optional[str] = None
     # Request-private data (the PII placeholder map): never traced, cached, logged or returned.
     private: Any = field(default=None, repr=False, compare=False)
 
@@ -102,6 +105,7 @@ class GuardContext:
     tool: Optional[str] = None
     retrieval_skipped: bool = False  # retrieval was skipped on purpose (small talk, "no retrieval needed")
     reranker: Optional[str] = None  # the reranker backend that scored ``documents`` (None / "none" = not reranked)
+    high_risk: Optional[str] = None  # why this request is high-risk (e.g. "tool calls"): tier 1 always escalates
 
 
 class Guard:
@@ -322,6 +326,7 @@ def _meta(decision: Decision) -> Dict[str, Any]:
         "cached": decision.cached,
         "reason": decision.reason,
         **({"flag": decision.flag} if decision.flag else {}),
+        **({"escalated": decision.escalated, "judge": decision.judge} if decision.escalated else {}),
         **({"error": decision.error} if decision.error else {}),
     }
 

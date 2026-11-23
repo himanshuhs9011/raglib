@@ -326,6 +326,8 @@ class RAG:
         stream_holdback_chars: int = 64,
         secure_defaults: Union[bool, Mapping[str, bool]] = True,
         guard_models: Optional[Mapping[str, Any]] = None,
+        judge_model: Optional[Union[str, BaseLLMClient, Any]] = None,
+        judge_budget: Optional[Any] = None,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -411,6 +413,9 @@ class RAG:
           ``{"injection": "protectai/deberta-v3-base-prompt-injection-v2", "nli": ...}`` (a model id that
           is already downloaded, or a callable). Optional: without one, a guard uses your cheapest
           configured API model, or is skipped with a one-time tip. Nothing is ever downloaded for you.
+        * ``judge_model``: the tier 2 LLM judge tier 1 guards escalate to (default: the cheapest
+          configured chat model); ``judge_budget``: a ``JudgeBudget`` (or dict) capping judge calls /
+          cost per minute and per day - past it the tier 1 verdict stands (see ``raglib.guards.judge``).
         """
 
         if top_k <= 0:
@@ -706,7 +711,20 @@ class RAG:
         self._tier_router: Optional[TierRouter] = (tier_router or HeuristicTierRouter()) if routing else None
 
         # Bound last: model-based guards pick their model (local -> cheapest API -> skipped) from
-        # everything configured above, including cheap_llm.
+        # everything configured above, including cheap_llm; the tier 2 judge likewise.
+        self._judge: Optional[Any] = None
+        if self._guards is not None and any(hasattr(g, "use_judge") for g in self._guards.all()):
+            from raglib.guards.judge import build_judge
+
+            judge_client = judge_model
+            if isinstance(judge_model, str):
+                judge_provider = parse_model_string(judge_model)[0]
+                judge_client = self._resolve_chat_llm(
+                    chat_llm=judge_model,
+                    api_key=effective_chat_key if judge_provider == chat_provider else None,
+                    model_name=None, base_url=None, timeout=llm_timeout, max_retries=llm_max_retries,
+                )[0]
+            self._judge = build_judge(self, judge_client, judge_budget, cache_ttl=guard_cache_ttl)
         if self._guards is not None:
             self._guards.bind(self)
             self._guard_signature = self._guards.signature()
@@ -878,6 +896,7 @@ class RAG:
         context = GuardContext(
             stage="input", question=question, user=context_user, user_id=uid, session_id=session_id,
             request=dict(request or {}), filters=filters,
+            high_risk="tool calls" if self._rag_type == "agentic" else None,
             permission_filter=self.permission_filter(context_user) if self._access is not None else None,
         )
         if self._rate_limit_key is not None:

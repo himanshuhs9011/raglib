@@ -60,7 +60,13 @@ class MockLLMClient(BaseLLMClient):
             message = prompt.split("Message:", 1)[-1].lower()
             toxic = any(word in message for word in ("idiot", "stupid", "hate you", "kill you"))
             return json.dumps({"toxic": toxic, "confidence": 0.9})
-        if lower.lstrip().startswith("you check whether an answer is supported"):
+        if lower.lstrip().startswith("you are the safety judge"):
+            from raglib.core.prompt_safety import injection_signals
+
+            message = prompt.split("Message:", 1)[-1]
+            toxic = any(word in message.lower() for word in ("idiot", "stupid", "hate you", "kill you"))
+            return json.dumps({"injection": bool(injection_signals(message)), "toxic": toxic, "confidence": 0.9})
+        if lower.lstrip().startswith(("you check whether an answer is supported", "you are the grounding judge")):
             return self._grounding(prompt)
         if "standalone question" in lower:
             return self._extract_query(prompt)

@@ -168,8 +168,8 @@ def price_run(prices: PriceTable, breakdown: Mapping[str, Any], events: Sequence
         usage = event.meta.get(STAGE_USAGE_KEY)
         if usage:
             by_stage[event.stage] = by_stage.get(event.stage, 0.0) + prices.cost(usage)["total"]
-        elif event.stage.startswith("guard."):
-            by_stage.setdefault(event.stage, 0.0)  # every guard gets its own line, free ones at $0
+        elif event.stage.startswith(("guard.", "judge.")):
+            by_stage.setdefault(event.stage, 0.0)  # every guard / judge gets its own line, free ones at $0
     other = total["total"] - sum(by_stage.values())
     if other > 1e-12:
         by_stage["other"] = other  # calls made outside any traced stage

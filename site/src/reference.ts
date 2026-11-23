@@ -153,6 +153,8 @@ export const GUARD_PARAMS: Param[] = [
   { name: "output_guards", default: "None", text: "OutputLeakGuard, CitationAccessGuard, JSONSchemaGuard, MaxOutputTokens, GroundingGuard." },
   { name: "tool_policy", default: "None", text: "Agent: allowed tools per role, max tool calls per question, argument limits." },
   { name: "guard_models", default: "None", text: 'Optional local models for tier 1 guards, e.g. {"injection": "protectai/deberta-v3-base-prompt-injection-v2"}. Never downloaded for you; without one a guard uses your cheapest API model, or is skipped with a tip.' },
+  { name: "judge_model", default: "None", text: "Tier 2 LLM judge, asked only when a tier 1 guard is unsure or the request is high-risk (agent tool calls, answers from non-public documents). Default: your cheapest configured chat model." },
+  { name: "judge_budget", default: "None", text: 'Cap on judge calls or cost per minute / day, e.g. {"max_calls_per_minute": 30, "max_usd_per_day": 2.0}. Past it, the tier 1 verdict stands (recorded in the trace).' },
   { name: "secure_defaults", default: "True", text: "Always-on protections that never change normal answers: citation access (with access_control), a 10-call agent limit, injection and secret flags." },
 ];
 

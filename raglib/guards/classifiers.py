@@ -36,6 +36,7 @@ from raglib.guards.verdicts import ask_verdict, hardened_prompt, probability
 
 def _with_mode(decision: Decision, mode: str) -> Decision:
     decision.mode = mode
+    decision.tier = max(decision.tier, 1)  # tier 1 checks (a judge's verdict is stamped tier 2)
     return decision
 
 
@@ -58,14 +59,25 @@ class ModelGuard(Guard):
         api: bool = True,
         allow_download: bool = False,
         llm: Any = None,
+        escalate_below: Optional[float] = 0.6,
+        use_judge: bool = True,
         **kwargs: Any,
     ):
         """``local_model``: a callable or a Hugging Face model id (never downloaded unless
-        ``allow_download=True``); ``api=False`` disables the API fallback; ``llm`` picks the API
-        model yourself (default: the cheapest configured one)."""
+        ``allow_download=True``); ``api=False`` disables the API fallback (and the judge); ``llm``
+        picks the API model yourself (default: the cheapest configured one).
+
+        Tier 2: when the RAG has a judge (``RAG(judge_model=...)``, else the cheapest model), the
+        guard escalates when its confidence is below ``escalate_below`` (``None``: never on
+        confidence), when its verdict was unsure, or for a high-risk request. ``use_judge=False``
+        keeps the guard at tier 1.
+        """
 
         super().__init__(**kwargs)
         self.threshold = threshold
+        self.escalate_below = escalate_below
+        self.use_judge = use_judge
+        self._judge: Any = None
         self.local_model = local_model
         self.api = api
         self.allow_download = allow_download
@@ -80,6 +92,7 @@ class ModelGuard(Guard):
     # ------------------------------------------------------------------ resolution
 
     def bind(self, rag: Any) -> None:
+        self._judge = getattr(rag, "_judge", None) if (rag is not None and self.use_judge and self.api) else None
         spec = self.local_model
         if spec is None and rag is not None:
             spec = (getattr(rag, "_guard_models", None) or {}).get(self.task)
@@ -126,6 +139,19 @@ class ModelGuard(Guard):
         return settings
 
     # ------------------------------------------------------------------ scoring
+
+    def _escalation(self, decision: Decision, unsure: bool, context: GuardContext) -> Optional[str]:
+        """Why to ask the judge (``None``: tier 1 stands)."""
+
+        if self._judge is None or self.mode == "skipped":
+            return None
+        if unsure:
+            return "unsure tier 1 verdict"
+        if context.high_risk:
+            return f"high risk: {context.high_risk}"
+        if self.escalate_below is not None and decision.confidence < self.escalate_below:
+            return f"low confidence ({decision.confidence:.2f} < {self.escalate_below:g})"
+        return None
 
     def _unsure(self, reason: str) -> Decision:
         """No usable verdict: security guards fail closed, quality guards fail open (confidence 0)."""
@@ -246,7 +272,44 @@ def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
     return dot / norm if norm else 0.0
 
 
-class InjectionClassifier(ModelGuard):
+class _InputSafetyGuard(ModelGuard):
+    """Tier 1 classifier on the question that escalates to the combined input-safety judge."""
+
+    judge_flag = ""
+
+    def _tier1(self, value: str) -> Tuple[Decision, bool]:
+        raise NotImplementedError
+
+    def check(self, value: str, context: GuardContext) -> Decision:
+        self._ensure_bound()
+        if self.mode == "skipped":
+            return skipped("no local model or API model")
+        decision, unsure = self._tier1(value)
+        why = self._escalation(decision, unsure, context)
+        return self._escalate(value, decision, why) if why else decision
+
+    def _escalate(self, value: str, tier1: Decision, why: str) -> Decision:
+        result = self._judge.input_safety(value, why)
+        if result.status == "budget":
+            tier1.escalated, tier1.judge = why, "budget"
+            tier1.reason += f"; judge budget reached ({result.detail}), tier 1 verdict kept"
+            return tier1
+        if result.status != "ok":  # unsure judge: security guards fail closed
+            decision = self._unsure(f"judge verdict unparseable: unsure (escalated: {why})")
+        else:
+            p = probability(result.verdict, self.judge_flag) or 0.0
+            reason = f"judge: {self.judge_flag} p={p:.2f} (escalated: {why})"
+            if p >= self.threshold:
+                decision = block(self.block_message, reason=reason, confidence=_certainty(p))
+            else:
+                decision = allow(reason=reason, confidence=_certainty(p))
+            decision.mode = "api"
+        decision.tier, decision.escalated = 2, why
+        decision.judge = "cached" if result.cached else result.status
+        return decision
+
+
+class InjectionClassifier(_InputSafetyGuard):
     """Prompt-injection classifier on the question (tier 1, parallel with retrieval).
 
     Local (recommended): ``protectai/deberta-v3-base-prompt-injection-v2``. API fallback: your
@@ -256,23 +319,21 @@ class InjectionClassifier(ModelGuard):
 
     name = "injection_classifier"
     task = "injection"
+    judge_flag = "injection"
     positive_labels = ("injection", "label_1", "jailbreak", "unsafe")
     block_message = "This question looks like an attempt to change the assistant's instructions, so it was not answered."
 
-    def check(self, value: str, context: GuardContext) -> Decision:
-        self._ensure_bound()
-        if self.mode == "skipped":
-            return skipped("no local model or API model")
+    def _tier1(self, value: str) -> Tuple[Decision, bool]:
         if self.mode == "local":
             p = self._local_probability(value)
         else:
             p = self._api_probability(value)
             if p is None:
-                return self._unsure(f"unparseable verdict ({self.backend}): unsure")
+                return self._unsure(f"unparseable verdict ({self.backend}): unsure"), True
         reason = f"injection p={p:.2f} ({self.mode}: {self.backend})"
         if p >= self.threshold:
-            return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode)
-        return _with_mode(allow(reason=reason, confidence=_certainty(p)), self.mode)
+            return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode), False
+        return _with_mode(allow(reason=reason, confidence=_certainty(p)), self.mode), False
 
     def _api_probability(self, text: str) -> Optional[float]:
         prompt = hardened_prompt(
@@ -285,7 +346,7 @@ class InjectionClassifier(ModelGuard):
         return probability(ask_verdict(self._client, prompt, {"injection": "bool", "confidence": "prob"}), "injection")
 
 
-class ToxicityClassifier(ModelGuard):
+class ToxicityClassifier(_InputSafetyGuard):
     """Toxicity / abuse check on the question (and the answer with ``check_answers=True``).
 
     Local (recommended): ``unitary/toxic-bert``. API fallback: OpenAI's moderation endpoint (free)
@@ -294,6 +355,7 @@ class ToxicityClassifier(ModelGuard):
 
     name = "toxicity"
     task = "toxicity"
+    judge_flag = "toxic"
     positive_labels = ("toxic", "toxicity", "severe_toxic", "obscene", "threat", "insult", "identity_hate", "label_1")
     block_message = "This message was not answered because it appears to contain abusive or harmful content."
 
@@ -310,10 +372,7 @@ class ToxicityClassifier(ModelGuard):
             return True
         return super()._resolve_api(rag)
 
-    def check(self, value: str, context: GuardContext) -> Decision:
-        self._ensure_bound()
-        if self.mode == "skipped":
-            return skipped("no local model or API model")
+    def _tier1(self, value: str) -> Tuple[Decision, bool]:
         if self.mode == "local":
             p = self._local_probability(value)
         elif self._moderation is not None:
@@ -321,11 +380,11 @@ class ToxicityClassifier(ModelGuard):
         else:
             p = self._api_probability(value)
             if p is None:
-                return self._unsure(f"unparseable verdict ({self.backend}): unsure")
+                return self._unsure(f"unparseable verdict ({self.backend}): unsure"), True
         reason = f"toxicity p={p:.2f} ({self.mode}: {self.backend})"
         if p >= self.threshold:
-            return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode)
-        return _with_mode(allow(reason=reason, confidence=_certainty(p)), self.mode)
+            return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode), False
+        return _with_mode(allow(reason=reason, confidence=_certainty(p)), self.mode), False
 
     def _api_probability(self, text: str) -> Optional[float]:
         prompt = hardened_prompt(
@@ -345,10 +404,12 @@ class GroundingGuard(ModelGuard):
     """Is the answer supported by its sources? (output stage; quality guard: fails open)
 
     Local (recommended): an NLI cross-encoder such as ``cross-encoder/nli-deberta-v3-small`` checks
-    every answer sentence against the sources (every answer: it is cheap). API fallback: your
-    cheapest chat model judges the answer, on a random ``grounding_sample_rate`` share of answers
-    (default 5%; the others are recorded as ``mode="skipped"``, reason "not sampled"). Blocks when
-    less than ``min_supported`` of the answer's sentences are supported. Not streaming-safe.
+    every answer sentence against the sources (every answer: it is cheap) and escalates to the
+    tier 2 judge when unsure or when the answer used non-public documents. Without a local model the
+    judge checks a random ``grounding_sample_rate`` share of answers (default 5%; the others are
+    recorded as ``mode="skipped"``, reason "not sampled") plus every answer that used non-public
+    documents. Blocks when less than ``min_supported`` of the answer's sentences are supported.
+    Not streaming-safe. Verdicts over non-public documents are never cached.
     Trade-off: small NLI models misjudge paraphrases and numbers; sampling misses most bad answers
     by design - it measures the grounding rate, it does not police every answer.
     """
@@ -379,26 +440,67 @@ class GroundingGuard(ModelGuard):
         self.max_sentences = max_sentences
         self.max_sources = max_sources
         self._rng = rng or random.Random()
+        self._private: Optional[Callable[[Any], bool]] = None
+
+    def bind(self, rag: Any) -> None:
+        super().bind(rag)
+        if rag is not None and getattr(rag, "_access", None) is not None:
+            self._private = getattr(rag, "_private_document", None)
+
+    def _verdict(self, supported: float, reason: str) -> Decision:
+        confidence = round(min(1.0, abs(supported - self.min_supported) * 2), 3)
+        if supported < self.min_supported:
+            return _with_mode(block(self.block_message, reason=reason, confidence=confidence), self.mode)
+        return _with_mode(allow(reason=reason, confidence=confidence), self.mode)
 
     def check(self, value: str, context: GuardContext) -> Decision:
         self._ensure_bound()
         if self.mode == "skipped":
             return skipped("no local model or API model")
-        sources = [getattr(doc, "content", "") for doc in list(context.documents)[: self.max_sources] if getattr(doc, "content", "")]
+        documents = list(context.documents)
+        sources = [getattr(doc, "content", "") for doc in documents[: self.max_sources] if getattr(doc, "content", "")]
         sentences = [s for s in (_CITATION.sub("", part).strip() for part in _SENTENCE.split(value or "")) if len(s.split()) >= 4]
         if not sources or not sentences:
             return _with_mode(allow(reason="nothing to check (no sources or no factual sentences)"), self.mode)
-        if self.mode == "api" and self._rng.random() >= self.grounding_sample_rate:
-            return skipped(f"not sampled (grounding_sample_rate={self.grounding_sample_rate:g})")
+        non_public = self._private is not None and any(self._private(doc) for doc in documents)
         sentences = sentences[: self.max_sentences]
-        supported = self._local_supported(sentences, sources) if self.mode == "local" else self._api_supported(value, sources)
+        if self.mode == "local":
+            supported = self._local_supported(sentences, sources)
+            tier1 = self._verdict(supported, f"{supported:.0%} of the answer supported (local: {self.backend})")
+            why = "non-public sources" if non_public and self._judge is not None else self._escalation(tier1, False, context)
+            return self._escalate(value, sources, tier1, why, non_public) if why else tier1
+        if non_public:
+            why = "non-public sources"
+        elif self._rng.random() < self.grounding_sample_rate:
+            why = f"sampled (grounding_sample_rate={self.grounding_sample_rate:g})"
+        else:
+            return skipped(f"not sampled (grounding_sample_rate={self.grounding_sample_rate:g})")
+        if self._judge is not None:
+            return self._escalate(value, sources, None, why, non_public)
+        supported = self._api_supported(value, sources)  # no judge: the tier 1 API check
         if supported is None:
             return self._unsure(f"unparseable verdict ({self.backend}): unsure")
-        reason = f"{supported:.0%} of the answer supported ({self.mode}: {self.backend})"
-        confidence = round(min(1.0, abs(supported - self.min_supported) * 2), 3)
-        if supported < self.min_supported:
-            return _with_mode(block(self.block_message, reason=reason, confidence=confidence), self.mode)
-        return _with_mode(allow(reason=reason, confidence=confidence), self.mode)
+        return self._verdict(supported, f"{supported:.0%} of the answer supported (api: {self.backend}; {why})")
+
+    def _escalate(self, answer: str, sources: List[str], tier1: Optional[Decision], why: str, non_public: bool) -> Decision:
+        result = self._judge.grounding(answer, sources, why, cacheable=not non_public)
+        if result.status == "budget":
+            if tier1 is None:
+                decision = skipped(f"judge budget reached ({result.detail}): not checked ({why})")
+            else:
+                decision = tier1
+                decision.reason += f"; judge budget reached ({result.detail}), tier 1 verdict kept"
+            decision.escalated, decision.judge = why, "budget"
+            return decision
+        if result.status != "ok":  # quality guard: an unsure judge fails open
+            decision = self._unsure(f"judge verdict unparseable: unsure (escalated: {why})")
+        else:
+            supported = float(result.verdict["supported_fraction"])
+            decision = self._verdict(supported, f"judge: {supported:.0%} of the answer supported (escalated: {why})")
+            decision.mode = "api"
+        decision.tier, decision.escalated = 2, why
+        decision.judge = "cached" if result.cached else result.status
+        return decision
 
     def _local_supported(self, sentences: List[str], sources: List[str]) -> float:
         assert self._local is not None

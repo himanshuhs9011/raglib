@@ -722,6 +722,38 @@ These figures are rough: they depend on hardware, text length and your model pri
 **Grounding.** `GroundingGuard` is not streaming-safe, so with it `rag.stream(...)` delivers the checked answer in one piece. In API mode, answers that were not sampled are recorded as `mode="skipped"` with reason "not sampled". Sampling measures your grounding rate; it does not police every answer. To check every answer, use a local NLI model, which is free per answer, or set `grounding_sample_rate=1.0`. Small NLI models can misjudge paraphrases and numbers, so calibrate `min_supported` / `entailment_threshold` on your own answers first.
 
 
+### Guardrails tier 2: the LLM judge (used sparingly)
+
+Tier 1 guards (`InjectionClassifier`, `ToxicityClassifier`, `GroundingGuard`) escalate to an LLM judge only when they need to:
+- Their confidence is below `escalate_below` (per guard; default 0.6, and `None` never escalates on confidence), or their verdict was unsure because the output did not parse.
+- The request is high-risk: a question for an agent with tools (`rag_type="agentic"`), or an answer that used non-public documents.
+- `GroundingGuard` without a local NLI model is judged on `grounding_sample_rate` of normal answers (default 5%), plus **every** answer that used non-public documents.
+
+There are two judgments. `input_safety` checks injection and toxicity in one call; both classifiers share it, and the second one reads it from the cache. `grounding` checks whether the answer is supported. Both judge prompts are hardened like every other guard prompt. A judge reply that does not parse is unsure: input safety fails closed and grounding fails open.
+
+```python
+from raglib.guards import InjectionClassifier, GroundingGuard, JudgeBudget
+
+rag = RAG(
+    "docs/", llm="openai/gpt-4.1",
+    input_guards=["default", InjectionClassifier(local_model="protectai/deberta-v3-base-prompt-injection-v2", escalate_below=0.7)],
+    output_guards=["default", GroundingGuard(grounding_sample_rate=0.05)],
+    judge_model="openai/gpt-4.1-mini",                 # default: your cheapest configured chat model
+    judge_budget=JudgeBudget(max_calls_per_minute=30, max_usd_per_day=2.0),
+)
+```
+
+| Option | Effect | Trade-off |
+| :--- | :--- | :--- |
+| `escalate_below` (per guard) | Below this confidence, ask the judge | Higher means more judge calls (cost, ~0.3-1.5 s each) and fewer wrong tier-1 verdicts |
+| `use_judge=False` (per guard) | This guard never escalates | Tier 1 stands, including unsure verdicts (which fail closed for security guards) |
+| `judge_model=` | The model that judges | A stronger judge is more accurate per call; at most a few percent of questions reach it |
+| `judge_budget=` | Caps judge calls or cost per minute / UTC day, per process | Once it is reached, the tier-1 verdict stands; the judge stage has `budget_exhausted=True` and the decision has `judge="budget"`. USD caps need `prices=`. The last admitted call can overshoot by its own cost. |
+| `grounding_sample_rate` | Share of normal answers whose grounding is judged | 5% measures your grounding rate. It does not check every answer; use a local NLI model for that. |
+
+Judge verdicts are cached by input hash plus the judge's configuration (model and prompt version), for `guard_cache_ttl` seconds. They are never cached for user-dependent checks, i.e. grounding over non-public documents. Every judge call is its own trace stage, `judge.input_safety` or `judge.grounding`, with `escalated=True`, `escalation` (the reason), `model`, `cached` and `budget_exhausted` in its meta. That makes it a separate `LatencyStats` stage and a separate `CostReport` line. The deciding guard's record in `result.metadata["guards"]` has `tier=2`, `escalated` and `judge` (`ok` / `cached` / `budget` / `unsure`).
+
+
 ## 11. Web Search Providers (All 9 Providers)
 
 Web search is **off by default**. Enable it with `web_search_provider`:
