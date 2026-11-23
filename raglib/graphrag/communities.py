@@ -136,9 +136,13 @@ class CommunityReporter:
                 community.title, community.summary = old.title, old.summary
                 community.findings, community.rating = list(old.findings), old.rating
                 community.report_signature, community.embedding = old.report_signature, old.embedding
+                # The kept text may predate chunks added since: inherit from old and current sources.
+                community.source_chunk_ids = sorted(set(old.source_chunk_ids) | set(member_chunk_ids(community, store)))
             else:
                 todo.append(community)
 
+        for community in todo:  # recorded at build time: the chunks this report is written from
+            community.source_chunk_ids = member_chunk_ids(community, store)
         small = [c for c in todo if len(c.entity_ids) < self.min_llm_report_size]
         for community in small:
             self._template_report(community, store)
@@ -217,3 +221,12 @@ class CommunityReporter:
             community.rating = 0.0
         community.report_signature = community.signature
         community.embedding = None
+
+
+def member_chunk_ids(community: Community, store: BaseGraphStore) -> List[str]:
+    """Every source chunk of every member entity (what a community report can draw on)."""
+
+    chunk_ids = set()
+    for entity in store.get_entities(community.entity_ids):
+        chunk_ids.update(entity.source_chunk_ids)
+    return sorted(chunk_ids)

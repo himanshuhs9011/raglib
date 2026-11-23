@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from raglib.access import FilterNotSupportedError
 from raglib.core.concurrency import parallel_map
@@ -178,14 +178,22 @@ class LocalSearch:
                     continue
                 chunk_scores[chunk_id] = chunk_scores.get(chunk_id, 0.0) + weight
 
+        def used_chunks(source_chunk_ids: Sequence[str]) -> List[str]:
+            """The chunks whose text a line shows: all of them, or only the visible ones (name only)."""
+
+            if gate is None or gate.all_allowed(source_chunk_ids):
+                return list(source_chunk_ids)
+            return [chunk_id for chunk_id in source_chunk_ids if gate.allowed(chunk_id)]
+
         documents: List[Document] = []
         ranked_entities = sorted(entities.values(), key=lambda e: weights.get(e.id, 0.0), reverse=True)[:12]
         if ranked_entities:
+            sources = [chunk_id for e in ranked_entities for chunk_id in used_chunks(e.source_chunk_ids)]
             documents.append(
                 Document(
                     id=f"graph-entities-{_digest(query)}",
                     content="Entities:\n" + "\n".join(entity_line(e) for e in ranked_entities),
-                    metadata={"title": "Knowledge graph entities", "graph": "entities"},
+                    metadata={"title": "Knowledge graph entities", "graph": "entities", **inherited_access(self, sources)},
                     source="graph",
                     score=1.0,
                 )
@@ -206,11 +214,12 @@ class LocalSearch:
             return f"{line}: {r.description[:200]}"
 
         if relations:
+            sources = [chunk_id for r in relations for chunk_id in used_chunks(r.source_chunk_ids)]
             documents.append(
                 Document(
                     id=f"graph-relations-{_digest(query)}",
                     content="Relationships:\n" + "\n".join(relation_line(r) for r in relations),
-                    metadata={"title": "Knowledge graph relationships", "graph": "relations"},
+                    metadata={"title": "Knowledge graph relationships", "graph": "relations", **inherited_access(self, sources)},
                     source="graph",
                     score=0.9,
                 )
@@ -254,7 +263,10 @@ class LocalSearch:
                 Document(
                     id=f"community-{community.id}",
                     content=f"Community report - {community.report_text()}",
-                    metadata={"title": community.title, "graph": "community", "level": community.level},
+                    metadata={
+                        "title": community.title, "graph": "community", "level": community.level,
+                        **inherited_access(self, community_chunks(store, community)),
+                    },
                     source="graph",
                     score=0.8,
                 )
@@ -374,12 +386,47 @@ class GlobalSearch:
                 Document(
                     id=f"{community.id}_p{index}",
                     content=text,
-                    metadata={"title": community.title or community.id, "graph": "global_point", "community_id": community.id},
+                    metadata={
+                        "title": community.title or community.id, "graph": "global_point", "community_id": community.id,
+                        **inherited_access(self, community_chunks(self.indexer.store, community)),
+                    },
                     source="graph",
                     score=score,
                 )
             )
         return documents
+
+
+def community_chunks(store: Any, community: Community) -> List[str]:
+    """The chunks a community report was built from (recorded at build time; older stores: members' now)."""
+
+    if community.source_chunk_ids:
+        return list(community.source_chunk_ids)
+    from raglib.graphrag.communities import member_chunk_ids
+
+    return member_chunk_ids(community, store)
+
+
+MAX_LISTED_SOURCES = 200
+
+
+def inherited_access(search: Any, chunk_ids: Sequence[str]) -> Dict[str, Any]:
+    """Access tags a summary inherits from its source chunks (``AccessControl.strictest``) plus
+    ``source_chunk_ids``; empty when access control is off (``search.access is None``).
+
+    A source chunk that no longer exists counts as untagged, so the summary is denied by default.
+    """
+
+    access = getattr(search, "access", None)
+    if access is None:
+        return {}
+    ids = sorted(set(chunk_ids))
+    lookup = getattr(search, "chunk_lookup", None)
+    metadatas = []
+    for chunk_id in ids:
+        chunk = lookup(chunk_id) if lookup is not None else None
+        metadatas.append(dict(chunk.metadata) if chunk is not None else {})
+    return {**access.strictest(metadatas), "source_chunk_ids": ids[:MAX_LISTED_SOURCES]}
 
 
 def _digest(text: str) -> str:

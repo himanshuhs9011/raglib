@@ -34,6 +34,9 @@ ACCESS_TAG_KEYS: Tuple[str, ...] = (ACCESS_LEVEL_KEY, DEPARTMENT_KEY, ALLOWED_RO
 ACL_PREFIX = "_acl_"
 ACL_ANY_DEPARTMENT = "_acl_dept_any"
 ACL_ANY_ROLE = "_acl_role_any"
+# Tag values no user holds: a summary whose sources share no department / role.
+NO_DEPARTMENT = "__no_common_department__"
+NO_ROLE = "__no_common_role__"
 
 
 class FilterNotSupportedError(RuntimeError):
@@ -164,6 +167,33 @@ class AccessControl:
                 {"$or": [{ACL_ANY_ROLE: True}] + [{_acl_key("role", name): True} for name in roles]},
             ]
         }
+
+    def strictest(self, metadatas: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """The access tags a summary built from these chunks inherits: the strictest of all of them.
+
+        * ``access_level``: the highest level of any source chunk. A source without a level (and
+          no ``default_access_level``), or no sources at all, gives no level: deny by default.
+        * ``department`` / ``allowed_roles``: the intersection over the sources that restrict them
+          (sources without the tag do not restrict). An empty intersection gives a value nobody
+          holds, so nobody sees the summary. This is stricter than "pass every source's rule" for
+          users in several departments - safe, never looser.
+        """
+
+        if not metadatas:
+            return {}
+        ranks = []
+        for metadata in metadatas:
+            level = metadata.get(ACCESS_LEVEL_KEY) or self.default_access_level
+            if level in (None, ""):
+                return {}
+            ranks.append(self._rank(str(level)))
+        tags: Dict[str, Any] = {ACCESS_LEVEL_KEY: self.levels[max(ranks)]}
+        for key, nobody in ((DEPARTMENT_KEY, NO_DEPARTMENT), (ALLOWED_ROLES_KEY, NO_ROLE)):
+            restricted = [set(_as_tuple(m.get(key), key)) for m in metadatas if _as_tuple(m.get(key), key)]
+            if restricted:
+                common = set.intersection(*restricted)
+                tags[key] = sorted(common) if common else [nobody]
+        return tags
 
     @staticmethod
     def signature(metadata: Mapping[str, Any]) -> str:

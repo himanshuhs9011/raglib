@@ -111,6 +111,9 @@ class Community:
     findings: List[str] = field(default_factory=list)
     rating: float = 0.0
     embedding: Optional[List[float]] = None
+    # Chunks the report was written from (all member entities' sources, recorded when the report is
+    # built): a report inherits the strictest access tags of all of them.
+    source_chunk_ids: List[str] = field(default_factory=list)
 
     @property
     def has_report(self) -> bool:

@@ -2051,6 +2051,9 @@ class RAG:
             max_workers=int(graph_kwargs.get("max_workers", 8)),
             **{key: graph_kwargs[key] for key in GRAPH_GLOBAL_OPTIONS if key in graph_kwargs},
         )
+        # With access control, every summary document (entities, relations, community reports, global
+        # points) inherits the strictest access tags of the chunks it was built from.
+        local.access = global_search.access = self._access
         self._graph_retriever = GraphRetriever(
             local=local,
             global_search=global_search,

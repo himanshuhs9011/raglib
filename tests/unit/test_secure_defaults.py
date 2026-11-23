@@ -12,7 +12,6 @@ from raglib import RAG, UserContext, access_tags
 from raglib.guards import InjectionHeuristic
 from raglib.guards.defaults import GUARD_TIP_ENV, reset_guard_tip
 from raglib.llm.mock_client import MockLLMClient
-from raglib.schemas import Document
 
 CORPUS = [
     "Acme Corp offices close on Friday afternoons in summer and the cafeteria opens at eight.",
@@ -183,7 +182,3 @@ def test_guard_tip_is_logged_once_and_can_be_silenced(caplog: pytest.LogCaptureF
     monkeypatch.setenv(GUARD_TIP_ENV, "0")
     _rag()
     assert tips() == 0
-
-
-def test_document_fixture_is_public() -> None:
-    assert Document(id="x", content="y").metadata == {}

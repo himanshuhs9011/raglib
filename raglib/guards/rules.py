@@ -539,9 +539,10 @@ class CitationAccessGuard(Guard):
 
     A source's permission comes from its access tags (``access_level``, ``department``,
     ``allowed_roles``), so copies of a chunk that lost the internal ``_acl_*`` keys (e.g. GraphRAG's
-    chunk view) are judged correctly. Derived context marked ``metadata["supplementary"]``
-    (GraphRAG entity / relation / community summaries) is built per user by the graph's own access
-    rules and has no tags of its own, so it is not re-checked here.
+    chunk view) are judged correctly. GraphRAG summaries (entities, relations, community reports,
+    global points) carry the strictest tags of the chunks they were built from
+    (``AccessControl.strictest``), so they are checked the same way; a summary without tags is
+    denied, like any untagged document.
     """
 
     name = "citation_access"
@@ -557,8 +558,6 @@ class CitationAccessGuard(Guard):
         from raglib.vectorstores.base_store import matches_filter
 
         metadata = dict(getattr(document, "metadata", {}) or {})
-        if metadata.get("supplementary"):
-            return True
         access = getattr(self, "_access", None)
         if access is not None:
             metadata = access.tag(metadata)  # re-derive the _acl_* keys from the access tags
