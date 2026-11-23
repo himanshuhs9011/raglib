@@ -74,3 +74,56 @@ def test_guardrail_cost_benchmark_runs_offline(tmp_path) -> None:
     assert setups["all / api"]["cheap_llm_calls"] > setups["all / local"]["cheap_llm_calls"]
     assert any(stage.startswith("guard.") for stage in setups["production"]["stages"])
     assert cost_bench.main(["--llm", "openai/gpt-4.1-mini"]) == 2  # paid: needs --yes, nothing sent
+
+
+def _public_datasets():
+    spec = importlib.util.spec_from_file_location("public_datasets", ROOT / "benchmarks" / "chunking" / "public_datasets.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["public_datasets"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_miracl_subset_keeps_judged_documents_and_samples_distractors(tmp_path, monkeypatch) -> None:
+    import gzip
+    import json
+
+    public = _public_datasets()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "topics.tsv").write_text("q1#0\tभारत की राजधानी क्या है?\nq2#0\tगंगा कहाँ बहती है?\nq3#0\tबिना जवाब\n", encoding="utf-8")
+    (raw / "qrels.tsv").write_text("q1#0\tQ0\td1#0\t1\nq1#0\tQ0\td2#0\t0\nq2#0\tQ0\td3#0\t1\n", encoding="utf-8")
+    rows = [{"docid": f"d{i}#0", "title": f"T{i}", "text": f"पाठ {i}।"} for i in range(1, 40)]
+    with gzip.open(raw / "docs.gz", "wt", encoding="utf-8") as handle:
+        handle.write("\n".join(json.dumps(row, ensure_ascii=False) for row in rows))
+    empty = raw / "empty.gz"
+    with gzip.open(empty, "wt", encoding="utf-8") as handle:
+        handle.write("")
+    files = {"topics": raw / "topics.tsv", "qrels": raw / "qrels.tsv", "docs-0": raw / "docs.gz", "docs-1": empty}
+
+    def fake_download(url, target):
+        return next(path for key, path in files.items() if key in url)
+
+    monkeypatch.setattr(public, "download", fake_download)
+    docs_dir, golden, info = public.prepare_miracl("miracl-hi", tmp_path / "cache", max_queries=5, max_docs=10, seed=1)
+    names = {path.name for path in docs_dir.glob("*.txt")}
+    assert {"d1_0.txt", "d2_0.txt", "d3_0.txt"} <= names and len(names) == 10  # judged + 7 distractors
+    questions = [json.loads(line) for line in golden.read_text(encoding="utf-8").splitlines()]
+    assert sorted(tuple(q["relevant_ids"]) for q in questions) == [("d1_0.txt",), ("d3_0.txt",)]  # positives only
+    assert all(q["relevant_ids"] for q in questions) and info["language"] == "Hindi" and info["queries"] == 2
+
+
+def test_beir_subset_from_parquet(tmp_path, monkeypatch) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    public = _public_datasets()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    pq.write_table(pa.table({"_id": ["a", "b", "c"], "title": ["A", "B", "C"], "text": ["alpha", "beta", "gamma"]}), raw / "c.parquet")
+    pq.write_table(pa.table({"_id": ["1", "2"], "title": ["", ""], "text": ["what is alpha?", "no labels"]}), raw / "q.parquet")
+    (raw / "qrels.tsv").write_text("query-id\tcorpus-id\tscore\n1\ta\t1\n", encoding="utf-8")
+    files = {"corpus": raw / "c.parquet", "queries": raw / "q.parquet", "test.tsv": raw / "qrels.tsv"}
+    monkeypatch.setattr(public, "download", lambda url, target: next(p for k, p in files.items() if k in url))
+    docs_dir, golden, info = public.prepare_beir("scifact", tmp_path / "cache", max_queries=10, max_docs=2, seed=1)
+    assert info["queries"] == 1 and len(list(docs_dir.glob("*.txt"))) == 2 and "a.txt" in golden.read_text(encoding="utf-8")
