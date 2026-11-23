@@ -128,3 +128,42 @@ def test_openai_rejects_oversized_input_before_calling_the_api(monkeypatch: pyte
         pytest.skip("tiktoken not installed: no exact OpenAI token count")
     with pytest.raises(EmbeddingLimitError, match="at most 8191"):
         client.embed_documents(["token " * 9000])
+
+
+
+def test_unknown_limits_warn_once_per_model_and_never_raise() -> None:
+    import warnings
+
+    from raglib import RAG
+    from raglib.embedding import limits
+    from raglib.embedding.base_embedding import BaseEmbedding
+    from raglib.embedding.limits import EmbeddingLimitWarning
+
+    class Unknown(BaseEmbedding):
+        def __init__(self, name: str) -> None:
+            self._model_name = name
+
+        def embed_documents(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+        @property
+        def dimension(self):
+            return 2
+
+    limits._UNKNOWN_WARNED.clear()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        RAG("A short text.", chat_llm="mock", embedding_llm=Unknown("acme-embed-v1"), token_counter="units")
+        RAG("A short text.", chat_llm="mock", embedding_llm=Unknown("acme-embed-v1"), token_counter="units")
+        RAG("A short text.", chat_llm="mock", embedding_llm=Unknown("acme-embed-v2"), preset="production",
+            reranker="none")  # production uses oversized_chunks="raise": still only a warning
+        RAG("A short text.", chat_llm="mock", embedding_llm=Unknown("acme-embed-v3"), embedding_max_tokens=512,
+            token_counter="units")  # a set limit: no warning
+        RAG("A short text.", offline=True, token_counter="units")  # offline mock embedding: no warning
+    messages = [str(w.message) for w in caught if issubclass(w.category, EmbeddingLimitWarning) and "is unknown" in str(w.message)]
+    assert len(messages) == 2
+    assert "acme-embed-v1" in messages[0] and "embedding_max_tokens=" in messages[0]
+    assert "acme-embed-v2" in messages[1]

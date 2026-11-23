@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**Unknown embedding limits warn.** When raglib does not know an embedding model's input limit (a custom embedding, or a provider model missing from the table), it now warns once per model with an `EmbeddingLimitWarning`. The warning names the model and suggests `RAG(embedding_max_tokens=...)`, so a provider can no longer truncate long chunks silently without notice. It only warns; it never raises, even with `preset="production"` / `oversized_chunks="raise"`. The offline mock embedding is exempt.
+
 **Guardrails, tier 2 (LLM judge, used sparingly).** See README "Tier 2: the LLM judge".
 - Tier 1 guards escalate to the judge only when their confidence is below `escalate_below` (per guard, default 0.6), when their verdict was unsure, or for high-risk requests: a question for an agent with tools, or an answer from non-public documents.
 - There are two hardened judgments. `input_safety` checks injection and toxicity in one shared call. `grounding` runs on `grounding_sample_rate` (default 5%) of normal answers plus every answer that used non-public documents. A local NLI model checks every answer and escalates only when unsure or non-public.

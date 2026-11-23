@@ -64,3 +64,29 @@ TOKENIZER_SAMPLE = (
     "2026 hiring plan: twelve engineers, four account managers and two compliance specialists, "
     "subject to the usual background checks and the renewal of the office lease on Hamilton Street."
 )
+
+
+_UNKNOWN_WARNED: set = set()
+
+
+def warn_unknown_limit(model: str) -> bool:
+    """Warn once per process per model that its input limit is unknown (never raises).
+
+    Returns True when the warning was emitted now.
+    """
+
+    import logging
+    import warnings
+
+    if model in _UNKNOWN_WARNED:
+        return False
+    _UNKNOWN_WARNED.add(model)
+    message = (
+        f"The input limit of embedding model '{model}' is unknown, so raglib cannot check that chunks fit: "
+        "a provider that truncates long input would do so silently. Set RAG(embedding_max_tokens=<limit>) "
+        "(e.g. 512 for bge / e5 models, 8192 for OpenAI text-embedding-3-*) to have oversized chunks split "
+        "or rejected (oversized_chunks=)."
+    )
+    logging.getLogger(__name__).warning(message)
+    warnings.warn(message, EmbeddingLimitWarning, stacklevel=4)
+    return True

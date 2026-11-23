@@ -1250,6 +1250,13 @@ class RAG:
         embedding = self._embedding
         limit = override or (embedding.max_input_tokens if embedding is not None else None)
         self._embedding_limit = limit
+        if embedding is not None and not limit:
+            # Unknown limit: warn (once per model), never raise - not even with oversized_chunks="raise".
+            from raglib.embedding.limits import warn_unknown_limit
+            from raglib.embedding.mock_embedding import MockEmbedding
+
+            if not isinstance(unwrap_embedding(embedding), MockEmbedding):  # offline hash vectors never truncate
+                warn_unknown_limit(embedding.model_name or type(unwrap_embedding(embedding)).__name__)
         if not limit or embedding is None:
             return
         exact = embedding.count_input_tokens(TOKENIZER_SAMPLE) is not None
