@@ -77,7 +77,7 @@ from raglib.presets import apply_presets
 from raglib.providers.base_provider import BaseSearchProvider
 from raglib.providers.factory import build_search_provider, normalize_provider_name
 from raglib.routing import TIER_CHEAP, TIER_FAQ, TIER_FULL, HeuristicTierRouter, TierRouter, decide
-from raglib.schemas import Document, GenerationResult
+from raglib.schemas import Document, GenerationResult, TraceEvent
 from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord, matches_filter
 from raglib.vectorstores.in_memory_store import InMemoryVectorStore
 from raglib.vision.base_vision import BaseVisionClient
@@ -290,6 +290,10 @@ class RAG:
         semantic_breakpoint: str = "percentile",
         semantic_threshold: Optional[float] = None,
         prices: Union[PriceTable, Mapping[str, Any], None] = None,
+        semantic_min_tokens: Optional[int] = None,
+        token_counter: Union[str, Callable[[str], int]] = "units",
+        on_embedding_failure: str = "fallback",
+        abbreviations: Optional[Sequence[str]] = None,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -334,7 +338,10 @@ class RAG:
         * ``parent_retrieval="heading" | "fixed"``: search small chunks, answer from their parent
           sections of up to ``parent_chunk_size`` tokens.
         * ``chunking_strategy="embedding"``: semantic chunking with ``semantic_breakpoint`` /
-          ``semantic_threshold`` (see ``ChunkSplitter``).
+          ``semantic_threshold`` / ``semantic_min_tokens``; ``on_embedding_failure="raise"`` makes a
+          failed embedding call fail ingestion instead of falling back (see ``ChunkSplitter``).
+        * ``token_counter``: how chunk sizes are measured - ``"units"`` (words; default),
+          ``"tiktoken"``, ``"auto"`` or a callable; the embedding cost estimate uses the same one.
         * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
         """
 
@@ -428,7 +435,17 @@ class RAG:
             embedding=self._embedding,
             semantic_breakpoint=semantic_breakpoint,
             semantic_threshold=semantic_threshold,
+            semantic_min_tokens=semantic_min_tokens,
+            token_counter=token_counter,
+            on_embedding_failure=on_embedding_failure,
+            abbreviations=abbreviations,
+            on_fallback=self._chunking_fallback,
         )
+        self._chunking_fallbacks: List[Dict[str, str]] = []
+        if isinstance(self._embedding, CachedEmbedding) and self._splitter.token_counter_name != "units":
+            # One counter for chunk sizes and embedding cost estimates (words are not model tokens,
+            # so with "units" the cost estimate keeps the token estimator).
+            self._embedding.token_counter = self._splitter.token_counter
         if parent_retrieval is not None and parent_retrieval not in PARENT_MODES:
             raise ValueError(f"parent_retrieval must be one of {list(PARENT_MODES)} or None")
         if parent_chunk_size <= 0:
@@ -822,6 +839,25 @@ class RAG:
         )
         return stats["chunks_indexed"]
 
+    def _chunking_fallback(self, document: Document, error: Exception) -> None:
+        """Record an embedding-chunking fallback: counted in ``ingest_usage()`` and sent to ``on_event``."""
+
+        from raglib.core.tracing import _callbacks
+
+        self._chunking_fallbacks.append({"document_id": document.id, "error": f"{type(error).__name__}: {error}"[:300]})
+        rag = getattr(self, "_rag", None)
+        event = TraceEvent(
+            stage="chunking_fallback",
+            latency_ms=0.0,
+            meta={"event": "warning", "document_id": document.id, "fallback": "recursive"},
+            error=f"{type(error).__name__}: {error}"[:300],
+        )
+        for callback in _callbacks(getattr(rag, "on_event", None)):
+            try:
+                callback(event)
+            except Exception as exc:  # noqa: BLE001 - observers must never break ingestion
+                logger.warning("on_event callback failed: %s", exc)
+
     def _tag(self, document: Document) -> Document:
         """Apply access-control tags to a chunk or section (no-op without access control)."""
 
@@ -843,7 +879,7 @@ class RAG:
                 chunks.append(self._tag(replace(child, metadata=metadata)))
         return chunks
 
-    def _register_sections(self, parent_id: str) -> None:
+    def _register_sections(self, parent_id: str, version: Optional[str] = None) -> None:
         """Make the staged sections of ``parent_id`` current (replacing its old ones)."""
 
         staged = self._staged_sections.pop(parent_id, None)
@@ -852,6 +888,8 @@ class RAG:
         for section_id in self._parent_sections.pop(parent_id, []):
             self._sections.pop(section_id, None)
         for section in staged:
+            if version is not None:
+                section.metadata["document_version"] = version
             self._sections[section.id] = section
         self._parent_sections[parent_id] = [section.id for section in staged]
 
@@ -912,7 +950,12 @@ class RAG:
     def ingest_usage(self) -> Dict[str, Any]:
         """Tokens (and USD, with ``prices``) spent on ingestion so far: embeddings, LLM chunking, graph."""
 
-        info: Dict[str, Any] = {**self._ingest_meter.as_dict(), "usage_by_model": self._ingest_meter.breakdown()}
+        info: Dict[str, Any] = {
+            **self._ingest_meter.as_dict(),
+            "usage_by_model": self._ingest_meter.breakdown(),
+            "chunking_fallbacks": len(self._chunking_fallbacks),
+            "chunking_fallback_documents": [item["document_id"] for item in self._chunking_fallbacks[-50:]],
+        }
         if self._prices is not None:
             cost = self._prices.cost(self._ingest_meter.breakdown())
             info.update({"cost_usd": round(cost["total"], 8), "cost_by_model": cost["by_model"], "cost_unpriced": cost["unpriced"]})
@@ -936,9 +979,10 @@ class RAG:
                 version = hashlib.sha256(json.dumps([new_ids, signature]).encode("utf-8")).hexdigest()[:16]
                 if old_ids == new_ids:
                     if self._parent_acl.get(parent_id, signature) != signature:
+                        _stamp_version(parent_chunks, version)
                         retagged.extend(parent_chunks)  # same text, new permissions
                         signatures[parent_id] = signature
-                        self._register_sections(parent_id)
+                        self._register_sections(parent_id, version)
                         self._doc_versions[parent_id] = version
                         # A cached public answer must not outlive a permission change.
                         self._invalidate_documents([parent_id])
@@ -952,7 +996,10 @@ class RAG:
                     self._parents.pop(parent_id, None)
                     self._invalidate_documents([parent_id], old_texts)
                     logger.info("Document %s changed; replaced %d old chunks", parent_id, len(old_ids))
-                self._register_sections(parent_id)
+                # Chunks carry their document's version, so stale vectors can be found or filtered
+                # in the vector store ({"document_version": rag.document_version(doc_id)}).
+                _stamp_version(parent_chunks, version)
+                self._register_sections(parent_id, version)
                 self._doc_versions[parent_id] = version
                 changed[parent_id] = new_ids
                 to_add.extend(parent_chunks)
@@ -1772,3 +1819,10 @@ def _enable_prompt_caching(client: Any) -> None:
             seen += 1
     if not seen:
         logger.info("prompt_caching=True has no effect: the chat model is not an Anthropic model")
+
+
+def _stamp_version(chunks: List[Document], version: str) -> None:
+    """Write ``document_version`` into each chunk's metadata (not part of the chunk id or ACL signature)."""
+
+    for chunk in chunks:
+        chunk.metadata["document_version"] = version

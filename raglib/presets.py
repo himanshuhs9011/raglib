@@ -31,6 +31,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "top_k": 3,
         # Repeated questions reuse their query embedding for a day (the corpus vectors live in the store).
         "embedding_cache_ttl": 86400.0,
+        # Chunk sizes in real model tokens (tiktoken when installed), and no silent chunking fallback.
+        "token_counter": "auto",
+        "on_embedding_failure": "raise",
     },
 }
 

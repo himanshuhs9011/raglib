@@ -101,6 +101,8 @@ class LatencyStats:
     def observe(self, event: TraceEvent) -> None:
         """Buffer a stage event; record the whole run when its ``total`` event arrives."""
 
+        if event.meta.get("event") == "warning":
+            return  # e.g. chunking_fallback: a notice, not a timed stage
         if event.run_id is None:  # a stand-alone Tracer, not a pipeline run
             self._add(LatencySample(event.stage, event.latency_ms, None, event.started_at, event.error, {}, dict(event.meta)))
             return

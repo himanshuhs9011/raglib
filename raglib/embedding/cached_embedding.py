@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from raglib.cache import TTLCache
 from raglib.core.concurrency import parallel_map
@@ -47,6 +47,8 @@ class CachedEmbedding(BaseEmbedding):
         self._cache = TTLCache(max_entries=max_entries, ttl=ttl)
         self.max_retries = max(0, max_retries)
         self.rate_limiter = rate_limiter
+        # Counts tokens for cost estimates; RAG sets it to the chunker's token_counter (default: tiktoken / estimate).
+        self.token_counter: Optional[Callable[[str], int]] = None
 
     @property
     def ttl(self) -> Optional[float]:
@@ -89,7 +91,8 @@ class CachedEmbedding(BaseEmbedding):
         from raglib.core.runtime import record_embedding_usage
         from raglib.core.text import count_tokens
 
-        record_embedding_usage(sum(count_tokens(text) for text in texts), model=self.model_label)
+        counter = self.token_counter or count_tokens
+        record_embedding_usage(sum(counter(text) for text in texts), model=self.model_label)
 
     @property
     def model_label(self) -> str:

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from functools import lru_cache
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +175,38 @@ def count_tokens(text: str) -> int:
         return len(encoder(text))
     dense = len(_HAS_NO_SPACE_RE.findall(text))
     return max(1, dense + (len(text) - dense + 3) // 4)
+
+
+TOKEN_COUNTERS = ("units", "auto", "tiktoken")
+
+
+def resolve_token_counter(spec: Any = "units") -> Tuple[Callable[[str], int], str]:
+    """Return ``(counter, name)`` for a token-counter setting.
+
+    * ``"units"`` - whitespace words, each CJK/Thai character counting as one. Not model tokens:
+      English averages ~1.3 model tokens per word, so a 500-unit chunk is ~650 tokens.
+    * ``"tiktoken"`` - real model tokens (``cl100k_base``); needs ``pip install tiktoken``.
+    * ``"auto"`` - tiktoken when installed, else units.
+    * a callable ``text -> int`` - your own tokenizer (e.g. the embedding model's).
+    """
+
+    if callable(spec):
+        return spec, getattr(spec, "__name__", "custom")
+    name = str(spec or "units").strip().lower()
+    if name not in TOKEN_COUNTERS:
+        raise ValueError(f"token_counter must be one of {list(TOKEN_COUNTERS)} or a callable, got {spec!r}")
+    if name == "units":
+        return count_units, "units"
+    encoder = _tiktoken_encoder()
+    if encoder is None:
+        if name == "tiktoken":
+            raise ImportError("token_counter='tiktoken' requires: pip install tiktoken (or raglib-py[fast])")
+        return count_units, "units"
+
+    def count_model_tokens(text: str) -> int:
+        return len(encoder(text)) if text else 0
+
+    return count_model_tokens, "tiktoken"
 
 
 def truncate_to_tokens(text: str, max_tokens: int) -> str:

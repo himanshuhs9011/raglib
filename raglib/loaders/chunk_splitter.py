@@ -6,9 +6,10 @@ import hashlib
 import logging
 import math
 import re
-from typing import List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
-from raglib.core.text import count_units, has_no_space_script, unit_spans
+from raglib.core.text import has_no_space_script, resolve_token_counter, unit_spans
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.llm.base_client import BaseLLMClient
 from raglib.schemas import Document
@@ -17,6 +18,32 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_CHUNKING_STRATEGIES = ("fixed", "recursive", "llm", "embedding")
 SEMANTIC_BREAKPOINTS = ("percentile", "fixed")
+EMBEDDING_FAILURE_POLICIES = ("fallback", "raise")
+FALLBACK_STRATEGY_LABEL = "recursive_fallback"
+
+# Words ending in a period that do not end a sentence ("Dr. Sharma", "e.g. tables"). Lower case.
+DEFAULT_ABBREVIATIONS: Tuple[str, ...] = (
+    "dr.", "mr.", "mrs.", "ms.", "prof.", "sr.", "jr.", "st.", "mt.", "e.g.", "i.e.", "etc.", "vs.", "inc.",
+    "ltd.", "co.", "corp.", "no.", "nos.", "fig.", "figs.", "approx.", "dept.", "est.", "vol.", "pp.",
+)
+
+_TABLE_ROW_RE = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
+_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+\u2022]|\d{1,3}[.)])[ \t]+\S")
+
+FallbackHook = Callable[[Document, Exception], None]
+
+
+class EmbeddingChunkingError(RuntimeError):
+    """Embedding-based chunking failed and ``on_embedding_failure="raise"`` was set."""
+
+
+@dataclass
+class _Piece:
+    """One chunk's text and, when known, its character offsets in the document content."""
+
+    text: str
+    start: Optional[int] = None
+    end: Optional[int] = None
 CHUNKING_STRATEGY_ALIASES = {
     "fixed": "fixed",
     "fixed_size": "fixed",
@@ -32,10 +59,10 @@ CHUNKING_STRATEGY_ALIASES = {
     "semantic_embedding": "embedding",
 }
 
-# Sentence boundaries: whitespace after . ! ? (or the Devanagari danda), any line break,
-# right after CJK full stops (no space follows them), and whitespace after Thai/CJK text.
+# Sentence boundaries: whitespace after . ! ? (or the Devanagari danda / double danda), any line
+# break, right after CJK full stops (no space follows them), and whitespace after Thai/CJK text.
 _SENTENCE_BOUNDARY_RE = re.compile(
-    r"(?<=[.!?\u0964])[ \t]+"
+    r"(?<=[.!?\u0964\u0965])[ \t]+"
     r"|\s*\n\s*"
     r"|(?<=[\u3002\uff01\uff1f])\s*"
     r"|(?<=[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u3400-\u9fff])[ \t]+"
@@ -73,8 +100,17 @@ class ChunkSplitter:
         semantic_breakpoint: str = "percentile",
         semantic_threshold: Optional[float] = None,
         semantic_min_tokens: Optional[int] = None,
+        token_counter: Any = "units",
+        on_embedding_failure: str = "fallback",
+        abbreviations: Optional[Iterable[str]] = None,
+        on_fallback: Optional[FallbackHook] = None,
     ):
         """Configure chunk size, overlap, strategy, and optional LLM client / embedding model.
+
+        Sizes (``chunk_size``, ``overlap``, ``min_tokens``, ``semantic_min_tokens``) are measured
+        with ``token_counter``: ``"units"`` (default: whitespace words, one per CJK/Thai character -
+        *not* model tokens; English is ~1.3 tokens per word), ``"tiktoken"`` (real model tokens),
+        ``"auto"`` (tiktoken when installed, else units) or a callable ``text -> int``.
 
         ``strategy="embedding"`` (semantic chunking with embeddings): at every gap between two
         sentences, embed the two sentences before it and the two after it, and start a new chunk
@@ -85,8 +121,19 @@ class ChunkSplitter:
         * ``"fixed"``: break where the cosine similarity is below ``semantic_threshold`` (default 0.75).
 
         Chunks are kept between ``semantic_min_tokens`` (default ``chunk_size // 4``) and
-        ``chunk_size`` tokens; no overlap is added (boundaries are topic changes). Pass a
+        ``chunk_size``; no overlap is added (boundaries are topic changes). Pass a
         ``CachedEmbedding`` (RAG does) so re-ingesting unchanged text costs nothing.
+
+        The embedding strategy keeps the original formatting: every chunk is a slice of the
+        document (``metadata["start_char"]`` / ``["end_char"]``), so line breaks, tables and lists
+        survive. A Markdown table, or a run of list items, is one unit that is only split (at row /
+        item borders) when it is larger than ``chunk_size``. Sentences do not end after
+        ``abbreviations`` (default ``DEFAULT_ABBREVIATIONS``: "Dr.", "e.g.", "Inc.", ...).
+
+        ``on_embedding_failure``: ``"fallback"`` (default) splits the document with the recursive
+        strategy instead, labels its chunks ``chunking_strategy="recursive_fallback"`` and calls
+        ``on_fallback(document, error)``; ``"raise"`` raises ``EmbeddingChunkingError`` (and
+        ``ValueError`` at construction when no embedding model is given).
 
         Trade-off (accuracy vs cost): ~15-25% better retrieval on structured documents in published
         tests, but every sentence is embedded - roughly 2x the corpus in embedding tokens (pairs of
@@ -110,6 +157,14 @@ class ChunkSplitter:
         self._strategy = self._normalize_strategy(strategy)
         self._llm_client = llm_client
         self._separators = list(separators) if separators is not None else list(DEFAULT_RECURSIVE_SEPARATORS)
+        if on_embedding_failure not in EMBEDDING_FAILURE_POLICIES:
+            raise ValueError(f"on_embedding_failure must be one of {list(EMBEDDING_FAILURE_POLICIES)}")
+        self._token_counter, self.token_counter_name = resolve_token_counter(token_counter)
+        self._on_embedding_failure = on_embedding_failure
+        self._abbreviations = frozenset(
+            item.strip().lower() for item in (DEFAULT_ABBREVIATIONS if abbreviations is None else abbreviations) if item.strip()
+        )
+        self.on_fallback = on_fallback
         if semantic_breakpoint not in SEMANTIC_BREAKPOINTS:
             raise ValueError(f"semantic_breakpoint must be one of {list(SEMANTIC_BREAKPOINTS)}")
         if semantic_breakpoint == "percentile" and semantic_threshold is not None and not 0 < semantic_threshold < 100:
@@ -123,6 +178,8 @@ class ChunkSplitter:
         )
         self._semantic_min_tokens = max(1, semantic_min_tokens if semantic_min_tokens is not None else chunk_size // 4)
         if self._strategy == "embedding" and self._embedding is None:
+            if on_embedding_failure == "raise":
+                raise ValueError("chunking_strategy='embedding' needs an embedding model (on_embedding_failure='raise')")
             logger.warning("chunking_strategy='embedding' without an embedding model; falling back to recursive")
 
         if self._strategy == "llm" and self._llm_client is None:
@@ -147,22 +204,27 @@ class ChunkSplitter:
         previous_last: Optional[Document] = None
         previous_document: Optional[Document] = None
         for document in documents:
-            split_texts = self._split_document(document)
+            pieces, label = self._split_document(document)
             doc_chunks: List[Document] = []
-            for index, chunk_text in enumerate(split_texts, start=1):
+            for index, piece in enumerate(pieces, start=1):
+                chunk_text = piece.text
                 digest = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
+                metadata = {
+                    **document.metadata,
+                    "parent_id": document.id,
+                    "chunk_index": index,
+                    "chunk_count": len(pieces),
+                    "chunk_tokens": self._count_tokens(chunk_text),
+                    "chunking_strategy": label,
+                }
+                if piece.start is not None:
+                    # document.content[start_char:end_char] == chunk content (character offsets).
+                    metadata["start_char"], metadata["end_char"] = piece.start, piece.end
                 doc_chunks.append(
                     Document(
                         id=f"{document.id}_chunk_{index}_{digest}",
                         content=chunk_text,
-                        metadata={
-                            **document.metadata,
-                            "parent_id": document.id,
-                            "chunk_index": index,
-                            "chunk_count": len(split_texts),
-                            "chunk_tokens": self._count_tokens(chunk_text),
-                            "chunking_strategy": self._strategy,
-                        },
+                        metadata=metadata,
                         score=document.score,
                         source=document.source,
                     )
@@ -204,23 +266,44 @@ class ChunkSplitter:
                 return b == a + 1
         return False
 
-    def _split_document(self, document: Document) -> List[str]:
-        """Split one document with the configured strategy."""
+    def _split_document(self, document: Document) -> Tuple[List[_Piece], str]:
+        """Split one document; returns its pieces and the strategy label that produced them."""
 
-        text = document.content.strip()
+        content = document.content
+        text = content.strip()
         if not text:
-            return []
+            return [], self._strategy
+        if self._strategy == "embedding":
+            pieces = self._split_embedding_pieces(content, document)
+            if pieces is not None:
+                return pieces, self._strategy
+            parts = self._split_recursive(text)
+            return self._locate(content, self._normalize_chunks(parts)), FALLBACK_STRATEGY_LABEL
 
         if self._strategy == "recursive":
             parts = self._split_recursive(text)
         elif self._strategy == "llm":
             parts = self._split_llm(text)
-        elif self._strategy == "embedding":
-            parts = self._split_embedding(text)
         else:
             parts = self._split_fixed(text)
+        return self._locate(content, self._normalize_chunks(parts)), self._strategy
 
-        return self._normalize_chunks(parts)
+    @staticmethod
+    def _locate(content: str, parts: List[str]) -> List[_Piece]:
+        """Attach character offsets to chunks that are verbatim slices of ``content`` (in order)."""
+
+        pieces: List[_Piece] = []
+        cursor = 0
+        for part in parts:
+            found = content.find(part, cursor)
+            if found < 0:
+                found = content.find(part)
+            if found < 0:
+                pieces.append(_Piece(part))  # rebuilt text (e.g. recursive overlap): no offsets
+                continue
+            pieces.append(_Piece(part, found, found + len(part)))
+            cursor = found + 1  # overlapping chunks start before the previous one ends
+        return pieces
 
     def _split_fixed(self, text: str) -> List[str]:
         """Pack whole sentences (or lines) into chunks of at most ``chunk_size`` units, with overlap.
@@ -352,25 +435,51 @@ class ChunkSplitter:
         Slices the original string, so whitespace and line breaks inside a window survive.
         """
 
+        return [text[start:end] for start, end in self._hard_split_spans(text, 0, len(text), overlap, limit)]
+
+    def _hard_split_spans(
+        self, text: str, start: int, end: int, overlap: int = 0, limit: Optional[int] = None
+    ) -> List[Tuple[int, int]]:
+        """``(start, end)`` offsets of windows of at most ``limit`` (default ``chunk_size``) inside ``text[start:end]``."""
+
         size = limit or self._chunk_size
-        spans = unit_spans(text)
+        spans = [(a + start, b + start) for a, b in unit_spans(text[start:end])]
         if not spans:
             return []
-        if len(spans) <= size:
-            return [text.strip()] if text.strip() else []
+        if self.token_counter_name == "units":
+            if len(spans) <= size:
+                return [(spans[0][0], spans[-1][1])]
+            windows: List[Tuple[int, int]] = []
+            step = max(size - overlap, 1)
+            index = 0
+            while index < len(spans):
+                last = min(index + size, len(spans))
+                windows.append((spans[index][0], spans[last - 1][1]))
+                if last >= len(spans):
+                    break
+                index += step
+            return windows
 
-        chunks: List[str] = []
-        step = max(size - overlap, 1)
-        start = 0
-        while start < len(spans):
-            end = min(start + size, len(spans))
-            piece = text[spans[start][0] : spans[end - 1][1]].strip()
-            if piece:
-                chunks.append(piece)
-            if end >= len(spans):
+        # A real tokenizer: grow each window by binary search on unit boundaries.
+        windows = []
+        index = 0
+        while index < len(spans):
+            low, high = index + 1, len(spans)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if self._count_tokens(text[spans[index][0] : spans[middle - 1][1]]) <= size:
+                    low = middle
+                else:
+                    high = middle - 1
+            last = low
+            windows.append((spans[index][0], spans[last - 1][1]))
+            if last >= len(spans):
                 break
-            start += step
-        return chunks
+            back = 0
+            while back + 1 < last - index and self._count_tokens(text[spans[last - back - 1][0] : spans[last - 1][1]]) <= overlap:
+                back += 1
+            index = max(index + 1, last - back)
+        return windows
 
     def _apply_overlap(self, chunks: List[str]) -> List[str]:
         """Prefix each chunk with the last ``overlap`` units of the previous chunk."""
@@ -381,10 +490,7 @@ class ChunkSplitter:
         overlapped: List[str] = [chunks[0]]
         for index in range(1, len(chunks)):
             previous = chunks[index - 1]
-            spans = unit_spans(previous)
-            overlap_text = previous[spans[-self._overlap][0] :].strip() if spans else ""
-            if len(spans) <= self._overlap:
-                overlap_text = previous.strip()
+            overlap_text = self._tail_within(previous, self._overlap)
             current = chunks[index].strip()
             if overlap_text and not current.startswith(overlap_text):
                 joiner = "" if has_no_space_script(overlap_text[-1:]) and has_no_space_script(current[:1]) else " "
@@ -392,32 +498,147 @@ class ChunkSplitter:
             overlapped.append(current)
         return overlapped
 
-    def _split_embedding(self, text: str) -> List[str]:
-        """Semantic chunking: break where neighbouring sentences stop being similar."""
+    def _semantic_units(self, text: str) -> List[Tuple[int, int]]:
+        """Character spans of the units the embedding strategy compares, in order.
+
+        A Markdown table (consecutive ``| ... |`` rows) or a run of list items (``-``, ``*``, ``+``,
+        ``1.``, ``1)`` with indented continuation lines, blank lines allowed between items) is one
+        unit; other text is split into sentences, not after an abbreviation. Spans are trimmed of
+        surrounding whitespace, so ``text[start:end]`` is the unit's exact text.
+        """
+
+        lines: List[Tuple[int, int]] = []
+        position = 0
+        for line in text.splitlines(keepends=True):
+            lines.append((position, position + len(line)))
+            position += len(line)
+        units: List[Tuple[int, int]] = []
+        prose_start: Optional[int] = None
+        index = 0
+
+        def flush_prose(until: int) -> None:
+            nonlocal prose_start
+            if prose_start is not None:
+                units.extend(self._sentence_spans(text, prose_start, until))
+                prose_start = None
+
+        while index < len(lines):
+            line_start, line_end = lines[index]
+            line = text[line_start:line_end]
+            kind = "table" if _TABLE_ROW_RE.match(line.rstrip("\r\n")) else "list" if _LIST_ITEM_RE.match(line) else None
+            if kind is None:
+                if prose_start is None and line.strip():
+                    prose_start = line_start
+                index += 1
+                continue
+            flush_prose(line_start)
+            block_end = line_end
+            index += 1
+            while index < len(lines):
+                candidate = text[lines[index][0] : lines[index][1]]
+                stripped = candidate.rstrip("\r\n")
+                if kind == "table" and _TABLE_ROW_RE.match(stripped):
+                    pass
+                elif kind == "list" and (_LIST_ITEM_RE.match(candidate) or (candidate[:1] in " \t" and candidate.strip())):
+                    pass
+                elif kind == "list" and not candidate.strip():
+                    following = next((text[a:b] for a, b in lines[index + 1 :] if text[a:b].strip()), "")
+                    if not _LIST_ITEM_RE.match(following):
+                        break
+                else:
+                    break
+                block_end = lines[index][1]
+                index += 1
+            units.append(_trim(text, line_start, block_end))
+        flush_prose(len(text))
+        return [(a, b) for a, b in units if b > a]
+
+    def _sentence_spans(self, text: str, start: int, end: int) -> List[Tuple[int, int]]:
+        """Trimmed sentence spans in ``text[start:end]``; no break right after an abbreviation."""
+
+        spans: List[Tuple[int, int]] = []
+        position = start
+        region = text[start:end]
+        for match in _SENTENCE_BOUNDARY_RE.finditer(region):
+            boundary = start + match.end()
+            if boundary <= position:
+                continue
+            candidate = text[position : start + match.start()]
+            if not candidate.strip():
+                continue
+            if "\n" not in match.group(0) and self._ends_with_abbreviation(candidate):
+                continue  # "Dr. Sharma": keep going until the next boundary
+            spans.append(_trim(text, position, start + match.start()))
+            position = boundary
+        if text[position:end].strip():
+            spans.append(_trim(text, position, end))
+        return [(a, b) for a, b in spans if b > a]
+
+    def _ends_with_abbreviation(self, sentence: str) -> bool:
+        """True when the last word of ``sentence`` is a known abbreviation (case-insensitive)."""
+
+        words = sentence.split()
+        return bool(words) and words[-1].lower() in self._abbreviations
+
+    def _fit_units(self, text: str, units: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Split units larger than ``chunk_size``: blocks at line borders, then hard windows."""
+
+        fitted: List[Tuple[int, int]] = []
+        for start, end in units:
+            if self._count_tokens(text[start:end]) <= self._chunk_size:
+                fitted.append((start, end))
+                continue
+            current: Optional[Tuple[int, int]] = None
+            position = start
+            for line in text[start:end].splitlines(keepends=True):
+                line_span = _trim(text, position, position + len(line))
+                position += len(line)
+                if line_span[1] <= line_span[0]:
+                    continue
+                if self._count_tokens(text[line_span[0] : line_span[1]]) > self._chunk_size:
+                    if current is not None:
+                        fitted.append(current)
+                        current = None
+                    fitted.extend(self._hard_split_spans(text, line_span[0], line_span[1]))
+                    continue
+                if current is not None and self._count_tokens(text[current[0] : line_span[1]]) <= self._chunk_size:
+                    current = (current[0], line_span[1])
+                else:
+                    if current is not None:
+                        fitted.append(current)
+                    current = line_span
+            if current is not None:
+                fitted.append(current)
+        return fitted
+
+    def _split_embedding_pieces(self, content: str, document: Document) -> Optional[List[_Piece]]:
+        """Semantic chunking on character offsets; ``None`` means "use the recursive fallback"."""
 
         if self._embedding is None:
-            return self._split_recursive(text)
-        sentences: List[str] = []
-        for sentence in self._split_sentences(text):
-            if self._count_tokens(sentence) > self._chunk_size:
-                sentences.extend(self._hard_split(sentence, overlap=0))
-            elif sentence.strip():
-                sentences.append(sentence.strip())
-        if len(sentences) <= 1:
-            return sentences or [text]
-        # For the gap after sentence i, compare the two sentences before it with the two after it
+            self._report_fallback(document, RuntimeError("no embedding model configured"))
+            return None
+        units = self._fit_units(content, self._semantic_units(content))
+        if not units:
+            return []
+        if len(units) == 1:
+            start, end = units[0]
+            return [_Piece(content[start:end], start, end)]
+        texts = [content[start:end] for start, end in units]
+        # For the gap after unit i, compare the two units before it with the two after it
         # (single sentences are too short to embed reliably; overlapping windows blur the boundary).
-        # right(i) == left(i + 2), so de-duplicated this is about one embedding per sentence.
-        gaps = range(len(sentences) - 1)
-        lefts = [" ".join(sentences[max(0, i - 1) : i + 1]) for i in gaps]
-        rights = [" ".join(sentences[i + 1 : i + 3]) for i in gaps]
+        # right(i) == left(i + 2), so de-duplicated this is about one embedding per unit.
+        gaps = range(len(units) - 1)
+        lefts = [" ".join(texts[max(0, i - 1) : i + 1]) for i in gaps]
+        rights = [" ".join(texts[i + 1 : i + 3]) for i in gaps]
         unique = list(dict.fromkeys(lefts + rights))
         try:
             vectors = dict(zip(unique, self._embedding.embed_documents(unique)))
-        except Exception as exc:  # noqa: BLE001 - chunking must not fail ingestion
-            logger.warning("Embedding chunking failed (%s); falling back to recursive", exc)
-            return self._split_recursive(text)
-        similarities = [_cosine(vectors[left], vectors[right]) for left, right in zip(lefts, rights)]
+            similarities = [_cosine(vectors[left], vectors[right]) for left, right in zip(lefts, rights)]
+        except Exception as exc:  # noqa: BLE001 - policy decides: raise or a visible fallback
+            if self._on_embedding_failure == "raise":
+                raise EmbeddingChunkingError(f"embedding chunking failed for document {document.id!r}: {exc}") from exc
+            self._report_fallback(document, exc)
+            return None
         if self._semantic_breakpoint == "percentile":
             distances = [1.0 - value for value in similarities]
             cutoff = _percentile(distances, self._semantic_threshold)
@@ -425,27 +646,61 @@ class ChunkSplitter:
         else:
             breaks = {i for i, value in enumerate(similarities) if value < self._semantic_threshold}
 
-        joiner = "" if has_no_space_script(text) else " "
-        chunks: List[List[str]] = []
-        current: List[str] = []
-        tokens = 0
-        for index, sentence in enumerate(sentences):
-            size = self._count_tokens(sentence)
-            if current and tokens + size > self._chunk_size:
-                chunks.append(current)
-                current, tokens = [], 0
-            current.append(sentence)
-            tokens += size
-            if index in breaks and tokens >= self._semantic_min_tokens:
-                chunks.append(current)
-                current, tokens = [], 0
+        groups: List[List[int]] = []
+        current: List[int] = []
+        for index in range(len(units)):
+            if current and self._count_tokens(content[units[current[0]][0] : units[index][1]]) > self._chunk_size:
+                groups.append(current)
+                current = []
+            current.append(index)
+            if index in breaks and self._count_tokens(content[units[current[0]][0] : units[index][1]]) >= self._semantic_min_tokens:
+                groups.append(current)
+                current = []
         if current:
-            # A short tail joins the previous chunk when it fits, instead of becoming a tiny chunk.
-            if chunks and tokens < self._semantic_min_tokens and self._count_tokens(joiner.join(chunks[-1] + current)) <= self._chunk_size:
-                chunks[-1].extend(current)
-            else:
-                chunks.append(current)
-        return [joiner.join(chunk).strip() for chunk in chunks if chunk]
+            groups.append(current)
+        spans = [(units[group[0]][0], units[group[-1]][1]) for group in groups]
+        spans = self._merge_small(content, spans, self._semantic_min_tokens)
+        spans = self._merge_small(content, spans, self._min_tokens)
+        return [_Piece(content[start:end], start, end) for start, end in spans]
+
+    def _merge_small(self, content: str, spans: List[Tuple[int, int]], minimum: int) -> List[Tuple[int, int]]:
+        """Merge spans smaller than ``minimum`` into a neighbour when the result fits ``chunk_size``."""
+
+        merged: List[Tuple[int, int]] = []
+        for start, end in spans:
+            if merged and self._count_tokens(content[start:end]) < minimum:
+                previous = merged[-1]
+                if self._count_tokens(content[previous[0] : end]) <= self._chunk_size:
+                    merged[-1] = (previous[0], end)
+                    continue
+            merged.append((start, end))
+        if len(merged) >= 2 and self._count_tokens(content[merged[0][0] : merged[0][1]]) < minimum:
+            if self._count_tokens(content[merged[0][0] : merged[1][1]]) <= self._chunk_size:
+                merged[0:2] = [(merged[0][0], merged[1][1])]
+        return merged
+
+    def _report_fallback(self, document: Document, error: Exception) -> None:
+        """Log and report a recursive fallback (RAG counts it and emits an ``on_event`` warning)."""
+
+        logger.warning("Embedding chunking fell back to recursive for document %s: %s", document.id, error)
+        if self.on_fallback is not None:
+            try:
+                self.on_fallback(document, error)
+            except Exception as exc:  # noqa: BLE001 - reporting must never break ingestion
+                logger.warning("on_fallback hook failed: %s", exc)
+
+    def _tail_within(self, text: str, budget: int) -> str:
+        """The longest suffix of ``text`` (on unit boundaries) whose size is at most ``budget``."""
+
+        spans = unit_spans(text)
+        if not spans:
+            return ""
+        if self.token_counter_name == "units":
+            return text.strip() if len(spans) <= budget else text[spans[-budget][0] :].strip()
+        count = 0
+        while count < len(spans) and self._count_tokens(text[spans[len(spans) - count - 1][0] :]) <= budget:
+            count += 1
+        return text[spans[len(spans) - count][0] :].strip() if count else ""
 
     def _split_llm(self, text: str) -> List[str]:
         """Use an LLM to propose semantic chunk boundaries with recursive fallback."""
@@ -586,9 +841,15 @@ class ChunkSplitter:
         return segments
 
     def _count_tokens(self, text: str) -> int:
-        """Count size units: whitespace words, with each CJK/Thai character counted as one."""
+        """Size of ``text`` with the configured ``token_counter`` (default: units, not model tokens)."""
 
-        return count_units(text)
+        return self._token_counter(text)
+
+    @property
+    def token_counter(self) -> Callable[[str], int]:
+        """The function that measures chunk sizes (shared with RAG's embedding cost estimate)."""
+
+        return self._token_counter
 
     @staticmethod
     def _normalize_strategy(strategy: str) -> str:
@@ -619,3 +880,13 @@ def _percentile(values: Sequence[float], q: float) -> float:
     position = (len(ordered) - 1) * q / 100.0
     low, high = math.floor(position), math.ceil(position)
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _trim(text: str, start: int, end: int) -> Tuple[int, int]:
+    """Shrink ``(start, end)`` so the span does not begin or end with whitespace."""
+
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end

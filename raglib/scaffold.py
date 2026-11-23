@@ -94,6 +94,10 @@ rag = RAG(
     chunking_strategy="fixed",             # "fixed" | "recursive" | "embedding" (semantic: ~2x embedding cost) | "llm" (LLM calls)
     semantic_breakpoint="percentile",      # chunking_strategy="embedding": "percentile" | "fixed" (cosine similarity cut-off)
     semantic_threshold=None,               # percentile (default 95) or similarity (default 0.75) where a new chunk starts
+    semantic_min_tokens=None,              # smallest semantic chunk (default chunk_size // 4)
+    token_counter=<<TOKEN_COUNTER>>,                 # "units" = words (not model tokens) | "tiktoken" | "auto" | callable
+    on_embedding_failure=<<ON_FAILURE>>,           # "raise": fail ingestion | "fallback": recursive split, counted in ingest_usage()
+    abbreviations=None,                    # words that do not end a sentence (default: Dr., Mr., e.g., i.e., Inc., No., ...)
 
     # ---------------------------------------------------------------- vector store
     vector_db=None,                        # None = in memory | "chroma" | "qdrant" | "pgvector" (pip install raglib-py[chroma] ...)
@@ -236,6 +240,8 @@ def render_pipeline(preset: str = "production", llm: str = "openai", docs: str =
         "<<RERANKER_REPR>>": f'"{values.get("reranker", "none")}"',
         "<<RERANK_CANDIDATES>>": str(values.get("rerank_candidates")),
         "<<EMBEDDING_TTL>>": repr(values.get("embedding_cache_ttl")),
+        "<<TOKEN_COUNTER>>": f'"{values.get("token_counter", "units")}"',
+        "<<ON_FAILURE>>": f'"{values.get("on_embedding_failure", "fallback")}"',
     }
     source = PIPELINE_TEMPLATE
     for token, value in tokens.items():

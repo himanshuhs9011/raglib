@@ -40,6 +40,16 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 
 **Evaluation.** `precision@k` sits next to `recall@k` in `raglib.eval`.
 
+**Embedding chunker correctness.**
+- No silent fallback: `on_embedding_failure="fallback" | "raise"` (production: `"raise"`). A fallback labels the chunks `recursive_fallback`, emits a `chunking_fallback` warning event and is counted in `ingest_usage()`.
+- Pluggable `token_counter` (`"units"` default, `"tiktoken"`, `"auto"`, callable), used by chunk sizes, overlap, hard splits, `semantic_min_tokens` and the embedding cost estimate. Production uses `"auto"`.
+- Chunks are exact slices of the original text with `start_char` / `end_char` metadata, so formatting is kept.
+- Markdown tables and list runs are single units.
+- Sentences don't end after configurable `abbreviations`.
+- The double danda `॥` ends a sentence.
+- `document_version` is stamped on every chunk and parent section.
+- `semantic_min_tokens` is exposed on `RAG(...)`.
+
 **Behaviour change: personalized queries are no longer cached.** With the default `cache_personalized=False`, queries that pass `user=` or `filters=` skip the LLM cache and the answer cache. Answers are identical, but repeated personalized questions are no longer served from cache. Pass `cache_personalized=True` for the old behaviour. The README's "Trade-offs" table lists what every new option costs.
 
 **Other changes (not breaking):**

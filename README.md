@@ -293,6 +293,10 @@ rag = RAG(
     semantic_breakpoint="percentile",   # chunking_strategy="embedding": "percentile" | "fixed"
     semantic_threshold=None,            # percentile (95) or cosine similarity (0.75) where a chunk ends
     prices=None,                        # PriceTable: USD cost per stage in result.usage
+    semantic_min_tokens=None,           # smallest embedding-based chunk (default chunk_size // 4)
+    token_counter="units",              # "units" (words, not model tokens) | "tiktoken" | "auto" | callable
+    on_embedding_failure="fallback",    # "raise": a failed embedding call fails ingestion instead of falling back
+    abbreviations=None,                 # words that don't end a sentence (default Dr., Mr., e.g., i.e., Inc., No., ...)
     on_event=None,                      # callback(TraceEvent) for every pipeline stage
     output_dir=None,                    # write each query result as JSON
     **rag_type_kwargs,                  # forwarded to the orchestrator (e.g. max_hops=3, search_mode="global")
@@ -352,6 +356,17 @@ rag = RAG(
 | **`"llm"`** | `"semantic"`, `"llm_semantic"` | The LLM groups numbered sentences at topic shifts (`CHUNK: start-end`); falls back to `"recursive"` without an LLM. | High-value documents with shifting topics. |
 
 **Small-to-big (parent sections).** `RAG(parent_retrieval="heading", chunk_size=200, parent_chunk_size=2000)` embeds and searches small child chunks for precise matches. The LLM then gets each child's whole parent section, split at Markdown or numbered headings (`"fixed"` uses fixed windows instead). Duplicate sections are removed, and `metadata["child_ids"]` lists the children that matched. **Trade-off:** answers see whole sections, but each source is bigger, so prompts grow and fewer sources fit in `max_context_tokens`. `neighbor_window` remains a separate, lighter option.
+
+**Units vs model tokens.** By default every size (`chunk_size`, `chunk_overlap`, `semantic_min_tokens`) is measured in *units*: whitespace-separated words, with each CJK or Thai character counted as one. Units are not model tokens. English averages about 1.3 tokens per word, so a 500-unit chunk is roughly 650 tokens. Pass `token_counter="tiktoken"` (real `cl100k_base` tokens), `"auto"` (tiktoken when installed, else units) or your own `callable(text) -> int`. The production file uses `"auto"`, and the embedding cost estimate then uses the same counter. The default stays `"units"` because a new counter re-chunks, and so re-embeds, existing indexes.
+
+**Embedding chunker details.**
+- **Exact slices:** every chunk is a slice of the original text, so `document.content[chunk.metadata["start_char"]:chunk.metadata["end_char"]] == chunk.content`, and line breaks, tables and lists survive.
+- **Tables and lists stay whole:** a Markdown table, or a run of list items (with indented continuation lines and blank lines between items), is one unit. It is only split, at row or item borders, when it is larger than `chunk_size`.
+- **Abbreviations:** sentences don't end after `abbreviations` ("Dr. Sharma", "Acme Inc. in 2020", "e.g. tables"; set your own list).
+- **Hindi:** the danda `।` / `॥` ends a sentence.
+- **Failures:** if the embedding call fails, `on_embedding_failure="fallback"` (default) splits that document recursively, labels its chunks `chunking_strategy="recursive_fallback"`, emits a `chunking_fallback` warning event to `on_event`, and counts it in `rag.ingest_usage()["chunking_fallbacks"]`. `"raise"` (production) raises `EmbeddingChunkingError` instead.
+
+**Document versions.** Every chunk (and parent section) carries `metadata["document_version"]`, a hash of its document's content and permissions. Stale vectors can be found in the vector store, or excluded with `filters={"document_version": rag.document_version(doc_id)}`.
 
 `chunk_size` is a hard limit for `fixed` and `recursive`: a line or sentence longer than it is split further, so log files, one-record-per-line data and text without punctuation never end up as one giant chunk. Line breaks inside a chunk are kept. For Chinese, Japanese, Thai, Lao, Khmer and Myanmar each character counts as one unit, and `。！？` end sentences.
 
