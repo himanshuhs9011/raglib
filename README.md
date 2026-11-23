@@ -391,6 +391,13 @@ rag = RAG(
 - **Custom splitter:** `sentence_splitter=r"(?<=[.?!])\s+"` (a regex whose matches are boundaries), or a callable `text -> [sentences]` such as a spaCy or NLTK splitter.
 - **Failures:** if the embedding call fails, `on_embedding_failure="fallback"` (default) splits that document recursively, labels its chunks `chunking_strategy="recursive_fallback"`, emits a `chunking_fallback` warning event to `on_event`, and counts it in `rag.ingest_usage()["chunking_fallbacks"]`. `"raise"` (production) raises `EmbeddingChunkingError` instead.
 
+**Embedding model limits.** No chunk is ever silently truncated by the embedding model:
+- **Limits:** raglib knows the input limit of common models (bge 512, all-MiniLM 256, OpenAI text-embedding-3 8191, Gemini 2048, Ollama nomic-embed-text 2048, ...). Set `embedding_max_tokens` for others.
+- **Counting:** chunks are counted with the model's own tokenizer when available (HuggingFace models, and OpenAI via tiktoken). Otherwise a tiktoken estimate is checked against 90% of the limit.
+- **Oversized chunks:** a chunk over the limit is split further at sentence borders, with an `EmbeddingLimitWarning`, and counted in `ingest_usage()["oversized_chunks_split"]`. With `oversized_chunks="raise"` (production) it raises `EmbeddingLimitError` instead.
+- **Startup check:** if `chunk_size` cannot fit the model, raglib warns at startup and suggests a safe `chunk_size`. Example: 500 tiktoken tokens is over bge-base's 512 WordPiece tokens.
+- **OpenAI:** inputs are checked before the API call, so an oversized text fails with a clear error instead of a 400 from the API.
+
 **Document versions.** Every chunk (and parent section) carries `metadata["document_version"]`, a hash of its document's content and permissions. Stale vectors can be found in the vector store, or excluded with `filters={"document_version": rag.document_version(doc_id)}`.
 
 `chunk_size` is a hard limit for `fixed` and `recursive`: a line or sentence longer than it is split further, so log files, one-record-per-line data and text without punctuation never end up as one giant chunk. Line breaks inside a chunk are kept. For Chinese, Japanese, Thai, Lao, Khmer and Myanmar each character counts as one unit, and `。！？` end sentences.

@@ -291,6 +291,97 @@ class ChunkSplitter:
 
         return self._strategy
 
+    _embed_limit: Optional[int] = None
+    _embed_counter: Optional[Callable[[str], int]] = None
+    _embed_exact = False
+    _oversized_policy = "split"
+    on_oversized: Optional[Callable[[Document, int, int], None]] = None
+
+    def set_embedding_limit(
+        self,
+        limit: Optional[int],
+        counter: Optional[Callable[[str], int]],
+        exact: bool,
+        policy: str = "split",
+        on_oversized: Optional[Callable[[Document, int, int], None]] = None,
+    ) -> None:
+        """Never produce a chunk the embedding model would truncate.
+
+        ``counter`` measures text in the model's tokens (``exact`` when it is the model's own
+        tokenizer; estimates are checked against 90% of ``limit``). A chunk over the limit is split
+        further at sentence borders (``policy="split"``, reported through ``on_oversized(document,
+        tokens, parts)``) or raises ``EmbeddingLimitError`` (``policy="raise"``).
+        """
+
+        from raglib.embedding.limits import ESTIMATE_MARGIN
+
+        if policy not in {"split", "raise"}:
+            raise ValueError("oversized_chunks must be 'split' or 'raise'")
+        self._embed_limit = None if not limit else (int(limit) if exact else max(1, int(limit * ESTIMATE_MARGIN)))
+        self._embed_reported_limit = limit
+        self._embed_counter = counter
+        self._embed_exact = exact
+        self._oversized_policy = policy
+        self.on_oversized = on_oversized
+
+    def _fits_model(self, text: str) -> bool:
+        return self._embed_limit is None or self._embed_counter is None or self._embed_counter(text) <= self._embed_limit
+
+    def _enforce_embedding_limit(self, document: Document, pieces: List[_Piece]) -> List[_Piece]:
+        """Split (or reject) pieces the embedding model cannot read in full."""
+
+        if self._embed_limit is None or self._embed_counter is None:
+            return pieces
+        fitted: List[_Piece] = []
+        for piece in pieces:
+            if self._fits_model(piece.text):
+                fitted.append(piece)
+                continue
+            tokens = self._embed_counter(piece.text)
+            if self._oversized_policy == "raise":
+                from raglib.embedding.limits import EmbeddingLimitError
+
+                raise EmbeddingLimitError(
+                    f"A chunk of document {document.id!r} has {tokens} embedding-model tokens; the model reads at most "
+                    f"{self._embed_reported_limit}. Lower chunk_size, or pass oversized_chunks='split' to split such chunks."
+                )
+            parts = self._split_for_model(document.content, piece)
+            if self.on_oversized is not None:
+                self.on_oversized(document, tokens, len(parts))
+            fitted.extend(parts)
+        return fitted
+
+    def _split_for_model(self, content: str, piece: _Piece) -> List[_Piece]:
+        """Pack the piece's sentences into parts that fit the model; hard windows for longer sentences."""
+
+        assert self._embed_counter is not None and self._embed_limit is not None
+        text, start, end = (content, piece.start, piece.end) if piece.start is not None else (piece.text, 0, len(piece.text))
+        offsets = piece.start is not None
+        limit, count = self._embed_limit, self._embed_counter
+        spans: List[Tuple[int, int]] = []
+        for unit_start, unit_end in self._sentence_spans(text, start, end) or [(start, end)]:
+            if count(text[unit_start:unit_end]) > limit:
+                spans.extend(self._hard_split_spans(text, unit_start, unit_end, 0, limit, counter=count))
+            elif spans and count(text[spans[-1][0] : unit_end]) <= limit:
+                spans[-1] = (spans[-1][0], unit_end)
+            else:
+                spans.append((unit_start, unit_end))
+        return [_Piece(text[a:b], a if offsets else None, b if offsets else None) for a, b in spans]
+
+    def _fit_window(self, units: List[str], keep_end: bool) -> str:
+        """Join similarity-window units, dropping far ones until the model can read the whole window."""
+
+        window = list(units)
+        while len(window) > 1 and not self._fits_model(" ".join(window)):
+            window = window[1:] if keep_end else window[:-1]
+        joined = " ".join(window)
+        if self._fits_model(joined):
+            return joined
+        # One unit longer than the model limit: compare on the part next to the gap (never stored).
+        spans = self._hard_split_spans(joined, 0, len(joined), 0, self._embed_limit, counter=self._embed_counter)
+        start, end = spans[-1] if keep_end else spans[0]
+        return joined[start:end]
+
     def settings(self) -> Dict[str, Any]:
         """The settings that decide chunk boundaries (recorded in an index; same settings = same chunks)."""
 
@@ -333,6 +424,7 @@ class ChunkSplitter:
         previous_document: Optional[Document] = None
         for document in documents:
             pieces, label = self._split_document(document)
+            pieces = self._enforce_embedding_limit(document, pieces)
             doc_chunks: List[Document] = []
             for index, piece in enumerate(pieces, start=1):
                 chunk_text = piece.text
@@ -566,15 +658,25 @@ class ChunkSplitter:
         return [text[start:end] for start, end in self._hard_split_spans(text, 0, len(text), overlap, limit)]
 
     def _hard_split_spans(
-        self, text: str, start: int, end: int, overlap: int = 0, limit: Optional[int] = None
+        self,
+        text: str,
+        start: int,
+        end: int,
+        overlap: int = 0,
+        limit: Optional[int] = None,
+        counter: Optional[Callable[[str], int]] = None,
     ) -> List[Tuple[int, int]]:
-        """``(start, end)`` offsets of windows of at most ``limit`` (default ``chunk_size``) inside ``text[start:end]``."""
+        """``(start, end)`` offsets of windows of at most ``limit`` (default ``chunk_size``) inside ``text[start:end]``.
+
+        ``counter`` measures the windows (default: the chunk ``token_counter``).
+        """
 
         size = limit or self._chunk_size
+        count = counter or self._count_tokens
         spans = [(a + start, b + start) for a, b in unit_spans(text[start:end])]
         if not spans:
             return []
-        if self.token_counter_name == "units":
+        if counter is None and self.token_counter_name == "units":
             if len(spans) <= size:
                 return [(spans[0][0], spans[-1][1])]
             windows: List[Tuple[int, int]] = []
@@ -595,7 +697,7 @@ class ChunkSplitter:
             low, high = index + 1, len(spans)
             while low < high:
                 middle = (low + high + 1) // 2
-                if self._count_tokens(text[spans[index][0] : spans[middle - 1][1]]) <= size:
+                if count(text[spans[index][0] : spans[middle - 1][1]]) <= size:
                     low = middle
                 else:
                     high = middle - 1
@@ -604,7 +706,7 @@ class ChunkSplitter:
             if last >= len(spans):
                 break
             back = 0
-            while back + 1 < last - index and self._count_tokens(text[spans[last - back - 1][0] : spans[last - 1][1]]) <= overlap:
+            while back + 1 < last - index and count(text[spans[last - back - 1][0] : spans[last - 1][1]]) <= overlap:
                 back += 1
             index = max(index + 1, last - back)
         return windows
@@ -782,8 +884,12 @@ class ChunkSplitter:
         # embedding per unit.
         gaps = range(len(units) - 1)
         width = self._buffer_size
-        lefts = [" ".join(texts[max(0, i - width + 1) : i + 1]) for i in gaps]
-        rights = [" ".join(texts[i + 1 : i + 1 + width]) for i in gaps]
+        if self._embed_limit is None:
+            lefts = [" ".join(texts[max(0, i - width + 1) : i + 1]) for i in gaps]
+            rights = [" ".join(texts[i + 1 : i + 1 + width]) for i in gaps]
+        else:  # windows the model can read in full (far sentences dropped first)
+            lefts = [self._fit_window(texts[max(0, i - width + 1) : i + 1], keep_end=True) for i in gaps]
+            rights = [self._fit_window(texts[i + 1 : i + 1 + width], keep_end=False) for i in gaps]
         unique = list(dict.fromkeys(lefts + rights))
         try:
             vectors = dict(zip(unique, self._embedding.embed_documents(unique)))

@@ -75,6 +75,7 @@ class OpenAIEmbedding(BaseEmbedding):
     def _embed(self, texts: List[str], input_type: Optional[str]) -> List[List[float]]:
         from raglib.llm.http import post_json
 
+        self._check_lengths(texts)
         vectors: List[List[float]] = []
         for start in range(0, len(texts), MAX_INPUTS_PER_REQUEST):
             batch = [text if text.strip() else " " for text in texts[start : start + MAX_INPUTS_PER_REQUEST]]
@@ -93,6 +94,33 @@ class OpenAIEmbedding(BaseEmbedding):
         if vectors:
             self._dimension = len(vectors[0])
         return vectors
+
+    def count_input_tokens(self, text: str) -> Optional[int]:
+        """Exact for OpenAI's text-embedding-3 / ada-002 models (cl100k_base tokenizer, with tiktoken)."""
+
+        name =(self._model_name or "").lower()
+        if not ("text-embedding-3" in name or "ada-002" in name):
+            return None
+        from raglib.core.text import _tiktoken_encoder
+
+        encoder = _tiktoken_encoder()
+        return len(encoder(text)) if encoder is not None else None
+
+    def _check_lengths(self, texts: List[str]) -> None:
+        """Fail fast with a clear error instead of a 400 from the API that aborts ingestion."""
+
+        limit = self.max_input_tokens
+        if not limit:
+            return
+        for index, text in enumerate(texts):
+            count = self.count_input_tokens(text)
+            if count is not None and count > limit:
+                from raglib.embedding.limits import EmbeddingLimitError
+
+                raise EmbeddingLimitError(
+                    f"Input {index} has {count} tokens; {self._model_name} reads at most {limit}. "
+                    "RAG(...) splits oversized chunks before embedding them - lower chunk_size or set embedding_max_tokens."
+                )
 
     def embed_query(self, text: str) -> List[float]:
         """Embed a search query (``input_type`` = the query type when configured)."""

@@ -300,6 +300,8 @@ class RAG:
         sentence_splitter: Any = None,
         semantic_overlap_sentences: int = 0,
         allow_web_after_private: bool = False,
+        embedding_max_tokens: Optional[int] = None,
+        oversized_chunks: str = "split",
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -456,6 +458,8 @@ class RAG:
             semantic_overlap_sentences=semantic_overlap_sentences,
         )
         self._chunking_fallbacks: List[Dict[str, str]] = []
+        self._oversized_chunks: List[Dict[str, Any]] = []
+        self._configure_embedding_limit(embedding_max_tokens, oversized_chunks)
         self._index_signatures: set = set()  # chunking signatures of the chunks already in this index
         self._settings_warned = False
         if isinstance(self._embedding, CachedEmbedding) and self._splitter.token_counter_name != "units":
@@ -877,6 +881,54 @@ class RAG:
             except Exception as exc:  # noqa: BLE001 - observers must never break ingestion
                 logger.warning("on_event callback failed: %s", exc)
 
+    def _configure_embedding_limit(self, override: Optional[int], policy: str) -> None:
+        """Make the chunker respect the embedding model's input limit, and warn when chunk_size cannot fit."""
+
+        from raglib.core.text import count_tokens
+        from raglib.embedding.limits import ESTIMATE_MARGIN, TOKENIZER_SAMPLE, EmbeddingLimitWarning
+
+        if policy not in {"split", "raise"}:
+            raise ValueError("oversized_chunks must be 'split' or 'raise'")
+        embedding = self._embedding
+        limit = override or (embedding.max_input_tokens if embedding is not None else None)
+        self._embedding_limit = limit
+        if not limit or embedding is None:
+            return
+        exact = embedding.count_input_tokens(TOKENIZER_SAMPLE) is not None
+        if exact:
+            counter: Callable[[str], int] = lambda text: embedding.count_input_tokens(text) or 0  # noqa: E731
+        else:
+            counter = count_tokens  # tiktoken when installed, else ~4 characters per token
+        self._splitter.set_embedding_limit(limit, counter, exact, policy, on_oversized=self._record_oversized)
+        # Startup check: how many model tokens does a chunk of chunk_size (in the chunker's units) hold?
+        ratio = counter(TOKENIZER_SAMPLE) / max(1, self._splitter._count_tokens(TOKENIZER_SAMPLE))
+        usable = limit if exact else int(limit * ESTIMATE_MARGIN)
+        expected = self._splitter._chunk_size * ratio
+        if expected > usable:
+            safe = max(1, int(usable / ratio))
+            message = (
+                f"chunk_size={self._splitter._chunk_size} ({self._splitter.token_counter_name}) is about {expected:.0f} "
+                f"tokens for {embedding.model_name or type(embedding).__name__}, which reads at most {limit}"
+                f"{'' if exact else ' (estimated)'}. Chunks over the limit will be "
+                f"{'rejected' if policy == 'raise' else 'split further'} at ingest. Use chunk_size<={safe} to avoid it."
+            )
+            warnings.warn(message, EmbeddingLimitWarning, stacklevel=4)
+            logger.warning(message)
+
+    def _record_oversized(self, document: Document, tokens: int, parts: int) -> None:
+        """A chunk was split to fit the embedding model: count it and warn once per ingest call."""
+
+        from raglib.embedding.limits import EmbeddingLimitWarning
+
+        self._oversized_chunks.append({"document_id": document.id, "tokens": tokens, "parts": parts})
+        if len(self._oversized_chunks) == 1 or len(self._oversized_chunks) % 1000 == 0:
+            warnings.warn(
+                f"A chunk of {document.id!r} had {tokens} tokens, over the embedding limit of {self._embedding_limit}; "
+                f"split into {parts} parts (counted in ingest_usage()['oversized_chunks_split']).",
+                EmbeddingLimitWarning,
+                stacklevel=2,
+            )
+
     def _private_document(self, document: Document) -> bool:
         """True for a retrieved corpus document above the lowest access level (web results have no level)."""
 
@@ -887,6 +939,8 @@ class RAG:
         """Settings that decide chunk boundaries (strategy, sizes, token counter, semantic options)."""
 
         info = dict(self._splitter.settings())
+        if getattr(self, "_embedding_limit", None):
+            info["embedding_max_tokens"] = self._embedding_limit  # oversized chunks are split at this limit
         if self._parent_retrieval is not None:
             info.update(parent_retrieval=self._parent_retrieval, parent_chunk_size=self._parent_chunk_size)
         return info
@@ -1026,6 +1080,7 @@ class RAG:
             **self._ingest_meter.as_dict(),
             "usage_by_model": self._ingest_meter.breakdown(),
             "chunking_fallbacks": len(self._chunking_fallbacks),
+            "oversized_chunks_split": len(self._oversized_chunks),
             "chunking_fallback_documents": [item["document_id"] for item in self._chunking_fallbacks[-50:]],
         }
         if self._prices is not None:

@@ -34,6 +34,8 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # Chunk sizes in real model tokens (tiktoken when installed), and no silent chunking fallback.
         "token_counter": "auto",
         "on_embedding_failure": "raise",
+        # A chunk the embedding model cannot read in full fails ingestion instead of being split quietly.
+        "oversized_chunks": "raise",
     },
 }
 

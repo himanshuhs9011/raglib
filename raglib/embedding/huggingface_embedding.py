@@ -56,6 +56,24 @@ class HuggingFaceEmbedding(BaseEmbedding):
         return self.embed_documents([text])[0]
 
     @property
+    def max_input_tokens(self) -> Optional[int]:
+        """The model's real limit (``max_seq_length``, e.g. 512 for bge-base); else the known table."""
+
+        limit = getattr(self._model, "max_seq_length", None)
+        return int(limit) if limit else super().max_input_tokens
+
+    def count_input_tokens(self, text: str) -> Optional[int]:
+        """Exact count with the model's own tokenizer (special tokens included, as the model sees it)."""
+
+        tokenizer = getattr(self._model, "tokenizer", None)
+        if tokenizer is None:
+            return None
+        try:
+            return len(tokenizer.encode(text, add_special_tokens=True))
+        except Exception:  # noqa: BLE001 - a tokenizer without encode(): fall back to estimates
+            return None
+
+    @property
     def dimension(self) -> int:
         """Return embedding dimensionality."""
 

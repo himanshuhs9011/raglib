@@ -95,6 +95,17 @@ class CachedEmbedding(BaseEmbedding):
         record_embedding_usage(sum(counter(text) for text in texts), model=self.model_label)
 
     @property
+    def max_input_tokens(self) -> Optional[int]:
+        """The wrapped model's input limit."""
+
+        return self.inner.max_input_tokens
+
+    def count_input_tokens(self, text: str) -> Optional[int]:
+        """The wrapped model's exact token count (``None`` without its tokenizer)."""
+
+        return self.inner.count_input_tokens(text)
+
+    @property
     def model_label(self) -> str:
         """Name used to price this model (``model_name`` of the wrapped model, else its class)."""
 

@@ -31,6 +31,19 @@ class BaseEmbedding(ABC):
 
         return getattr(self, "_model_name", None)
 
+    @property
+    def max_input_tokens(self) -> Optional[int]:
+        """Longest input the model reads, in its own tokens (``None`` when unknown)."""
+
+        from raglib.embedding.limits import known_limit
+
+        return known_limit(self.model_name)
+
+    def count_input_tokens(self, text: str) -> Optional[int]:
+        """Exact length of ``text`` in the model's tokens, or ``None`` without the model's tokenizer."""
+
+        return None
+
     def fingerprint(self) -> Dict[str, Any]:
         """Identify the model that produced the vectors (class + model name)."""
 

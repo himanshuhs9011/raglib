@@ -79,6 +79,14 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 - Every tool call and its arguments is logged in the `tool` trace stage and in `result.metadata["tool_calls"]`.
 - A heuristic flags, but never blocks, sources with instruction-like text, in `result.metadata["injection_flags"]` and an `injection_flag` warning event.
 
+**Embedding model limits: chunks are never silently truncated.**
+- Known per-model limits (bge 512, all-MiniLM 256, OpenAI 8191, Gemini 2048, Ollama models, ...), overridable with `embedding_max_tokens`.
+- Chunks are counted with the model's tokenizer when available (HuggingFace `tokenizer` / `max_seq_length`, OpenAI via tiktoken), else estimated with a 10% margin.
+- At ingest, chunks over the limit are split at sentence borders, with an `EmbeddingLimitWarning`, and counted in `ingest_usage()`. With `oversized_chunks="raise"` (the production preset) they raise `EmbeddingLimitError`. The semantic chunker's comparison windows are kept within the limit too.
+- A startup warning appears when `chunk_size` cannot fit the model, with a safe size suggested.
+- OpenAI inputs are checked before the API call.
+- New `BaseEmbedding.max_input_tokens` / `count_input_tokens()`.
+
 **Other changes (not breaking):**
 - New optional parameters: `RAG(access_control=)`, `query/aquery/stream(user=)`, `add(access=, metadata=)`, `reset_memory(user=)`. New `rag.permission_filter(user)`.
 - `GraphRetriever.retrieve`, `LocalSearch.search`, `GlobalSearch.search` and `WebRetriever.retrieve` accept `filters=`. `GlobalSearch` takes an optional `chunk_lookup`, which it needs to serve filtered queries.

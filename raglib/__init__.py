@@ -33,6 +33,7 @@ from raglib.components import (
 )
 from raglib.core.base import BaseRAG
 from raglib.costs import CostReport, ModelPrice, PriceTable
+from raglib.embedding.limits import EmbeddingLimitError, EmbeddingLimitWarning
 from raglib.exporters import OpenTelemetryExporter, PrometheusExporter
 from raglib.facade import RAG
 from raglib.graph_context import (
@@ -74,6 +75,8 @@ from raglib.schemas import (
 )
 
 __all__ = [
+    "EmbeddingLimitError",
+    "EmbeddingLimitWarning",
     "IndexSettingsWarning",
     "EmbeddingChunkingError",
     "AnswerCache",

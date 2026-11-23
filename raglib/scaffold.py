@@ -81,6 +81,8 @@ rag = RAG(
     embedding_api_key=<<EMBEDDING_KEY>>,
     embedding_model=None,                  # e.g. "text-embedding-3-large"
     embedding_base_url=None,
+    embedding_max_tokens=None,             # model input limit (default: known per model, e.g. bge 512, OpenAI 8191)
+    oversized_chunks=<<OVERSIZED>>,               # chunk longer than the model reads: "raise" | "split" (never silently truncated)
 
     # ---------------------------------------------------------------- vision (OCR of scanned PDF pages)
     vision_llm=None,                       # e.g. "openai" to read image-only pages
@@ -247,6 +249,7 @@ def render_pipeline(preset: str = "production", llm: str = "openai", docs: str =
         "<<EMBEDDING_TTL>>": repr(values.get("embedding_cache_ttl")),
         "<<TOKEN_COUNTER>>": f'"{values.get("token_counter", "units")}"',
         "<<ON_FAILURE>>": f'"{values.get("on_embedding_failure", "fallback")}"',
+        "<<OVERSIZED>>": f'"{values.get("oversized_chunks", "split")}"',
     }
     source = PIPELINE_TEMPLATE
     for token, value in tokens.items():
