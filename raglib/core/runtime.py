@@ -147,10 +147,17 @@ def _reset(var: ContextVar, token: Any) -> None:
 
 
 @contextmanager
-def usage_scope() -> Iterator[UsageMeter]:
-    """Collect the usage of every LLM call made inside the block (nested scopes all count it)."""
+def usage_scope(meter: Optional[UsageMeter] = None) -> Iterator[UsageMeter]:
+    """Collect the usage of every LLM call made inside the block (nested scopes all count it).
 
-    meter = UsageMeter()
+    ``meter`` reuses an existing meter (e.g. one opened by ``RAG.query`` for its guards); it is
+    not added twice when it is already collecting, so nothing is double-counted.
+    """
+
+    if meter is not None and any(active is meter for active in _METERS.get()):
+        yield meter
+        return
+    meter = meter or UsageMeter()
     token = _METERS.set(_METERS.get() + (meter,))
     try:
         yield meter

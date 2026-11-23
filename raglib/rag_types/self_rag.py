@@ -105,6 +105,7 @@ class SelfRAG(BaseRAG):
         verdict = RETRIEVE_NO if ctx.metadata.get("smalltalk") else self._llm_decide_retrieval(state.active_query)
         state.trace.append(f"decide_retrieval:{verdict}")
         if verdict == RETRIEVE_NO:
+            ctx.metadata["retrieval_skipped"] = True
             state.result = self.generate(ctx, [])
             state.terminal = "direct"
             return self._finalize(ctx, state)

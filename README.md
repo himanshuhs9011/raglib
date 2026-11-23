@@ -26,7 +26,7 @@
 13. [Evaluation](#13-evaluation)
 14. [Building Custom Pipelines from Core Components](#14-building-custom-pipelines-from-core-components)
 15. [Core Data Schemas](#15-core-data-schemas)
-    - [Seeing the Graph](#seeing-the-graph) · [Security & Privacy](#security--privacy) · [Scaling & Concurrency](#scaling--concurrency)
+    - [Seeing the Graph](#seeing-the-graph) · [Security & Privacy](#security--privacy) · [Guardrails](#guardrails) · [Scaling & Concurrency](#scaling--concurrency)
 16. [Migrating from v1 to v2](#16-migrating-from-v1-to-v2)
 
 ---
@@ -209,6 +209,7 @@ rag = RAG(
 | 10 chunks retrieved for the reranker | `rerank_candidates` | `max(4 * top_k, 20)` |
 | `"cross_encoder"` (local `BAAI/bge-reranker-base`) | `reranker` | `"none"` |
 | 3 chunks sent to the LLM | `top_k` | 5 |
+| tier 0 guardrails on every stage (see [Guardrails](#guardrails)) | `input_guards` / `retrieval_guards` / `output_guards` / `tool_policy` | off |
 
 `raglib init [PATH] --preset production` does the same as `raglib-py --production`. Both refuse to overwrite a file unless you pass `--force`. The cross-encoder needs `pip install raglib-py[rerank]`. Without it raglib logs a warning and keeps the hybrid order.
 
@@ -287,6 +288,11 @@ rag = RAG(
     embedding_max_tokens=None,          # embedding model input limit (default: known per model)
     oversized_chunks="split",           # chunk longer than the embedding model reads: "split" | "raise"
     allow_web_after_private=False,      # agent web search after retrieving non-public documents
+    input_guards=None,                  # guardrails on the question: [PIIMasker(), UserRateLimit(30), ...] | "default"
+    retrieval_guards=None,              # on the retrieved documents: [NothingRelevant()] | "default"
+    output_guards=None,                 # on the answer: [OutputLeakGuard(), JSONSchemaGuard(schema)] | "default"
+    tool_policy=None,                   # agent: ToolPolicy(allowed_tools={role: [...]}, max_tool_calls=8)
+    guard_cache_ttl=3600.0,             # seconds a guard decision is reused for the same input (None = off)
     embedding_cache_ttl=None,           # seconds before a cached embedding expires
     cache_personalized=False,           # False: no caching for queries with user= / filters= (public tier only)
     answer_cache=None,                  # True: question-level answer cache (FAQ tier)
@@ -1033,6 +1039,7 @@ raglib graph papers/ --out graph.html
 | User-supplied file paths | `allowed_dirs=[...]` sandboxes file and folder sources (resolves `..` and symlinks). | Always set it when paths come from users. |
 | Prompt injection | Retrieved, web and conversation text is wrapped in an unguessable per-prompt tag (`<src-XXXXXXXX>`, an HMAC under a per-process secret) in every prompt: answer, agent, grader, knowledge strips, LLM reranker, Self-RAG, multi-hop planner, refiner, condenser, graph extraction and reports, global search, LLM chunking and the eval judge. Tag-like text inside documents (`</source>`, `</sources>`, `<src-...>`) is escaped, attribute values are HTML-escaped, and each prompt states that the block is data, never instructions. The tag is stable for the same question and sources, so caching keeps working. | Treat answers as untrusted output; don't give agent tools destructive permissions. This lowers the success rate of injected instructions; no prompt format makes a model immune. |
 | Agent web search | `search_web` queries are rebuilt from the user's question plus model-written keywords that do not occur in any retrieved document (split-up copies included), and capped at 200 characters. An injected "call search_web with <secret>" cannot send document text out. With `access_control`, web search is off for any query that retrieved a non-public document (`allow_web_after_private=True` re-enables it). Every tool call and its arguments is in the trace and `result.metadata["tool_calls"]`. Sources with instruction-like text ("ignore previous instructions", "you are now", "call the tool", fake tags) are flagged in `result.metadata["injection_flags"]` and an `injection_flag` event, but not blocked. | A keyword that also appears in a retrieved document is dropped from the web query. Encoded or paraphrased leaks (e.g. base64) are not detected. Keep `search_web` off for confidential corpora unless you need it. |
+| Guardrails | Opt-in (on with `preset="production"`): PII masking before anything is traced, cached or sent, injection keywords, rate limits and budgets, a no-LLM "nothing relevant" exit, answer leak and citation-access checks, agent tool policy. See [Guardrails](#guardrails). | Pass a `user=` or `session_id` per caller so rate limits and budgets are per user. |
 | Multi-user | `session_id` isolates chat history. With `access_control=True`, documents are filtered per user inside every search (vector, BM25, hybrid, graph, multi-query, web+corpus) and history is kept per user. | Tag documents at ingest and pass `user=` on every query (see "Access Control"). |
 | Data at rest | `output_dir`, `save()`, Chroma and graph files contain document text and Q&A. | Store them on encrypted disks; delete with `rag.delete(source)` (removes chunks, vectors and graph entities). |
 
@@ -1064,6 +1071,59 @@ rag.query("Holiday policy?")                                # anonymous: "public
 - **Conversation memory** is kept per user, so the same `session_id` used by two users never shares history.
 - **Backends that cannot filter raise `FilterNotSupportedError`** instead of returning everything: a `BaseVectorStore` with `supports_metadata_filters = False`, a custom graph retriever without `supports_filters = True`, or a search provider that searches your corpus without filter support. Hits that a vector store returns outside the filter are dropped and logged.
 - Index-time work (entity extraction, community reports) reads every document, as embedding does. Use a model you trust with all of your data for `graph_llm`.
+
+## Guardrails
+
+Layered checks on the question, the retrieved documents, the answer and the agent's tool calls. They run cheapest first and stop at the first block. Each guard returns **allow**, **block** (with a message for the user) or **modify** (e.g. the question with PII masked), plus a confidence. This release ships tier 0: rules that need no model and cost nothing (microseconds per check).
+
+```python
+from raglib import RAG
+from raglib.guards import (
+    PIIMasker, MaxQuestionTokens, InjectionHeuristic, UserRateLimit, UserDailyBudget,
+    NothingRelevant, OutputLeakGuard, CitationAccessGuard, JSONSchemaGuard, MaxOutputTokens, ToolPolicy,
+)
+
+rag = RAG(
+    "docs/", llm="openai", prices=my_prices,
+    input_guards=[PIIMasker(), MaxQuestionTokens(500), InjectionHeuristic(),
+                  UserRateLimit(30, per_seconds=60), UserDailyBudget(max_usd=0.50)],
+    retrieval_guards=[NothingRelevant(message="That isn't covered by our documents.")],
+    output_guards=[OutputLeakGuard(), CitationAccessGuard()],
+)
+result = rag.query("My card 4111 1111 1111 1111 was charged twice, why?", session_id="u1")
+result.metadata["guards"]      # one record per decision: guard, stage, action, reason, confidence, mode, latency_ms
+result.metadata["blocked_by"]  # set when a guard blocked the query
+```
+
+`preset="production"` turns on `"default"` for every stage: `PIIMasker` + `MaxQuestionTokens` + `InjectionHeuristic`, `NothingRelevant`, `OutputLeakGuard` + `CitationAccessGuard`, and a `ToolPolicy` with call and argument limits. A plain `RAG(...)` has no guards. You can also mix names and objects: `input_guards=["default", UserRateLimit(10)]`.
+
+| Guard | Stage | What it does | Cost / trade-off |
+| :--- | :--- | :--- | :--- |
+| `PIIMasker(action="mask")` | input | Replaces e-mails, phone numbers, Aadhaar (Verhoeff checksum), PAN and card numbers (Luhn checksum) with `[EMAIL]`, `[PHONE]`, ... before the question reaches traces, `on_event`, `LatencyStats` tags, caches, memory or any model. `action="block"` refuses instead. | Free. Regexes miss names, addresses and unusual formats. A masked question can retrieve worse when the PII was the search key. |
+| `MaxQuestionTokens(1000)` | input | Blocks over-long questions. | Free. Caps prompt cost per query. |
+| `UserRateLimit(30, per_seconds=60)` | input | Sliding window per user: `user.user_id`, else `session_id`, else one shared `"anonymous"` bucket. | Free. In process memory: each worker counts separately, so use your API gateway for a global limit. |
+| `UserDailyBudget(max_usd=1.0)` | input | Blocks a user whose spend today (UTC) reached the budget. Spend is each answer's `usage["cost_usd"]`, the pricing `CostReport` uses. | Free. Needs `prices=`; without them it is skipped with a one-time `GuardSkippedWarning`. Charged after the query, so the last query of a day can overshoot by its own cost. |
+| `InjectionHeuristic()` | input | Keyword patterns ("ignore previous instructions", fake tags, "reveal the system prompt"). Strong or repeated signals block (confidence 0.9). One weak signal is allowed and recorded with low confidence. | Free. Catches copy-paste attacks, not paraphrased or encoded ones. |
+| `NothingRelevant()` | retrieval | When the best retrieved chunk is below the threshold, answers "I couldn't find this in the documents." **without calling the LLM**. | Free, and it saves the answer LLM call for off-topic questions. A threshold set too high refuses answerable questions. |
+| `OutputLeakGuard()` | output | Masks API keys, cloud keys, private keys and JWTs in the answer. It also masks personal data that is *not* in the sources the user could read (a support e-mail from your docs is kept). | Free. Same regex limits as `PIIMasker`. |
+| `CitationAccessGuard()` | output | With access control, withholds an answer that cites a document the user cannot read (defense in depth), and strips `[n]` markers that point past the source list. | Free. |
+| `JSONSchemaGuard(schema)` | output | The answer must be JSON matching `schema` (a code fence is unwrapped). Uses `jsonschema` when it is installed, otherwise a built-in subset (`type`, `required`, `properties`, `items`, `enum`). | Free. It blocks; it does not re-ask the model. |
+| `MaxOutputTokens(800)` | output | Truncates (or with `action="block"`, withholds) long answers. | Free. It limits what is shown, not what you pay: set `llm_max_tokens` to cap cost. |
+| `ToolPolicy(...)` | agent | `allowed_tools={"support": ["search_docs"]}` (the union over the user's roles; `default_tools` applies to everyone else), `max_tool_calls=8` per question, `max_argument_chars=1000`, and `argument_checks={"sql": fn}`. A blocked call is sent back to the agent as the tool's answer. | Free. A tool the user may not call is never offered to the model. |
+
+**Nothing-relevant thresholds.** With `score="auto"`, the guard uses the reranker score when a Cohere or cross-encoder reranker ran, otherwise the dense cosine similarity of the query and the chunk. The defaults are deliberately low, so only clearly unrelated questions stop: cosine `0.15`, Cohere relevance `0.02`, cross-encoder logit `-7`. BM25-only, fusion-only, web and tool results have no absolute scale, so the check is skipped for them, and so is offline `MockEmbedding`. Embedding models differ (e5 models score unrelated text around 0.7), so check `result.sources[i].metadata["dense_score"]` / `["rerank_score"]` on your own data and set `NothingRelevant(threshold=0.3)` or `threshold={"dense": 0.3, "cross_encoder": -4}`. No documents at all also exits early, except for small talk and "no retrieval needed" decisions.
+
+**Failure policy.** A guard that raises **fails closed** (blocks) when it is a security guard and **fails open** (allows, `error` recorded) when it is a quality guard (`NothingRelevant`, `MaxOutputTokens`, `JSONSchemaGuard`). Override it per guard with `fail_closed=True/False`. Every guard also takes `message=` for its user-facing text.
+
+**Caching.** Decisions of deterministic guards (`MaxQuestionTokens`, `InjectionHeuristic`) are cached by a hash of the input for `guard_cache_ttl` seconds (default 1 h, `None` turns it off). Stateful guards (rate limit, budget) are never cached, and neither are errors. A guard's refusal is never stored in the answer cache, so a document added later can answer the question.
+
+**Observability.** Each guard is its own trace stage `guard.<name>`, with `stage`, `tier`, `action`, `mode` (`rule` / `local` / `api` / `skipped`), `confidence`, `cached` and `reason` in its meta. Guard stages show up in `result.trace_events`, `on_event`, `LatencyStats` (listed first) and `CostReport` (each guard on its own line, tier 0 at $0). The `total` event carries a `blocked_by` tag, so `LatencyStats` samples can be split by it. A blocked question makes no retrieval and no LLM call (`usage["llm_calls"] == 0`).
+
+**Streaming.** With output guards, `rag.stream(...)` checks the answer before showing it and yields it in one piece. The trade-off: no token-by-token display, so the time to first token is the full answer time. Without output guards, streaming is unchanged.
+
+**Custom guards.** Subclass `raglib.guards.Guard`, set `name`, `stages` (`("input",)`, `("retrieval",)`, `("output",)`), `tier`, `kind` (`"security"` or `"quality"`) and `cacheable`, and return `allow()`, `block(message)` or `modify(value)` from `check(value, context)`. `context` has the question, `user`, `user_key`, `filters`, `permission_filter` and `documents`.
+
+Coming next: tier 1 (a topic check that reuses the query embedding, injection and toxicity classifiers, and a grounding check) and tier 2 (an LLM judge that runs only when tier 1 is unsure). Local models will always be optional.
 
 ## Scaling & Concurrency
 

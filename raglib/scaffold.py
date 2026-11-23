@@ -178,6 +178,13 @@ rag = RAG(
     access_control=None,                   # True: per-document permissions (rag.add(..., access=...), rag.query(..., user=...))
     allow_web_after_private=False,         # agent web search after retrieving non-public documents (off: no exfiltration path)
 
+    # ---------------------------------------------------------------- guardrails (raglib.guards, cheapest first)
+    input_guards=<<INPUT_GUARDS>>,                # "default" = PIIMasker + MaxQuestionTokens + InjectionHeuristic; add UserRateLimit(30), UserDailyBudget(1.0)
+    retrieval_guards=<<RETRIEVAL_GUARDS>>,            # "default" = NothingRelevant(): "couldn't find this" without an LLM call
+    output_guards=<<OUTPUT_GUARDS>>,               # "default" = OutputLeakGuard + CitationAccessGuard; add JSONSchemaGuard(schema), MaxOutputTokens(800)
+    tool_policy=<<TOOL_POLICY>>,                 # agent: ToolPolicy(allowed_tools={"support": ["search_docs"]}, max_tool_calls=8)
+    guard_cache_ttl=3600.0,                # seconds a guard decision is reused for the same input (None = off)
+
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back
     on_event=latency,                      # or [latency, PrometheusExporter(), OpenTelemetryExporter()]
@@ -224,6 +231,10 @@ def _models(llm: str) -> Tuple[str, Optional[str], str, Optional[str]]:
     return chat_env, "openai", "OPENAI_API_KEY", note
 
 
+def _repr(value: object) -> str:
+    return repr(value).replace("'", '"')
+
+
 def _getenv(name: str) -> str:
     return f'os.getenv("{name}")' if name else "None"
 
@@ -252,6 +263,10 @@ def render_pipeline(preset: str = "production", llm: str = "openai", docs: str =
         "<<TOKEN_COUNTER>>": f'"{values.get("token_counter", "units")}"',
         "<<ON_FAILURE>>": f'"{values.get("on_embedding_failure", "fallback")}"',
         "<<OVERSIZED>>": f'"{values.get("oversized_chunks", "split")}"',
+        "<<INPUT_GUARDS>>": _repr(values.get("input_guards")),
+        "<<RETRIEVAL_GUARDS>>": _repr(values.get("retrieval_guards")),
+        "<<OUTPUT_GUARDS>>": _repr(values.get("output_guards")),
+        "<<TOOL_POLICY>>": _repr(values.get("tool_policy")),
     }
     source = PIPELINE_TEMPLATE
     for token, value in tokens.items():

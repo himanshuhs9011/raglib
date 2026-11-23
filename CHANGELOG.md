@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Guardrails, tier 0 (free rules).** New `raglib.guards` and `RAG(input_guards=..., retrieval_guards=..., output_guards=..., tool_policy=..., guard_cache_ttl=3600)`. Guards run cheapest tier first and stop at the first block. Each returns allow / block (with a user-facing message) / modify, plus a confidence. See README "Guardrails".
+- Input: `PIIMasker` (e-mail, phone, Aadhaar, PAN and card numbers, with checksums; it runs before the question reaches traces, `LatencyStats` tags, caches, memory or the LLM), `MaxQuestionTokens`, `UserRateLimit`, `UserDailyBudget` (priced like `CostReport`; skipped with a one-time `GuardSkippedWarning` without `prices=`), `InjectionHeuristic`.
+- Retrieval: `NothingRelevant` answers "I couldn't find this in the documents." without an LLM call when the best chunk is below a threshold. The default threshold depends on the score type: cosine 0.15, Cohere 0.02, cross-encoder logit -7.
+- Output: `OutputLeakGuard` (secrets, and PII that is not in the user's sources), `CitationAccessGuard`, `JSONSchemaGuard`, `MaxOutputTokens`.
+- Agent: `ToolPolicy`, with a tool allowlist per role, a cap on tool calls per question and argument limits.
+- Security guards fail closed and quality guards fail open; `fail_closed=` overrides this. Deterministic decisions are cached by input hash.
+- Every decision is in `result.metadata["guards"]` (plus `blocked_by` / `block_reason` on a block) and is traced as its own stage `guard.<name>`. Guard stages appear in `on_event`, `LatencyStats` (listed first; the `total` event has a new `blocked_by` run tag) and `CostReport` (each guard on its own line, $0 for tier 0).
+- `preset="production"` turns on the defaults for every stage. This preset is unreleased, so the change is not breaking. A plain `RAG(...)` is unchanged: no guards.
+- With output guards, `stream()` yields the checked answer in one piece instead of token by token.
+- `BaseRAG.run` / `stream` accept optional `tracer=` / `meter=` to continue a caller's trace and usage, and `usage_scope(meter)` reuses an active meter without double counting.
+- An answer refused by a guard is not stored in the answer cache.
+
 **Security: filters were not applied on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search, but these paths ignored it and could return documents outside the filter:
 - GraphRAG local and global search (`rag_type="graph"`), the router's `graph` and `hybrid` routes (`rag_type="routing"`), and the agentic `graph_search` tool.
 - The decision engine's web/hybrid fallback (`BaseRAG._retrieve_by_mode`), and `HybridRAG` when no corpus retriever is set.

@@ -38,6 +38,7 @@ STAGE_ORDER: Sequence[str] = (
 )
 RUN_TAGS: Sequence[str] = (
     "cache_hit", "query_tokens", "num_candidates", "reranker_used", "rerank_skipped", "pipeline", "tier",
+    "blocked_by",
 )
 
 
@@ -168,7 +169,8 @@ class LatencyStats:
         with self._lock:
             names = list(self._samples)
         known = [name for name in STAGE_ORDER if name in names]
-        return known + sorted(name for name in names if name not in STAGE_ORDER)
+        guards = sorted(name for name in names if name.startswith("guard."))  # input guards run first
+        return guards + known + sorted(name for name in names if name not in STAGE_ORDER and name not in guards)
 
     def samples(self, stage: str) -> List[LatencySample]:
         """A snapshot of the samples kept for ``stage``."""

@@ -89,7 +89,34 @@ class AgenticRAG(BaseRAG):
             )
         for tool in self.extra_tools:
             tools[tool.name] = tool
+        policy = self._tool_policy()
+        if policy is not None:
+            from raglib.guards.base import current_scope
+
+            scope = current_scope()
+            tools = policy.filter_tools(tools, scope.context.user if scope is not None else None)
         return tools
+
+    @staticmethod
+    def _tool_policy() -> Any:
+        """The query's ``ToolPolicy`` (``RAG(tool_policy=...)``), if any."""
+
+        from raglib.guards.base import current_scope
+
+        scope = current_scope()
+        return scope.tool_policy if scope is not None else None
+
+    def _check_tool(self, ctx: PipelineContext, name: str, tool_input: str) -> Optional[Any]:
+        """The ``ToolPolicy`` decision blocking this call, or ``None`` when it may run."""
+
+        from raglib.guards.base import current_scope
+
+        scope = current_scope()
+        if scope is None or scope.tool_policy is None:
+            return None
+        calls = len(ctx.metadata.get("tool_calls", []))
+        _, blocked = scope.run("tool", [scope.tool_policy], (name, tool_input or "", calls), tool=name, question=ctx.query)
+        return blocked
 
     def retrieve(self, ctx: PipelineContext) -> List[Document]:
         """Run the agent loop and return the gathered evidence."""
@@ -98,6 +125,9 @@ class AgenticRAG(BaseRAG):
             raise ValueError("AgenticRAG requires llm_client")
         tools = self.available_tools(ctx)
         if not tools:
+            if self._tool_policy() is not None:
+                ctx.trace.append("tools_denied_by_policy")
+                return []
             raise ValueError("AgenticRAG has no tools: configure a retriever, web search, graph, or tools=[...]")
 
         steps: List[Dict[str, Any]] = []
@@ -117,6 +147,16 @@ class AgenticRAG(BaseRAG):
                 ctx.trace.append(f"step_{step_number}:unknown_tool:{name}")
                 continue
             call: Dict[str, Any] = {"step": step_number, "tool": name, "input": (tool_input or "")[:500]}
+            denied = self._check_tool(ctx, name, tool_input)
+            if denied is not None:
+                call["blocked"] = denied.message
+                call["docs"] = 0
+                ctx.metadata.setdefault("tool_calls", []).append(call)
+                steps.append({"action": name, "input": tool_input, "observation": denied.message})
+                ctx.trace.append(f"step_{step_number}:{name}_blocked_by_policy")
+                if denied.reason.startswith("call limit"):
+                    break  # out of tool calls for this question: answer with what we have
+                continue
             with ctx.tracer.stage("tool", tool=name, step=step_number, input=call["input"]) as meta:
                 guard = self._guard_web(ctx, name, tool_input, evidence) if name == "search_web" else None
                 if guard is not None and guard[0] is None:
@@ -139,7 +179,7 @@ class AgenticRAG(BaseRAG):
             steps.append({"action": name, "input": tool_input, "observation": observation})
             ctx.trace.append(f"step_{step_number}:{name}({(tool_input or '')[:50]})->{len(docs)}_docs")
 
-        if not any(evidence) and "search_docs" in tools:
+        if not any(evidence) and "search_docs" in tools and self._check_tool(ctx, "search_docs", ctx.search_query) is None:
             ctx.trace.append("fallback:search_docs")
             evidence.append(tools["search_docs"].run(ctx.search_query))
         ctx.metadata["agent_steps"] = steps

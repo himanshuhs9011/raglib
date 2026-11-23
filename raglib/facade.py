@@ -47,11 +47,12 @@ from raglib.constants import (
 )
 from raglib.core.runtime import UsageMeter, usage_scope
 from raglib.core.text import token_set
-from raglib.core.tracing import OnEvent, Tracer, run_tags
+from raglib.core.tracing import OnEvent, Tracer, active_tracer, run_tags
 from raglib.costs import PriceTable
 from raglib.embedding.base_embedding import BaseEmbedding
 from raglib.embedding.cached_embedding import CachedEmbedding
 from raglib.embedding.embedding_factory import EmbeddingFactory
+from raglib.guards import GuardConfig, GuardContext, GuardScope, GuardSpec, ToolPolicy, guard_scope
 from raglib.llm.base_client import (
     BaseLLMClient,
     CachedLLMClient,
@@ -304,6 +305,11 @@ class RAG:
         oversized_chunks: str = "split",
         embedding_timeout: Optional[float] = None,
         reranker_timeout: float = 10.0,
+        input_guards: GuardSpec = None,
+        retrieval_guards: GuardSpec = None,
+        output_guards: GuardSpec = None,
+        tool_policy: Union[ToolPolicy, str, None] = None,
+        guard_cache_ttl: Optional[float] = 3600.0,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -360,6 +366,18 @@ class RAG:
           cost estimate uses the same one. The chunking settings are recorded in the index; opening or
           extending an index with different ones raises an ``IndexSettingsWarning``.
         * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
+
+        Guardrails (``raglib.guards``; cheapest first, stop at the first block):
+
+        * ``input_guards`` run on the question before anything else (PII masking, length, rate
+          limit, budget, injection keywords); ``retrieval_guards`` on the retrieved documents
+          before the answer LLM call (``NothingRelevant`` answers "couldn't find this" for free);
+          ``output_guards`` on the answer (leak check, citation access, JSON schema, length).
+          Each takes a list of ``Guard`` objects, guard names, or ``"default"``.
+        * ``tool_policy``: a ``ToolPolicy`` for ``rag_type="agentic"`` (tools per role, calls per
+          question, argument limits); ``"default"`` caps calls and argument length.
+        * ``guard_cache_ttl``: seconds a cacheable guard decision is reused for the same input
+          (``None`` disables the decision cache).
         """
 
         if top_k <= 0:
@@ -598,6 +616,11 @@ class RAG:
         if tools:
             rag_type_kwargs["tools"] = list(tools)
         self._rag = self._build_orchestrator(self._rag_type, rag_type_kwargs)
+        self._guards: Optional[GuardConfig] = GuardConfig.build(
+            input_guards, retrieval_guards, output_guards, tool_policy, cache_ttl=guard_cache_ttl
+        )
+        if self._guards is not None:
+            self._guards.bind(self)
 
         # Tier routing: FAQ (answer cache) -> cheap model -> full pipeline.
         self._cheap_rag: Optional[Any] = None
@@ -672,12 +695,103 @@ class RAG:
         question = question.strip()
         effective_filters, session_key = self._scope(filters, user, session_id)
         personalized = self._personalized(filters, user)
-        with cache_bypass(personalized and not self._cache_personalized):
-            result = self._answer(question, session_key, effective_filters, personalized)
+        if self._guards is None:
+            with cache_bypass(personalized and not self._cache_personalized):
+                result = self._answer(question, session_key, effective_filters, personalized)
+        else:
+            result, question = self._guarded(question, session_id, effective_filters, user, personalized, session_key)
         result.metadata["session_id"] = session_id
         if self._output_dir:
             self._save_result(question, result)
         return result
+
+    def _guarded(
+        self,
+        question: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        user: Any,
+        personalized: bool,
+        session_key: Optional[str],
+    ) -> Tuple[GenerationResult, str]:
+        """Run the input guards, then the pipeline with retrieval / output / tool guards in scope.
+
+        One trace and one usage meter cover the guards and the pipeline, so guard stages show up
+        in ``result.trace_events``, ``on_event``, ``LatencyStats`` and ``CostReport``.
+        """
+
+        guards = self._guards
+        assert guards is not None
+        tracer = Tracer(on_event=self._rag.on_event)
+        context = self._guard_context(question, session_id, filters, user)
+        with usage_scope() as meter, active_tracer(tracer):
+            question, decisions, blocked = guards.runner.run("input", guards.input, question, context)
+            context = replace(context, question=question)
+            scope = GuardScope(
+                runner=guards.runner, context=context, retrieval_guards=guards.retrieval,
+                output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
+            )
+            if blocked is not None:
+                result = self._input_blocked(blocked, tracer, meter)
+            else:
+                with guard_scope(scope), cache_bypass(personalized and not self._cache_personalized):
+                    result = self._answer(question, session_key, filters, personalized, tracer=tracer, meter=meter)
+        self._attach_guards(result, scope)
+        for guard in guards.all():
+            try:
+                guard.after(result, context)
+            except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail the answer
+                logger.warning("Guard %s after-hook failed: %s", guard.name, exc)
+        return result, question
+
+    def _guard_context(
+        self, question: str, session_id: Optional[str], filters: Optional[MetadataFilter], user: Any
+    ) -> GuardContext:
+        """Who is asking: rate limits / budgets are per ``user_id``, else per session, else shared."""
+
+        context = UserContext.coerce(user)
+        if context is not None and context.user_id:
+            user_key = f"user:{context.user_id}"
+        elif session_id:
+            user_key = f"session:{session_id}"
+        else:
+            user_key = "anonymous"
+        return GuardContext(
+            stage="input", question=question, user=context, user_key=user_key, filters=filters,
+            permission_filter=self.permission_filter(context) if self._access is not None else None,
+        )
+
+    def _input_blocked(self, decision: Any, tracer: Tracer, meter: UsageMeter) -> GenerationResult:
+        """The result for a question an input guard refused: its message, no retrieval, no LLM call."""
+
+        tracer.tag("blocked_by", decision.guard)
+        costs: Dict[str, Any] = {}
+        if self._prices is not None:
+            from raglib.costs import price_run
+
+            costs = price_run(self._prices, meter.breakdown(), tracer.events)
+        total = tracer.finish(pipeline=self._rag_type, docs=0, **costs)
+        result = GenerationResult(answer=decision.message or "", sources=[], reasoning_trace=[f"blocked_by:{decision.guard}"])
+        result.trace_events = list(tracer.events)
+        result.usage = {
+            **meter.as_dict(),
+            "usage_by_model": meter.breakdown(),
+            "latency_ms": tracer.total_latency_ms(),
+            "wall_latency_ms": total.latency_ms,
+            **costs,
+        }
+        result.metadata.update({"pipeline": self._rag_type, "blocked_by": decision.guard})
+        return result
+
+    @staticmethod
+    def _attach_guards(result: GenerationResult, scope: GuardScope) -> None:
+        """``result.metadata["guards"]``: every decision (no checked values); ``blocked_by`` if any."""
+
+        result.metadata["guards"] = [decision.summary() for decision in scope.decisions]
+        blocking = next((d for d in scope.decisions if d.action == "block"), None)
+        if blocking is not None:
+            result.metadata["blocked_by"] = blocking.guard
+            result.metadata["block_reason"] = blocking.reason
 
     def _personalized(self, filters: Optional[MetadataFilter], user: Any) -> bool:
         """True when the answer may depend on who asks (a user context or caller filters)."""
@@ -685,12 +799,19 @@ class RAG:
         return user is not None or bool(filters)
 
     def _answer(
-        self, question: str, session_key: Optional[str], filters: Optional[MetadataFilter], personalized: bool
+        self,
+        question: str,
+        session_key: Optional[str],
+        filters: Optional[MetadataFilter],
+        personalized: bool,
+        tracer: Optional[Tracer] = None,
+        meter: Optional[UsageMeter] = None,
     ) -> GenerationResult:
-        """Route to the FAQ / cheap / full tier and run it."""
+        """Route to the FAQ / cheap / full tier and run it (``tracer`` / ``meter``: continue the guards' run)."""
 
+        run_kwargs: Dict[str, Any] = {"tracer": tracer, "meter": meter} if tracer is not None else {}
         if self._tier_router is None:
-            return self._rag.run(question, session_id=session_key, filters=filters)
+            return self._rag.run(question, session_id=session_key, filters=filters, **run_kwargs)
         cache = self._answer_cache
         # Answers that depend on who asks, or on the conversation so far, are never served from cache.
         cacheable = cache is not None and (self._cache_personalized or not personalized) and not self._rag.use_memory
@@ -704,20 +825,26 @@ class RAG:
         decision = decide(self._tier_router, question, context)
         logger.info("tier=%s (%s)", decision.tier, decision.reason)
         if decision.tier == TIER_FAQ and cached is not None:
-            return self._faq_result(cached, decision.reason)
+            return self._faq_result(cached, decision.reason, tracer=tracer)
         tier = TIER_CHEAP if decision.tier in (TIER_FAQ, TIER_CHEAP) and self._cheap_rag is not None else TIER_FULL
         pipeline = self._cheap_rag if tier == TIER_CHEAP else self._rag
+        if tracer is not None:
+            tracer.tag("tier", tier)
         with run_tags(tier=tier):
-            result = pipeline.run(question, session_id=session_key, filters=filters)
+            result = pipeline.run(question, session_id=session_key, filters=filters, **run_kwargs)
         result.metadata.update({"tier": tier, "tier_reason": decision.reason, "answer_cache_hit": False})
-        if cacheable and cache is not None:
+        if cacheable and cache is not None and not result.metadata.get("blocked_by"):
+            # A guard's refusal is not cached: new documents may answer the question next time.
             cache.put(question, result, scope, self._rag_type)
         return result
 
-    def _faq_result(self, cached: GenerationResult, reason: str) -> GenerationResult:
-        """Return a cached answer, traced as its own short run (tier ``faq``)."""
+    def _faq_result(self, cached: GenerationResult, reason: str, tracer: Optional[Tracer] = None) -> GenerationResult:
+        """Return a cached answer, traced as its own short run (tier ``faq``).
 
-        tracer = Tracer(on_event=self._rag.on_event)
+        The cached answer already passed the output guards when it was generated.
+        """
+
+        tracer = tracer or Tracer(on_event=self._rag.on_event)
         tracer.tag("tier", TIER_FAQ)
         with tracer.stage("answer_cache"):
             pass
@@ -753,15 +880,59 @@ class RAG:
 
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
+        question = question.strip()
         effective_filters, session_key = self._scope(filters, user, session_id)
-        # Streaming always runs the full pipeline (tier routing and the answer cache are query() features).
-        with cache_bypass(self._personalized(filters, user) and not self._cache_personalized):
-            result = yield from self._rag.stream(question.strip(), session_id=session_key, filters=effective_filters)
+        bypass = self._personalized(filters, user) and not self._cache_personalized
+        if self._guards is None:
+            # Streaming always runs the full pipeline (tier routing and the answer cache are query() features).
+            with cache_bypass(bypass):
+                result = yield from self._rag.stream(question, session_id=session_key, filters=effective_filters)
+        else:
+            result, question = yield from self._guarded_stream(question, session_id, effective_filters, user, bypass, session_key)
         if result is not None:
             result.metadata["session_id"] = session_id
         if self._output_dir and result is not None:
-            self._save_result(question.strip(), result)
+            self._save_result(question, result)
         return result
+
+    def _guarded_stream(
+        self,
+        question: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        user: Any,
+        bypass: bool,
+        session_key: Optional[str],
+    ) -> Iterator[str]:
+        """``stream`` with guards: input guards first; output guards make the answer arrive in one piece."""
+
+        guards = self._guards
+        assert guards is not None
+        tracer = Tracer(on_event=self._rag.on_event)
+        context = self._guard_context(question, session_id, filters, user)
+        with usage_scope() as meter, active_tracer(tracer):
+            question, decisions, blocked = guards.runner.run("input", guards.input, question, context)
+            context = replace(context, question=question)
+            scope = GuardScope(
+                runner=guards.runner, context=context, retrieval_guards=guards.retrieval,
+                output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
+            )
+            if blocked is not None:
+                result = self._input_blocked(blocked, tracer, meter)
+                yield result.answer
+            else:
+                with guard_scope(scope), cache_bypass(bypass):
+                    result = yield from self._rag.stream(
+                        question, session_id=session_key, filters=filters, tracer=tracer, meter=meter
+                    )
+        if result is not None:
+            self._attach_guards(result, scope)
+            for guard in guards.all():
+                try:
+                    guard.after(result, context)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Guard %s after-hook failed: %s", guard.name, exc)
+        return result, question
 
     @property
     def access_control(self) -> Optional[AccessControl]:

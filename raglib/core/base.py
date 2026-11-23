@@ -59,6 +59,14 @@ logger = logging.getLogger(__name__)
 _INTERNAL_METADATA = {"graph_context_docs"}
 
 
+class GuardBlocked(Exception):
+    """Raised inside a run when a retrieval guard blocks; the run returns the guard's message."""
+
+    def __init__(self, decision: Any):
+        super().__init__(decision.message)
+        self.decision = decision
+
+
 @dataclass
 class PipelineContext:
     """Mutable state for one pipeline run."""
@@ -169,15 +177,24 @@ class BaseRAG:
         query: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
+        tracer: Optional[Tracer] = None,
+        meter: Optional[UsageMeter] = None,
     ) -> GenerationResult:
-        """Execute the pipeline for one query and return the answer with sources."""
+        """Execute the pipeline for one query and return the answer with sources.
 
-        tracer = Tracer(on_event=self.on_event)
-        with run_scope(self.strict) as state, usage_scope() as meter, active_tracer(tracer):
+        ``tracer`` / ``meter`` continue a trace and usage count started by the caller (``RAG.query``
+        passes them so its input guards are part of the same run).
+        """
+
+        tracer = tracer or Tracer(on_event=self.on_event)
+        with run_scope(self.strict) as state, usage_scope(meter) as meter, active_tracer(tracer):
             try:
                 ctx = self._start(query, session_id, filters, tracer=tracer)
                 ctx.usage, ctx.run_state = meter, state
-                result = self.answer(ctx)
+                try:
+                    result = self.answer(ctx)
+                except GuardBlocked as blocked:
+                    result = self._blocked_result(ctx, blocked.decision)
                 return self._finish(ctx, result)
             except Exception as exc:
                 tracer.finish(error=f"{type(exc).__name__}: {exc}", pipeline=self.pipeline_name)
@@ -198,36 +215,54 @@ class BaseRAG:
         query: str,
         session_id: Optional[str] = None,
         filters: Optional[MetadataFilter] = None,
+        tracer: Optional[Tracer] = None,
+        meter: Optional[UsageMeter] = None,
     ) -> GeneratorType[str, None, Optional[GenerationResult]]:
         """Yield answer tokens; the generator's return value is the final GenerationResult.
 
-        Strategies that loop over generation (e.g. Self-RAG) yield the final answer once.
+        Strategies that loop over generation (e.g. Self-RAG) yield the final answer once. With
+        output guards configured the answer is checked before anything is shown, so it is yielded
+        once at the end (trade-off: no token-by-token display; time to first token = full answer).
         """
 
         if type(self).answer is not BaseRAG.answer or self.generator is None:
-            result = self.run(query, session_id=session_id, filters=filters)
+            result = self.run(query, session_id=session_id, filters=filters, tracer=tracer, meter=meter)
             yield result.answer
             return result
 
-        tracer = Tracer(on_event=self.on_event)
-        with run_scope(self.strict) as state, usage_scope() as meter, active_tracer(tracer):
+        from raglib.guards.base import current_scope
+
+        scope = current_scope()
+        buffered = scope is not None and bool(scope.output_guards)
+        tracer = tracer or Tracer(on_event=self.on_event)
+        with run_scope(self.strict) as state, usage_scope(meter) as meter, active_tracer(tracer):
             try:
                 ctx = self._start(query, session_id, filters, tracer=tracer)
                 ctx.usage, ctx.run_state = meter, state
                 documents = self._prepare_documents(ctx)
+                try:
+                    self._check_retrieval(ctx, documents)
+                except GuardBlocked as blocked:
+                    result = self._finish(ctx, self._blocked_result(ctx, blocked.decision))
+                    yield result.answer
+                    return result
                 # prompt_build is traced by the generator; "generate" times the streamed LLM reply.
                 context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
                 with ctx.tracer.stage("generate", streaming=True) as meta, usage_scope() as generation:
                     parts: List[str] = []
                     for token in tokens:
                         parts.append(token)
-                        yield token
+                        if not buffered:
+                            yield token
                     meta["docs"] = len(context_docs)
                 result = self.generator.finalize(
                     "".join(parts), context_docs, ctx.trace + [f"generated_with_docs={len(context_docs)}"], meter=generation
                 )
                 result = self.post_generate(result)
-                return self._finish(ctx, result)
+                result = self._finish(ctx, result)
+                if buffered:
+                    yield result.answer
+                return result
             except Exception as exc:
                 tracer.finish(error=f"{type(exc).__name__}: {exc}", pipeline=self.pipeline_name)
                 raise
@@ -269,6 +304,7 @@ class BaseRAG:
             ctx.trace.append(f"decision:{mode}")
             if mode == RETRIEVAL_NONE:
                 ctx.trace.append("retrieval_skipped")
+                ctx.metadata["retrieval_skipped"] = True
                 return []
 
         documents = self._retrieve_by_mode(ctx, ctx.search_query, mode)
@@ -306,8 +342,9 @@ class BaseRAG:
         return documents
 
     def generate(self, ctx: PipelineContext, documents: List[Document]) -> GenerationResult:
-        """Generate the final answer for the original question."""
+        """Generate the final answer for the original question (after the retrieval guards)."""
 
+        self._check_retrieval(ctx, documents)
         if self.generator is None:
             if self.llm_client is None:
                 raise ValueError("Either generator or llm_client must be provided")
@@ -328,6 +365,54 @@ class BaseRAG:
                 reasoning_trace=ctx.trace,
             )
             meta.update(result.usage)
+        return result
+
+    def _check_retrieval(self, ctx: PipelineContext, documents: List[Document]) -> None:
+        """Run the query's retrieval guards; raises ``GuardBlocked`` (no LLM call follows) on a block."""
+
+        from raglib.guards.base import current_scope
+
+        scope = current_scope()
+        if scope is None or not scope.retrieval_guards:
+            return
+        _, blocked = scope.run(
+            "retrieval",
+            scope.retrieval_guards,
+            list(documents),
+            question=ctx.query,
+            documents=list(documents),
+            retrieval_skipped=bool(ctx.metadata.get("smalltalk") or ctx.metadata.get("retrieval_skipped")),
+            reranker=self.reranker.backend if self.reranker is not None else None,
+        )
+        if blocked is not None:
+            raise GuardBlocked(blocked)
+
+    def _blocked_result(self, ctx: PipelineContext, decision: Any) -> GenerationResult:
+        """The answer returned when a guard stops the run: the guard's message, no sources."""
+
+        ctx.metadata["blocked_by"] = decision.guard
+        ctx.tracer.tag("blocked_by", decision.guard)
+        ctx.trace.append(f"blocked_by:{decision.guard}")
+        return GenerationResult(answer=decision.message or "", sources=[], reasoning_trace=list(ctx.trace))
+
+    def _check_output(self, ctx: PipelineContext, result: GenerationResult) -> GenerationResult:
+        """Run the query's output guards on the answer (mask / truncate / withhold)."""
+
+        from raglib.guards.base import current_scope
+
+        scope = current_scope()
+        if scope is None or not scope.output_guards or ctx.metadata.get("blocked_by"):
+            return result
+        answer, blocked = scope.run(
+            "output", scope.output_guards, result.answer, question=ctx.query, documents=list(result.sources), result=result
+        )
+        if blocked is not None:
+            ctx.metadata["blocked_by"] = blocked.guard
+            ctx.tracer.tag("blocked_by", blocked.guard)
+            result.answer, result.sources, result.citations = blocked.message or "", [], []
+        elif answer != result.answer:
+            result.answer = answer
+            result.citations = Generator.extract_citations(answer, result.sources)
         return result
 
     def pre_retrieve(self, query: str) -> str:
@@ -449,8 +534,9 @@ class BaseRAG:
         return ctx
 
     def _finish(self, ctx: PipelineContext, result: GenerationResult) -> GenerationResult:
-        """Persist memory and attach diagnostics."""
+        """Run output guards, persist memory and attach diagnostics."""
 
+        result = self._check_output(ctx, result)
         if self.use_memory:
             memory = self.memory_for(ctx.session_id)
             if memory is not None:

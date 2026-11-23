@@ -36,13 +36,19 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "on_embedding_failure": "raise",
         # A chunk the embedding model cannot read in full fails ingestion instead of being split quietly.
         "oversized_chunks": "raise",
+        # Tier 0 guardrails (free rules): PII masking, question length, injection keywords; a
+        # "couldn't find this" exit without an LLM call; leak + citation-access checks on answers.
+        "input_guards": "default",
+        "retrieval_guards": "default",
+        "output_guards": "default",
+        "tool_policy": "default",
     },
 }
 
 PRESET_DESCRIPTIONS: Dict[str, str] = {
     "production": (
         "500-token chunks (100 overlap), hybrid search for 10 candidates, cross-encoder rerank to the best 3, "
-        "embeddings cached for 24 hours"
+        "embeddings cached for 24 hours, tier 0 guardrails on every stage"
     ),
 }
 
