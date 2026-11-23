@@ -6,6 +6,12 @@ at least ``holdback`` characters before the end of the buffer. The release point
 so it never cuts through anything a guard looks for (an API key, a card number, a ``[n]``
 citation, a ``<EMAIL_1>`` placeholder): a secret split across tokens is still checked whole.
 
+``holdback`` (``RAG(stream_holdback_chars=...)``, default ``DEFAULT_STREAM_HOLDBACK`` = 64) must be
+at least ``MIN_STREAM_HOLDBACK`` = 40: the longest text that can still *become* a secret while
+containing a space is a PEM header (``-----BEGIN ENCRYPTED PRIVATE KEY-----``, 37 characters; a
+card number with separators is at most 23, a placeholder 24). Below that, a space inside a
+not-yet-complete header or card number could be released before the pattern matches.
+
 Trade-off: the text shown lags the model by up to one sentence (or ``holdback`` characters).
 A block mid-stream cannot take back the pieces already shown: the stream stops and the guard's
 message is appended.
@@ -25,15 +31,28 @@ from raglib.guards.pii import ALL_PII_PATTERNS, PLACEHOLDER_RE, SECRET_PATTERNS
 _SENTENCE_END = re.compile(r"[.!?;:][\"')\]*]*\s+|\n\s*\n")
 _GUARDED = [pattern for _, pattern, _ in (*SECRET_PATTERNS, *ALL_PII_PATTERNS)] + [PLACEHOLDER_RE, re.compile(r"\[\d{1,3}\]")]
 _RANK = {"allow": 0, "modify": 1, "block": 2}
+MIN_STREAM_HOLDBACK = 40
+DEFAULT_STREAM_HOLDBACK = 64
+
+
+def check_holdback(chars: int) -> int:
+    """Validate ``stream_holdback_chars`` (see the module docstring for the minimum)."""
+
+    if not isinstance(chars, int) or chars < MIN_STREAM_HOLDBACK:
+        raise ValueError(
+            f"stream_holdback_chars must be an integer >= {MIN_STREAM_HOLDBACK} (the longest secret prefix "
+            "that can contain a space, a PEM header), got " + repr(chars)
+        )
+    return chars
 
 
 class StreamingOutput:
     """Release checked pieces of a streamed answer (see the module docstring)."""
 
-    def __init__(self, guards: Sequence[Guard], context: GuardContext, holdback: int = 64):
+    def __init__(self, guards: Sequence[Guard], context: GuardContext, holdback: int = DEFAULT_STREAM_HOLDBACK):
         self.guards = sorted(guards, key=guard_sort_key)
         self.context = context
-        self.holdback = holdback
+        self.holdback = check_holdback(holdback)
         self.blocked: Optional[Decision] = None
         self.stopped = False  # True after a block or once MaxOutputTokens is exhausted
         self._pending = ""

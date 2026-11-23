@@ -190,7 +190,7 @@ def test_secret_split_across_tokens_is_still_masked() -> None:
 
 
 def test_long_sentences_flow_with_a_holdback_window() -> None:
-    monitor = StreamingOutput([OutputLeakGuard()], GuardContext(stage="output"), holdback=32)
+    monitor = StreamingOutput([OutputLeakGuard()], GuardContext(stage="output"), holdback=40)
     words = [f"word{i} " for i in range(60)]  # no sentence end at all
     early = [monitor.feed(word) for word in words]
     assert sum(1 for piece in early if piece) > 5  # released while the "sentence" is still going
@@ -372,3 +372,26 @@ def test_a_full_guarded_query_logs_no_pii_even_at_debug(caplog: pytest.LogCaptur
     rag.query(f"When do Acme offices close? I am {EMAIL}, card {CARD}")
     list(rag.stream(f"When do Acme offices close? I am {EMAIL}, card {CARD}"))
     assert EMAIL not in caplog.text and "4111 1111" not in caplog.text
+
+
+# ------------------------------------------------------------------ configurable stream hold-back
+
+
+def test_stream_holdback_is_configurable_with_a_documented_minimum() -> None:
+    from raglib.guards.streaming import MIN_STREAM_HOLDBACK
+
+    assert MIN_STREAM_HOLDBACK == 40
+    with pytest.raises(ValueError):
+        _rag(output_guards="default", stream_holdback_chars=39)
+    words = [f"word{i} " for i in range(80)]  # one long sentence
+
+    def first_release(holdback: int) -> int:
+        monitor = StreamingOutput([OutputLeakGuard()], GuardContext(stage="output"), holdback=holdback)
+        return next(i for i, word in enumerate(words) if monitor.feed(word))
+
+    assert first_release(40) < first_release(64) < first_release(200)
+    rag = _rag(WordStreamer(" ".join(words)), output_guards="default", stream_holdback_chars=200)
+    pieces = list(rag.stream("When do Acme offices close?"))
+    assert len(pieces) > 1 and "".join(pieces).split() == " ".join(words).split()
+    sentence = StreamingOutput([OutputLeakGuard()], GuardContext(stage="output"), holdback=200)
+    assert sentence.feed("Short sentence. ") == "Short sentence. "  # sentence end still releases at once

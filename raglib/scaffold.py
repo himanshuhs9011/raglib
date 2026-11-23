@@ -186,6 +186,7 @@ rag = RAG(
     guard_cache_ttl=3600.0,                # seconds a guard decision is reused for the same input (None = off)
     rate_limit_key=None,                   # callable(GuardContext) -> str: who a rate limit / budget counts (default: query(user_id=...))
     guard_store=None,                      # GuardStore for limit counters (default: in this process only)
+    stream_holdback_chars=64,              # streamed text may trail the model this far while output guards check it (min 40)
 
     # ---------------------------------------------------------------- reliability + observability
     strict=False,                          # True: raise when an optional step fails instead of falling back

@@ -258,7 +258,9 @@ class BaseRAG:
                 # prompt_build is traced by the generator; "generate" times the streamed LLM reply.
                 context_docs, tokens = self.generator.stream(ctx.query, documents, memory_context=ctx.history)
                 monitor = (
-                    StreamingOutput(scope.output_guards, stream_context(scope.context, ctx.query, context_docs))
+                    StreamingOutput(
+                        scope.output_guards, stream_context(scope.context, ctx.query, context_docs), holdback=scope.stream_holdback
+                    )
                     if mode == "incremental" and scope is not None
                     else None
                 )

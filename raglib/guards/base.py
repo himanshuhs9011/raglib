@@ -297,6 +297,7 @@ class GuardScope:
     output_guards: Sequence[Guard] = ()
     tool_policy: Any = None
     decisions: List[Decision] = field(default_factory=list)
+    stream_holdback: int = 64  # RAG(stream_holdback_chars=...)
 
     def run(self, stage: str, guards: Sequence[Guard], value: Any, **context: Any) -> Tuple[Any, Optional[Decision]]:
         """Run a stage with this scope's context (fields overridden by ``context``); records decisions."""

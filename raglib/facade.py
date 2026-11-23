@@ -321,6 +321,7 @@ class RAG:
         guard_cache_ttl: Optional[float] = 3600.0,
         rate_limit_key: Optional[Callable[[GuardContext], Optional[str]]] = None,
         guard_store: Optional[GuardStore] = None,
+        stream_holdback_chars: int = 64,
         **rag_type_kwargs: Any,
     ):
         """Build the full RAG stack. See README for every option.
@@ -394,6 +395,8 @@ class RAG:
           from ``query(..., user_id=...)`` or ``UserContext``.
         * ``guard_store``: where rate-limit / budget counters live (``GuardStore``); default in
           process memory, so each worker process counts on its own.
+        * ``stream_holdback_chars``: how far (in characters) streamed text may trail the model while
+          streaming-safe output guards check it (default 64, minimum 40; see ``raglib.guards.streaming``).
         """
 
         if top_k <= 0:
@@ -632,6 +635,9 @@ class RAG:
         if tools:
             rag_type_kwargs["tools"] = list(tools)
         self._rag = self._build_orchestrator(self._rag_type, rag_type_kwargs)
+        from raglib.guards.streaming import check_holdback
+
+        self._stream_holdback = check_holdback(stream_holdback_chars)
         self._rate_limit_key = rate_limit_key
         self._guard_store: GuardStore = guard_store or InMemoryGuardStore()
         self._guards: Optional[GuardConfig] = GuardConfig.build(
@@ -780,6 +786,7 @@ class RAG:
         scope = GuardScope(
             runner=guards.runner, context=replace(context, question=masked), retrieval_guards=guards.retrieval,
             output_guards=guards.output, tool_policy=guards.tool_policy, decisions=list(decisions),
+            stream_holdback=self._stream_holdback,
         )
         return masked, scope, blocked, mapping
 
