@@ -253,7 +253,7 @@ def main(argv: List[str]) -> int:
     true_chunks = round(statistics.fmean(len(doc["boundaries"]) + 1 for doc in corpus))
     configs: List[Tuple[str, str, Dict[str, Any]]] = [
         ("raglib", "percentile 95", {"semantic_breakpoint": "percentile"}),
-        ("raglib", "standard_deviation 3", {"semantic_breakpoint": "standard_deviation"}),
+        ("raglib", "standard_deviation 1.5", {"semantic_breakpoint": "standard_deviation"}),
         ("raglib", "interquartile 1.5", {"semantic_breakpoint": "interquartile"}),
         ("raglib", "gradient 95", {"semantic_breakpoint": "gradient"}),
         ("raglib", f"number_of_chunks={true_chunks}", {"number_of_chunks": true_chunks}),

@@ -52,13 +52,22 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 
 **Embedding chunker options.**
 - `semantic_buffer_size`: the window centred on each gap. The default of 2 keeps the previous behaviour.
-- New threshold types: `standard_deviation` (3), `interquartile` (1.5) and `gradient` (95), next to `percentile` and `fixed`.
+- New threshold types: `standard_deviation` (1.5), `interquartile` (1.5) and `gradient` (95), next to `percentile` and `fixed`. The `standard_deviation` default is 1.5, not LangChain's 3: with the default 2-sentence window, mean + 3 sd found no topic change in the comparison (F1 0.00). With 1.5 it scores F1 0.81-0.88, the best of all types. The README says which threshold type to use when, with benchmark numbers.
 - `semantic_number_of_chunks`: an approximate target count.
 - `sentence_splitter`: a regex or a callable.
 - `semantic_overlap_sentences`: carries the last N sentences of each chunk into the next.
 - `benchmarks/chunking/compare_langchain.py` compares the chunker with LangChain's `SemanticChunker` offline.
 - The default `semantic_min_tokens` is now `min(32, chunk_size // 8)` instead of `chunk_size // 4`. The larger minimum swallowed short topic sections: boundary F1 was 0.23 at `chunk_size=500` in the comparison, and 0.69 with the new default.
 - `gradient` breaks at the distance peak, not one gap before it as the literal rule does.
+
+**Index settings and the token counter.**
+- The chunking settings (strategy, sizes, `token_counter`, semantic options, parent sections) are recorded in each saved index (`chunks.json` -> `index.chunking`), and every chunk carries a `chunking_signature`. `rag.chunking_settings()` / `rag.chunking_signature()` return them.
+- Opening an index (`load`) or adding to one with different settings raises an `IndexSettingsWarning`. It lists the changed settings and how to re-index: add all sources again with the new settings and `save()` to a new directory, or pass the settings the index was built with.
+- **Deprecation:** `token_counter` still defaults to `"units"` (whitespace words). It will become `"auto"` (tiktoken when installed) in the next major version, which changes chunk boundaries and so re-chunks existing indexes. Leaving it unset emits a `DeprecationWarning` once per process when tiktoken is installed. Pass `token_counter="units"` to keep the current behaviour, or `"auto"` to switch now. `preset="production"` and the `raglib-py --production` file already use `"auto"`.
+
+**Benchmarks.**
+- `benchmarks/chunking/real_eval.py` runs the chunker on your own documents, embedding model and golden set. It reports recall@k, precision@k, chunk count and average size, and embedding tokens/cost per threshold type and `semantic_min_tokens` (32/64/125). It refuses to call a paid API without `--yes`.
+- New `[bench]` extra pins `langchain-experimental==0.4.2` (being sunset) for the comparison script.
 
 **Behaviour change: personalized queries are no longer cached.** With the default `cache_personalized=False`, queries that pass `user=` or `filters=` skip the LLM cache and the answer cache. Answers are identical, but repeated personalized questions are no longer served from cache. Pass `cache_personalized=True` for the old behaviour. The README's "Trade-offs" table lists what every new option costs.
 

@@ -77,7 +77,7 @@ def test_every_threshold_type_finds_the_known_topic_changes(breakpoint: str, thr
 
 def test_threshold_defaults_and_validation() -> None:
     assert SEMANTIC_THRESHOLD_DEFAULTS == {
-        "percentile": 95.0, "fixed": 0.75, "standard_deviation": 3.0, "interquartile": 1.5, "gradient": 95.0,
+        "percentile": 95.0, "fixed": 0.75, "standard_deviation": 1.5, "interquartile": 1.5, "gradient": 95.0,
     }
     splitter = ChunkSplitter(strategy="embedding", embedding=TopicEmbedding(), semantic_breakpoint="interquartile")
     assert splitter._semantic_threshold == 1.5

@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import statistics
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Sequence, Tuple, Union
 
@@ -22,7 +23,9 @@ SEMANTIC_BREAKPOINTS = ("percentile", "fixed", "standard_deviation", "interquart
 SEMANTIC_THRESHOLD_DEFAULTS: Dict[str, float] = {
     "percentile": 95.0,  # break above this percentile of the gap distances
     "fixed": 0.75,  # break where cosine similarity is below this
-    "standard_deviation": 3.0,  # break above mean + N standard deviations of the distances
+    # break above mean + N standard deviations; 1.5, not LangChain's 3: the default 2-sentence window
+    # smooths the distances, and mean + 3 sd found no topic change in the comparison benchmark
+    "standard_deviation": 1.5,
     "interquartile": 1.5,  # break above mean + N x interquartile range of the distances
     "gradient": 95.0,  # break above this percentile of the distance gradient (sharp changes)
 }
@@ -40,6 +43,42 @@ _TABLE_ROW_RE = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+\u2022]|\d{1,3}[.)])[ \t]+\S")
 
 FallbackHook = Callable[[Document, Exception], None]
+
+_DEFAULT_COUNTER_WARNED = False
+
+
+class IndexSettingsWarning(UserWarning):
+    """An index is opened or extended with chunking settings different from the ones it was built with."""
+
+
+def _warn_default_token_counter() -> None:
+    """Once per process: the "units" default will change, and only matters when tiktoken is installed."""
+
+    global _DEFAULT_COUNTER_WARNED
+    if _DEFAULT_COUNTER_WARNED or resolve_token_counter("auto")[1] != "tiktoken":
+        return
+    _DEFAULT_COUNTER_WARNED = True
+    warnings.warn(
+        "token_counter defaults to 'units' (whitespace words, not model tokens). The default will become "
+        "'auto' (tiktoken when installed) in the next major version, which changes chunk boundaries and "
+        "re-chunks existing indexes on their next add(). Pass token_counter='units' to keep the current "
+        "behaviour, or token_counter='auto' to switch now.",
+        DeprecationWarning,
+        stacklevel=_caller_stacklevel(),
+    )
+
+
+def _caller_stacklevel() -> int:
+    """``stacklevel`` of the first frame outside the raglib package (so the warning names your line)."""
+
+    import os
+    import sys
+
+    package = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    frame, level = sys._getframe(1), 1
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(package):
+        frame, level = frame.f_back, level + 1
+    return level
 
 
 class EmbeddingChunkingError(RuntimeError):
@@ -109,7 +148,7 @@ class ChunkSplitter:
         semantic_breakpoint: str = "percentile",
         semantic_threshold: Optional[float] = None,
         semantic_min_tokens: Optional[int] = None,
-        token_counter: Any = "units",
+        token_counter: Any = None,
         on_embedding_failure: str = "fallback",
         abbreviations: Optional[Iterable[str]] = None,
         on_fallback: Optional[FallbackHook] = None,
@@ -123,7 +162,9 @@ class ChunkSplitter:
         Sizes (``chunk_size``, ``overlap``, ``min_tokens``, ``semantic_min_tokens``) are measured
         with ``token_counter``: ``"units"`` (default: whitespace words, one per CJK/Thai character -
         *not* model tokens; English is ~1.3 tokens per word), ``"tiktoken"`` (real model tokens),
-        ``"auto"`` (tiktoken when installed, else units) or a callable ``text -> int``.
+        ``"auto"`` (tiktoken when installed, else units) or a callable ``text -> int``. Leaving it
+        unset uses ``"units"`` and emits a ``DeprecationWarning`` (when tiktoken is installed): the
+        default becomes ``"auto"`` in the next major version.
 
         ``strategy="embedding"`` (semantic chunking with embeddings): at every gap between two
         sentences, embed the ``buffer_size`` sentences before it and the ``buffer_size`` after it
@@ -133,10 +174,17 @@ class ChunkSplitter:
 
         * ``"percentile"`` (95): break above that percentile of the distances.
         * ``"fixed"`` (0.75): break where the cosine similarity is below the threshold.
-        * ``"standard_deviation"`` (3): break above mean + N standard deviations.
+        * ``"standard_deviation"`` (1.5): break above mean + N standard deviations.
         * ``"interquartile"`` (1.5): break above mean + N x the interquartile range.
         * ``"gradient"`` (95): break above that percentile of the distance gradient - finds sharp
           changes in documents whose topics drift slowly (legal, medical).
+
+        Which to use (``benchmarks/chunking/compare_langchain.py``): ``percentile`` as the general
+        default (highest precision, misses some boundaries); ``number_of_chunks`` when you know
+        roughly how many topics a document has; ``standard_deviation`` (1.5) for the best balance;
+        ``interquartile`` (~0.5) or ``gradient`` (~80) with *lowered* thresholds when recall matters
+        more than precision - at their defaults they are as conservative as ``percentile``.
+        Confirm on your own documents with ``benchmarks/chunking/real_eval.py``.
 
         ``number_of_chunks`` (approximate target) overrides the threshold: the
         ``number_of_chunks - 1`` largest gaps become breaks, then size limits apply.
@@ -186,6 +234,9 @@ class ChunkSplitter:
         self._separators = list(separators) if separators is not None else list(DEFAULT_RECURSIVE_SEPARATORS)
         if on_embedding_failure not in EMBEDDING_FAILURE_POLICIES:
             raise ValueError(f"on_embedding_failure must be one of {list(EMBEDDING_FAILURE_POLICIES)}")
+        if token_counter is None:
+            _warn_default_token_counter()
+            token_counter = "units"
         self._token_counter, self.token_counter_name = resolve_token_counter(token_counter)
         self._on_embedding_failure = on_embedding_failure
         self._abbreviations = frozenset(
@@ -239,6 +290,36 @@ class ChunkSplitter:
         """Return the normalized chunking strategy name."""
 
         return self._strategy
+
+    def settings(self) -> Dict[str, Any]:
+        """The settings that decide chunk boundaries (recorded in an index; same settings = same chunks)."""
+
+        info: Dict[str, Any] = {
+            "strategy": self._strategy,
+            "chunk_size": self._chunk_size,
+            "chunk_overlap": self._overlap,
+            "min_tokens": self._min_tokens,
+            "token_counter": self.token_counter_name,
+        }
+        if self._strategy == "embedding":
+            splitter: Any = "default"
+            if self._sentence_fn is not None:
+                splitter = f"callable:{getattr(self._sentence_fn, '__name__', 'custom')}"
+            elif self._sentence_re is not _SENTENCE_BOUNDARY_RE:
+                splitter = f"regex:{self._sentence_re.pattern}"
+            abbreviations = sorted(self._abbreviations)
+            info.update(
+                semantic_breakpoint=self._semantic_breakpoint,
+                semantic_threshold=self._semantic_threshold,
+                semantic_min_tokens=self._semantic_min_tokens,
+                buffer_size=self._buffer_size,
+                number_of_chunks=self._number_of_chunks,
+                semantic_overlap_sentences=self._semantic_overlap,
+                sentence_splitter=splitter,
+                abbreviations="default" if abbreviations == sorted(DEFAULT_ABBREVIATIONS)
+                else hashlib.sha256("|".join(abbreviations).encode("utf-8")).hexdigest()[:8],
+            )
+        return info
 
     def split(self, documents: List[Document]) -> List[Document]:
         """Split documents into chunks with preserved metadata and prev/next links.

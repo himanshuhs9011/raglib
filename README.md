@@ -368,7 +368,24 @@ rag = RAG(
 - **Tables and lists stay whole:** a Markdown table, or a run of list items (with indented continuation lines and blank lines between items), is one unit. It is only split, at row or item borders, when it is larger than `chunk_size`.
 - **Abbreviations:** sentences don't end after `abbreviations` ("Dr. Sharma", "Acme Inc. in 2020", "e.g. tables"; set your own list).
 - **Hindi:** the danda `।` / `॥` ends a sentence.
-- **Thresholds:** `semantic_breakpoint` is one of `"percentile"` (default 95), `"fixed"` (cosine similarity, 0.75), `"standard_deviation"` (mean + 3 sd), `"interquartile"` (mean + 1.5 IQR) or `"gradient"` (95th percentile of the distance gradient, for slowly drifting topics). `semantic_number_of_chunks=8` instead takes the 7 largest gaps, so the count is approximate because size limits still apply.
+- **Thresholds:** `semantic_breakpoint` is one of `"percentile"` (default 95), `"fixed"` (cosine similarity, 0.75), `"standard_deviation"` (mean + 1.5 sd), `"interquartile"` (mean + 1.5 IQR) or `"gradient"` (95th percentile of the distance gradient, for slowly drifting topics). `semantic_number_of_chunks=8` instead takes the 7 largest gaps, so the count is approximate because size limits still apply.
+- **Which threshold to use** (from `benchmarks/chunking/compare_langchain.py`; check on your own data with `benchmarks/chunking/real_eval.py`):
+
+  | Situation | Use | Benchmark (chunk_size=400) |
+  | :--- | :--- | :--- |
+  | General default | `"percentile"` (95) | precision 0.96: breaks are almost always real topic changes, but recall is 0.54 (some changes missed) |
+  | You know about how many topics a document has | `semantic_number_of_chunks=N` | F1 0.87 (P 0.93, R 0.83): takes the N-1 largest gaps |
+  | Balanced, topic count unknown | `"standard_deviation"` (1.5) | F1 0.88 (P 0.94, R 0.84), the best overall |
+  | Recall matters more than precision (a missed boundary costs more than an extra one) | `"interquartile"` with `semantic_threshold=0.5`, or `"gradient"` with `80` | recall 0.84-0.91 at precision 0.74-0.77 |
+  | You have a calibrated similarity cut-off for your embedding model | `"fixed"` | the same cut-off for every document |
+
+  At their *default* thresholds `interquartile` (1.5) and `gradient` (95) are as conservative as `percentile`, with recall of 0.43-0.45. Recall comes from lowering the threshold, and that works for any type (`percentile` at 80: R 0.93). These numbers come from a synthetic corpus with a fake embedding, so confirm on your documents with `benchmarks/chunking/real_eval.py`.
+
+- **Benchmarks:**
+  - `benchmarks/chunking/compare_langchain.py` compares the chunker with LangChain's `SemanticChunker` offline, on synthetic documents with known topic changes.
+  - `benchmarks/chunking/real_eval.py --docs my_docs/ --golden eval/golden.jsonl --embedding huggingface/BAAI/bge-base-en-v1.5` measures recall@k, precision@k, chunk count and size, and embedding cost on your own documents, for every threshold type and `semantic_min_tokens` 32/64/125. The format is in `benchmarks/chunking/golden.example.jsonl`.
+  - With a paid embedding API (`openai/...`), `real_eval.py` prints the estimated tokens and cost and stops unless you pass `--yes`.
+  - `langchain-experimental` is being sunset and is no longer maintained. `pip install raglib-py[bench]` pins its last release (0.4.2) so the comparison keeps running.
 - **Window:** `semantic_buffer_size=N` compares the N sentences before each gap with the N after it. Bigger windows are smoother and make fewer breaks.
 - **Overlap:** `semantic_overlap_sentences=N` repeats the last N sentences of a chunk in the next one, never beyond `chunk_size`. **Trade-off:** more tokens to embed and send, fewer ideas cut at a boundary.
 - **Custom splitter:** `sentence_splitter=r"(?<=[.?!])\s+"` (a regex whose matches are boundaries), or a callable `text -> [sentences]` such as a spaCy or NLTK splitter.

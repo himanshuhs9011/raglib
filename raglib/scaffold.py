@@ -93,7 +93,7 @@ rag = RAG(
     chunk_overlap=<<CHUNK_OVERLAP>>,                     # tokens shared by neighbouring chunks (20% keeps ideas whole)
     chunking_strategy="fixed",             # "fixed" | "recursive" | "embedding" (semantic: ~2x embedding cost) | "llm" (LLM calls)
     semantic_breakpoint="percentile",      # embedding chunks: "percentile" | "fixed" | "standard_deviation" | "interquartile" | "gradient"
-    semantic_threshold=None,               # default per type: 95 | 0.75 (similarity) | 3 | 1.5 | 95
+    semantic_threshold=None,               # default per type: 95 | 0.75 (similarity) | 1.5 | 1.5 | 95
     semantic_buffer_size=2,                # sentences compared on each side of a gap (bigger = smoother, fewer breaks)
     semantic_number_of_chunks=None,        # e.g. 8: aim for about 8 chunks per document (overrides the threshold)
     sentence_splitter=None,                # a regex or callable; default: multilingual splitter with abbreviations

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import warnings
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,7 +71,7 @@ from raglib.llm.providers import (
     provider_table,
 )
 from raglib.llm.resilience import shared_limiter
-from raglib.loaders.chunk_splitter import ChunkSplitter
+from raglib.loaders.chunk_splitter import ChunkSplitter, IndexSettingsWarning
 from raglib.loaders.document_loader import DocumentLoader, SourceInput
 from raglib.loaders.sections import PARENT_MODES, build_sections
 from raglib.presets import apply_presets
@@ -291,7 +292,7 @@ class RAG:
         semantic_threshold: Optional[float] = None,
         prices: Union[PriceTable, Mapping[str, Any], None] = None,
         semantic_min_tokens: Optional[int] = None,
-        token_counter: Union[str, Callable[[str], int]] = "units",
+        token_counter: Union[str, Callable[[str], int], None] = None,
         on_embedding_failure: str = "fallback",
         abbreviations: Optional[Sequence[str]] = None,
         semantic_buffer_size: int = 2,
@@ -346,8 +347,10 @@ class RAG:
           failed embedding call fail ingestion instead of falling back; ``semantic_buffer_size``,
           ``semantic_number_of_chunks``, ``sentence_splitter`` and ``semantic_overlap_sentences``
           tune it (see ``ChunkSplitter``).
-        * ``token_counter``: how chunk sizes are measured - ``"units"`` (words; default),
-          ``"tiktoken"``, ``"auto"`` or a callable; the embedding cost estimate uses the same one.
+        * ``token_counter``: how chunk sizes are measured - ``"units"`` (words; default, becomes
+          ``"auto"`` in the next major version), ``"tiktoken"``, ``"auto"`` or a callable; the embedding
+          cost estimate uses the same one. The chunking settings are recorded in the index; opening or
+          extending an index with different ones raises an ``IndexSettingsWarning``.
         * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
         """
 
@@ -452,6 +455,8 @@ class RAG:
             semantic_overlap_sentences=semantic_overlap_sentences,
         )
         self._chunking_fallbacks: List[Dict[str, str]] = []
+        self._index_signatures: set = set()  # chunking signatures of the chunks already in this index
+        self._settings_warned = False
         if isinstance(self._embedding, CachedEmbedding) and self._splitter.token_counter_name != "units":
             # One counter for chunk sizes and embedding cost estimates (words are not model tokens,
             # so with "units" the cost estimate keeps the token estimator).
@@ -818,6 +823,7 @@ class RAG:
             if unknown:
                 raise ValueError(f"Unknown access tags: {sorted(unknown)}. Supported: {list(ACCESS_TAG_KEYS)}")
         extra = {**dict(metadata or {}), **dict(access or {})}
+        self._check_chunking_settings("added to")
         stats = {"files": 0, "chunks_indexed": 0, "skipped": 0}
         pending: List[Document] = []
 
@@ -868,6 +874,47 @@ class RAG:
             except Exception as exc:  # noqa: BLE001 - observers must never break ingestion
                 logger.warning("on_event callback failed: %s", exc)
 
+    def chunking_settings(self) -> Dict[str, Any]:
+        """Settings that decide chunk boundaries (strategy, sizes, token counter, semantic options)."""
+
+        info = dict(self._splitter.settings())
+        if self._parent_retrieval is not None:
+            info.update(parent_retrieval=self._parent_retrieval, parent_chunk_size=self._parent_chunk_size)
+        return info
+
+    def chunking_signature(self) -> str:
+        """Short hash of ``chunking_settings()`` (stamped on every chunk as ``chunking_signature``)."""
+
+        raw = json.dumps(self.chunking_settings(), sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+    def _check_chunking_settings(self, action: str, saved: Optional[Dict[str, Any]] = None, where: str = "this index") -> None:
+        """Warn (once) when the index holds chunks made with other chunking settings."""
+
+        current = self.chunking_signature()
+        foreign = {sig for sig in self._index_signatures if sig and sig != current}
+        if not foreign or self._settings_warned:
+            return
+        self._settings_warned = True
+        mine = self.chunking_settings()
+        if saved:
+            changes = ", ".join(
+                f"{key}: index={saved.get(key)!r} now={mine.get(key)!r}"
+                for key in sorted(set(saved) | set(mine))
+                if saved.get(key) != mine.get(key)
+            )
+        else:
+            changes = f"chunking signature(s) {sorted(foreign)} vs {current}"
+        message = (
+            f"{where} was built with different chunking settings than this RAG ({changes}). It is being {action} "
+            "with the current settings: new and changed documents get differently sized chunks, and unchanged "
+            "documents are re-chunked and re-embedded the next time they are added. To re-index consistently, build "
+            "a RAG with the settings you want, add() all your sources again and save() to a new directory - or keep "
+            "the index as it is by passing the settings it was built with (see rag.chunking_settings())."
+        )
+        warnings.warn(message, IndexSettingsWarning, stacklevel=3)
+        logger.warning(message)
+
     def _tag(self, document: Document) -> Document:
         """Apply access-control tags to a chunk or section (no-op without access control)."""
 
@@ -876,8 +923,9 @@ class RAG:
     def _chunk(self, documents: List[Document]) -> List[Document]:
         """Split loaded documents into chunks (children of parent sections with parent_retrieval)."""
 
+        signature = self.chunking_signature()
         if self._parent_retrieval is None:
-            return [self._tag(chunk) for chunk in self._splitter.split(documents)]
+            return [self._tag(_signed(chunk, signature)) for chunk in self._splitter.split(documents)]
         chunks: List[Document] = []
         for document in documents:
             sections = [self._tag(section) for section in build_sections(document, self._parent_retrieval, self._parent_chunk_size)]
@@ -885,7 +933,12 @@ class RAG:
                 self._staged_sections.setdefault(document.id, []).extend(sections)
             for child in self._splitter.split(sections):
                 # Children belong to the document (replace/delete semantics) and point to their section.
-                metadata = {**child.metadata, "parent_id": document.id, "section_id": child.metadata["parent_id"]}
+                metadata = {
+                    **child.metadata,
+                    "parent_id": document.id,
+                    "section_id": child.metadata["parent_id"],
+                    "chunking_signature": signature,
+                }
                 chunks.append(self._tag(replace(child, metadata=metadata)))
         return chunks
 
@@ -1020,6 +1073,7 @@ class RAG:
                 self._retriever.add_documents(retagged)
                 logger.info("Updated access tags of %d chunks", len(retagged))
             added = self._retriever.add_documents(to_add)
+            self._index_signatures.update(str(chunk.metadata.get("chunking_signature", "")) for chunk in added)
             if self._graph_indexer is not None and to_add:
                 self._add_to_graph(to_add)  # skips chunks it already extracted
             # Record documents only after they are really indexed, so a failed batch is retried next run.
@@ -1176,6 +1230,10 @@ class RAG:
             elif vectors_path.exists():  # indexes saved before raglib 2.2
                 store.upsert([VectorRecord(**record) for record in json.loads(vectors_path.read_text(encoding="utf-8"))])
         documents = [Document(**item) for item in payload.get("chunks", [])]
+        self._index_signatures.update(str(doc.metadata.get("chunking_signature", "")) for doc in documents)
+        if saved.get("chunking_signature"):
+            self._index_signatures.add(str(saved["chunking_signature"]))
+        self._check_chunking_settings("opened", saved=saved.get("chunking"), where=f"The index in {directory}")
         if reembed and store is not None and not isinstance(store, InMemoryVectorStore):
             store.delete([document.id for document in documents])  # drop vectors from the old model
         self._retriever.add_documents(documents)
@@ -1662,6 +1720,8 @@ class RAG:
         """Describe how the index was built (embedding model + vector size), stored by ``save``."""
 
         info: Dict[str, Any] = {"embedding_class": None, "embedding_model": None, "dimension": None}
+        info["chunking"] = self.chunking_settings()
+        info["chunking_signature"] = self.chunking_signature()
         if self._embedding is not None:
             info.update(self._embedding.fingerprint())
             try:
@@ -1836,3 +1896,10 @@ def _stamp_version(chunks: List[Document], version: str) -> None:
 
     for chunk in chunks:
         chunk.metadata["document_version"] = version
+
+
+def _signed(chunk: Document, signature: str) -> Document:
+    """Stamp the chunking signature on a chunk (lets mixed-settings chunks be found in the store)."""
+
+    chunk.metadata["chunking_signature"] = signature
+    return chunk
