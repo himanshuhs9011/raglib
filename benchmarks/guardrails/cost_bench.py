@@ -344,6 +344,8 @@ def summarize(runs: Sequence[Dict[str, Any]], args: argparse.Namespace, simulate
 
 def print_report(summary: Dict[str, Any], args: argparse.Namespace) -> None:
     note = "simulated (--main-ms / --cheap-ms / --local-ms)" if summary["simulated_latency"] else "measured"
+    if summary["simulated_latency"] and args.local == "real":
+        note += "; the local classifier stages of 'all / local' are measured (real models)"
     setups = summary["setups"]
     print(f"\nLatency: {note}. Prices: {args.prices or 'defaults (gpt-4.1-mini / gpt-4.1-nano)'}.\n")
     print("| setup | blocked | attacks blocked | answerable wrongly blocked | borderline blocked | answer-model calls "
@@ -389,6 +391,9 @@ def _models(args: argparse.Namespace) -> Dict[str, Any]:
         embedding: Any = LexicalEmbedding()
     else:
         embedding = args.embedding
+    if not args.prices:  # default rates follow the models actually used (answer: gpt-4.1-mini, cheap: gpt-4.1-nano)
+        prices = {"llm": {main_name: DEFAULT_PRICES["llm"]["mock/main"], cheap_name: DEFAULT_PRICES["llm"]["mock/cheap"]},
+                  "embedding": DEFAULT_PRICES["embedding"]}
     return {"main": main, "main_name": main_name, "cheap": cheap, "cheap_name": cheap_name,
             "embedding": embedding, "prices": prices}
 
