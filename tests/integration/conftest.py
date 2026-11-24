@@ -78,15 +78,25 @@ def _qdrant_client() -> Any:
 
 def strict_mode_collection(client: Any, name: str, dimension: int) -> None:
     """A collection as Qdrant Cloud creates it with strict mode: filtering on an unindexed payload
-    key is rejected (``unindexed_filtering_retrieve=False``)."""
+    key is rejected (``unindexed_filtering_retrieve=False``).
+
+    Skips (also with ``RAGLIB_REQUIRE_LIVE_STORES=1``: it is a version limit, not an outage) when the
+    client or the server is too old to have strict mode.
+    """
 
     from qdrant_client import models
 
+    if not hasattr(models, "StrictModeConfig"):
+        pytest.skip("this qdrant-client has no strict mode (too old)")
     client.create_collection(
         name,
         vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
         strict_mode_config=models.StrictModeConfig(enabled=True, unindexed_filtering_retrieve=False),
     )
+    mode = getattr(client.get_collection(name).config, "strict_mode_config", None)
+    if mode is None or not getattr(mode, "enabled", False):
+        client.delete_collection(name)
+        pytest.skip("this Qdrant server has no strict mode (too old)")
 
 
 @pytest.fixture(params=STORES)

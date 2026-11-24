@@ -46,7 +46,20 @@ jobs:
     # Access control, leak and filter tests against real servers (tests/integration/), with Qdrant
     # both plain and in strict mode. RAGLIB_REQUIRE_LIVE_STORES=1 fails instead of skipping when a
     # service is not reachable. Keep the images in step with docker-compose.test.yml.
+    # Matrix: the oldest supported Qdrant (server and client 1.10.1, the qdrant extra's floor; it
+    # has no strict mode, so those tests skip) and the newest tested one with the newest client.
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - qdrant: v1.10.1
+            qdrant-client: "qdrant-client==1.10.1"
+            python-version: "3.9"
+          - qdrant: v1.20.2
+            qdrant-client: "qdrant-client"
+            python-version: "3.13"
+    name: live-stores (qdrant ${{ matrix.qdrant }})
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -56,7 +69,7 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
       qdrant:
-        image: qdrant/qdrant:v1.20.0
+        image: qdrant/qdrant:${{ matrix.qdrant }}
         ports: ["6333:6333"]
         options: >-
           --health-cmd "bash -c ':> /dev/tcp/127.0.0.1/6333'" --health-interval 5s --health-timeout 5s --health-retries 10
@@ -64,8 +77,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
-      - run: pip install -e ".[dev,pgvector,qdrant]"
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev,pgvector,qdrant]" "${{ matrix.qdrant-client }}"
       - name: Live vector-store tests
         env:
           RAGLIB_OFFLINE: "1"
