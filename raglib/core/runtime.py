@@ -291,12 +291,26 @@ def isolated(generator: Iterator[Any]) -> Iterator[Any]:
     import contextvars
 
     context = contextvars.copy_context()
+    send = getattr(generator, "send", None)
+    sent: Any = None
+    thrown: Optional[BaseException] = None
     try:
         while True:
             try:
-                value = context.run(next, generator)
+                if thrown is not None:
+                    error, thrown = thrown, None
+                    value = context.run(generator.throw, error)  # type: ignore[attr-defined]
+                elif send is not None:
+                    value = context.run(send, sent)
+                else:
+                    value = context.run(next, generator)
             except StopIteration as stop:
                 return stop.value
-            yield value
+            try:
+                sent = yield value
+            except GeneratorExit:
+                raise
+            except BaseException as error:  # noqa: BLE001 - passed on to the wrapped generator
+                thrown, sent = error, None
     finally:
         context.run(generator.close)

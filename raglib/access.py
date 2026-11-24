@@ -158,8 +158,10 @@ class AccessControl:
 
         max_level = user.max_access_level if user is not None and user.max_access_level else self.levels[0]
         allowed_levels = list(self.levels[: self._rank(max_level) + 1])
-        departments = user.departments if user is not None else ()
-        roles = user.roles if user is not None else ()
+        # Sorted and de-duplicated: the same user gives the same filter (and memory key, cache scope)
+        # whatever order the roles and departments come in.
+        departments = sorted(set(user.departments)) if user is not None else []
+        roles = sorted(set(user.roles)) if user is not None else []
         return {
             "$and": [
                 {ACCESS_LEVEL_KEY: {"$in": allowed_levels}},

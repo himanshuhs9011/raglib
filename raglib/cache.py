@@ -226,6 +226,12 @@ class AnswerCache:
         self.refresh_on_new_documents = refresh_on_new_documents
         self._generation = 0
 
+    @property
+    def generation(self) -> int:
+        """Counts additions of new documents (``refresh_on_new_documents``); read it before a run."""
+
+        return self._generation
+
     def new_documents_added(self) -> None:
         """The corpus gained documents: answers cached before are stale (``refresh_on_new_documents``)."""
 
@@ -257,11 +263,19 @@ class AnswerCache:
             return None
         return copy.deepcopy(result)
 
-    def put(self, question: str, result: Any, scope: Any = None, pipeline: str = "") -> bool:
-        """Store ``result`` with the current versions of its source documents; False when not stored."""
+    def put(
+        self, question: str, result: Any, scope: Any = None, pipeline: str = "", generation: Optional[int] = None
+    ) -> bool:
+        """Store ``result`` with the versions of its source documents; False when not stored.
+
+        ``generation``: ``self.generation`` read before the run that produced ``result``. When a new
+        document was added since (the run may not have seen it), the answer is not stored.
+        """
 
         if not caching_allowed() or not getattr(result, "sources", None):
             return False  # answers without sources ("I don't know") are not worth serving again
+        if generation is not None and generation != self._generation:
+            return False  # a document was added while the answer was generated
         versions = answer_dependencies(result.sources, self.version_of)
         entry = (copy.deepcopy(result), versions, self._generation)
         self._cache.set(self.key(question, scope, pipeline), entry, deps=set(versions))

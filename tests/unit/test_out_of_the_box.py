@@ -160,9 +160,8 @@ def test_web_results_are_public_and_internal_ones_restricted(internal: bool) -> 
               token_counter="units")
     rag._web_retriever.provider = Provider(internal=internal)
     result = rag.query("What is the Paris weather today?", user=UserContext(user_id="u", max_access_level="executive"))
-    assert result.sources or result.metadata.get("blocked_by")
     if internal:
-        assert result.metadata.get("blocked_by") == "citation_access"  # untagged internal result: restricted
+        assert result.sources == []  # untagged internal result: hidden at retrieval, never in the prompt
     else:
         assert "blocked_by" not in result.metadata and result.sources[0].metadata["source_type"] == "web"
         assert not rag._private_document(result.sources[0])

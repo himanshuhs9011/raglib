@@ -31,9 +31,11 @@ class BaseSearchProvider(ABC):
 
     searches_corpus: bool = False
     supports_filters: bool = False
-    # An internal search (intranet, a private wiki): with access control its results are not public -
-    # they keep the access tags the provider puts in their metadata, and without tags nobody may read
-    # them (deny by default). Public web results are tagged with the lowest access level.
+    # An internal search (intranet, a private wiki). Its results are not public: at retrieval they
+    # must pass the query's filters, including the access-control permission filter, judged by the
+    # tags the provider puts in each result's metadata (access_level, department, allowed_roles).
+    # A result without tags is hidden from users without access (deny by default). Public web
+    # results are tagged with the lowest access level instead.
     internal: bool = False
 
     @abstractmethod
@@ -61,6 +63,12 @@ class ProviderChain(BaseSearchProvider):
         """True when any provider in the chain searches the local corpus."""
 
         return any(getattr(provider, "searches_corpus", False) for provider in self.providers)
+
+    @property
+    def internal(self) -> bool:  # type: ignore[override]
+        """True when any provider in the chain is internal (all its results are then checked)."""
+
+        return any(getattr(provider, "internal", False) for provider in self.providers)
 
     @property
     def name(self) -> str:

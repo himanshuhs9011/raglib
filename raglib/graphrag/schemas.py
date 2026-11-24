@@ -169,16 +169,17 @@ class ExtractionResult:
 
 
 def rebuild_description(item: Any, remaining: List[str]) -> str:
-    """The merged description of the chunks that remain, or ``""`` when a fragment is unknown.
+    """The merged description fragments of the chunks that remain (``""`` when none has one).
 
-    Entities and relations from graphs saved before per-chunk fragments existed have no fragments:
-    their description is dropped rather than kept, because it may quote a removed chunk.
+    Only text a remaining chunk supports is kept, so nothing quotes a removed chunk. A remaining
+    chunk without a fragment (its extraction gave no description) adds nothing and does not clear
+    the others. Entities and relations from graphs saved before per-chunk fragments existed have
+    no fragments at all: their description is dropped, because it may quote the removed chunk.
     """
 
     fragments = getattr(item, "descriptions", None) or {}
-    if any(chunk_id not in fragments for chunk_id in remaining):
-        return ""
     merged = ""
     for chunk_id in remaining:
-        merged = merge_descriptions(merged, fragments[chunk_id])
+        if fragments.get(chunk_id):
+            merged = merge_descriptions(merged, fragments[chunk_id])
     return merged

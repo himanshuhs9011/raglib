@@ -578,6 +578,7 @@ class RAG:
         self._web_retriever = WebRetriever(provider=self._web_provider, top_k=top_k) if self._web_provider else None
         if self._web_retriever is not None and self._access is not None:
             self._web_retriever.public_access_level = self._access.levels[0]  # public web results are public
+            self._web_retriever.access = self._access  # internal providers' results are checked by their tags
         self._hybrid_retriever = (
             HybridRetriever(vector_retriever=self._retriever, web_retriever=self._web_retriever)
             if self._web_retriever is not None
@@ -1003,12 +1004,13 @@ class RAG:
         pipeline = self._cheap_rag if tier == TIER_CHEAP else self._rag
         if tracer is not None:
             tracer.tag("tier", tier)
+        generation = cache.generation if cache is not None else None  # before retrieval starts
         with run_tags(tier=tier):
             result = pipeline.run(question, session_id=session_key, filters=filters, **run_kwargs)
         result.metadata.update({"tier": tier, "tier_reason": decision.reason, "answer_cache_hit": False})
         if cacheable and cache is not None and not result.metadata.get("blocked_by"):
             # A guard's refusal is not cached: new documents may answer the question next time.
-            cache.put(question, result, scope, cache_key)
+            cache.put(question, result, scope, cache_key, generation=generation)
         return result
 
     def _faq_result(self, cached: GenerationResult, reason: str, tracer: Optional[Tracer] = None) -> GenerationResult:
@@ -1345,7 +1347,8 @@ class RAG:
             f"chunk_size={self._splitter._chunk_size} ({self._splitter.token_counter_name}) is about {expected:.0f} "
             f"tokens for {model}, which reads at most {limit}{'' if exact else ' (estimated)'}. Use chunk_size<={safe} to avoid it"
         )
-        if self._preset == "production":  # your own chunk_size with the production preset: fail early
+        if self._preset == "production" and policy is None:
+            # Your own chunk_size with the production preset and no oversized_chunks choice: fail early.
             from raglib.embedding.limits import EmbeddingLimitError
 
             raise EmbeddingLimitError(message + ", or pass oversized_chunks='split' to split such chunks at ingest.")
@@ -1447,9 +1450,11 @@ class RAG:
         return replace(document, metadata=self._access.tag(document.metadata)) if self._access is not None else document
 
     def _document_fingerprint(self, document: Document) -> str:
-        """Content + chunking settings + access tags: equal means re-adding changes nothing."""
+        """Content + chunking settings + oversized-chunk policy + access tags: equal means re-adding
+        changes nothing (so switching ``oversized_chunks`` and re-adding really re-chunks)."""
 
-        raw = json.dumps([document.content, self.chunking_signature(), AccessControl.signature(document.metadata)])
+        policy = self._oversized_policy() if getattr(self._splitter, "_embed_limit", None) is not None else None
+        raw = json.dumps([document.content, self.chunking_signature(), policy, AccessControl.signature(document.metadata)])
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     def _unchanged(self, document: Document) -> bool:

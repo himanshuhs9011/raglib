@@ -94,7 +94,21 @@ class WebRetriever:
             from raglib.core.runtime import record_search_usage
 
             record_search_usage(f"web:{provider.name}", 1)  # billable API call (priced per 1K searches)
-        return provider.search(query=query, num_results=self.top_k)
+        docs = provider.search(query=query, num_results=self.top_k)
+        if filters and getattr(provider, "internal", False):
+            docs = [doc for doc in docs if self._internal_visible(doc, filters)]
+        return docs
+
+    def _internal_visible(self, doc: Document, filters: MetadataFilter) -> bool:
+        """An internal provider's result passes the query's filters by the tags it carries."""
+
+        from raglib.vectorstores.base_store import matches_filter
+
+        metadata = dict(doc.metadata or {})
+        access = getattr(self, "access", None)
+        if access is not None:
+            metadata = access.tag(metadata)  # derive the _acl_* keys the permission filter checks
+        return matches_filter(metadata, filters, array_contains=True)
 
     def _retrieve_from_fallback(
         self, query: str, cause: Exception, filters: Optional[MetadataFilter] = None

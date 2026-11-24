@@ -30,13 +30,18 @@ class BaseGraphStore(ABC):
     def remove_chunks(self, chunk_ids: Iterable[str]) -> List[str]:
         """Drop chunk references; delete orphaned entities/relations. Returns removed entity ids."""
 
-    @abstractmethod
     def remove_chunks_detailed(self, chunk_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
-        """``(removed entity ids, entity ids whose text changed)``. Stores that cannot rebuild a
-        description should blank it for every entity/relation that lost a chunk."""
+        """``(removed entity ids, entity ids whose text changed)``.
+
+        Optional (stores written for raglib 2.2 do not have it). This default calls ``remove_chunks``
+        and reports no changed text, so descriptions behave as in 2.2: they are kept and may still
+        quote a removed chunk. Override it to rebuild each description from the chunks that remain
+        (see ``NetworkXGraphStore``).
+        """
 
         return self.remove_chunks(chunk_ids), []
 
+    @abstractmethod
     def set_communities(self, communities: Sequence[Community]) -> None:
         """Replace all communities (and the entity -> community assignments)."""
 
