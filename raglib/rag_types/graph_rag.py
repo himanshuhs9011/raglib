@@ -6,6 +6,7 @@ import logging
 from dataclasses import replace
 from typing import Any, List
 
+from raglib.access import FilterNotSupportedError
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.core.fusion import reciprocal_rank_fusion
 from raglib.schemas import Document
@@ -48,7 +49,12 @@ class GraphRAG(BaseRAG):
             ctx.metadata["graph_building"] = True
         
         
-        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode, filters=ctx.filters)
+        if ctx.filters:
+            # Graph summaries are not linked to the metadata of their source chunks in 2.2.
+            raise FilterNotSupportedError(
+                "GraphRAG cannot apply metadata filters in raglib 2.2; query without filters= or use another rag_type"
+            )
+        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode)
         if mode == "global":
             ctx.trace.append(f"global_points:{len(graph_docs)}")
             if graph_docs or self.retriever is None:

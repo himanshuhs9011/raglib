@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import threading
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
@@ -164,17 +166,72 @@ class WebRetriever:
         return line[:120]
 
 
+_warned: set = set()
+_warned_lock = threading.Lock()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Log ``message`` the first time ``key`` is seen in this process."""
+
+    with _warned_lock:
+        if key in _warned:
+            return
+        _warned.add(key)
+    logger.warning(message)
+
+
+def accepts_filters(method: Any) -> bool:
+    """True when ``method`` takes a ``filters`` keyword (or ``**kwargs``)."""
+
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "filters" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
 def _search(provider: BaseSearchProvider, query: str, num_results: int, filters: Optional[Dict[str, Any]]) -> List[Document]:
-    """Call ``provider.search``, passing ``filters`` to corpus-backed providers."""
+    """Call ``provider.search``, passing ``filters`` to corpus-backed providers.
+
+    Other providers cannot apply filters: with filters set, a warning is logged once per provider.
+    """
 
     if filters and provider.name in CORPUS_BACKED_PROVIDERS:
         return provider.search(query=query, num_results=num_results, filters=filters)  # type: ignore[call-arg]
+    if filters:
+        _warn_once(f"provider:{provider.name}", f"filters were not applied by provider {provider.name}")
     return provider.search(query=query, num_results=num_results)
 
 
 def web_retrieve(web_retriever: Any, query: str, filters: Optional[Dict[str, Any]]) -> List[Document]:
-    """``web_retriever.retrieve`` with ``filters`` (custom retrievers without the argument still work unfiltered)."""
+    """``web_retriever.retrieve``, with ``filters`` when its ``retrieve`` accepts them.
+
+    A custom web retriever written for 2.2 (``retrieve(self, query)``) keeps working: it is called
+    without filters, and a warning is logged once.
+    """
 
     if filters:
-        return web_retriever.retrieve(query, filters=filters)
+        if accepts_filters(web_retriever.retrieve):
+            return web_retriever.retrieve(query, filters=filters)
+        name = type(web_retriever).__name__
+        _warn_once(f"retriever:{name}", f"filters were not applied by web retriever {name} (its retrieve() has no filters parameter)")
     return web_retriever.retrieve(query)
+
+
+def corpus_web_retrieve(hybrid_retriever: Any, query: str, filters: Optional[Dict[str, Any]]) -> List[Document]:
+    """``hybrid_retriever.retrieve`` (corpus + web), with ``filters`` when given.
+
+    Without filters it is called exactly as in 2.2. A custom hybrid retriever whose ``retrieve``
+    takes no ``filters`` searches the corpus unfiltered, so a filtered query raises
+    ``FilterNotSupportedError`` instead of returning documents outside the filter.
+    """
+
+    if not filters:
+        return hybrid_retriever.retrieve(query)
+    if not accepts_filters(hybrid_retriever.retrieve):
+        from raglib.access import FilterNotSupportedError
+
+        raise FilterNotSupportedError(
+            f"hybrid retriever {type(hybrid_retriever).__name__} cannot apply metadata filters (its retrieve() has no filters parameter)"
+        )
+    return hybrid_retriever.retrieve(query, filters=filters)

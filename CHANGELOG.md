@@ -12,10 +12,15 @@ Fixed, now apply the filter:
 - `neighbor_window` expansion: it stops at a neighbouring chunk that fails the filter.
 - pgvector and Qdrant: an empty `{"$or": []}` matched every document. It now matches nothing, as in the in-memory store. An empty `$and` still matches everything.
 
-Cannot be filtered in 2.2, now refuse instead of returning unfiltered results:
-- `rag_type="graph"` and `GraphRetriever.retrieve(..., filters=...)` raise the new `raglib.FilterNotSupportedError`. Graph summaries are not linked to the access metadata of their source chunks in 2.2. raglib 2.3 adds filtered GraphRAG.
+**Behaviour change: GraphRAG with `filters=` now raises.** `rag_type="graph"` (and `GraphRetriever.retrieve(..., filters=...)`) raises the new `raglib.FilterNotSupportedError` whenever `filters=` are given. In 2.2.0 it returned graph results that ignored the filter. Why: in 2.2 the graph's entity, relation and community summaries are not linked to the metadata of the chunks they were built from, so there is no way to tell which of them a filter allows. Refusing is the only safe answer. Queries without `filters=` are unchanged. raglib 2.3 adds filtered GraphRAG: summaries are used only when the chunks behind them pass the filter. The other pipelines that can use the graph keep working:
 - `rag_type="routing"`: a filtered query routed to `graph` uses the filtered `vector` route instead.
 - `rag_type="agentic"`: the `graph_search` tool is not offered to the agent when the query has filters.
+
+Custom retrievers written for 2.2 keep working:
+- A custom web retriever whose `retrieve()` has no `filters` parameter is called without filters, and a warning is logged once.
+- A custom hybrid (corpus + web) retriever without a `filters` parameter raises `FilterNotSupportedError` on a filtered query, because it would search the corpus unfiltered. Unfiltered queries call it exactly as before.
+
+**Known limit.** Only the built-in corpus provider (`web_search_provider="local"`) can apply filters. Any other search provider, including your own provider that searches private data, is called without them. When a query has filters, raglib logs `filters were not applied by provider <name>` once per provider and does not raise. Public web results are not corpus documents, so this is expected for providers like DuckDuckGo or Tavily. Filter inside a custom provider that searches private data yourself.
 
 ## 2.2.0 - 2026-11-21
 

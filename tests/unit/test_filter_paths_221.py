@@ -165,3 +165,81 @@ def test_qdrant_empty_or_matches_nothing() -> None:
     store._models = models
     translated = store.to_qdrant_filter({"$or": []})
     assert translated.must == [models.HasIdCondition(has_id=[])]
+
+
+# --- custom retrievers written for 2.2 keep working ---------------------------------------
+
+class _OldWeb:
+    """A 2.2-style custom web retriever: retrieve(self, query), no filters parameter."""
+
+    def retrieve(self, query: str) -> List[Document]:
+        return [Document(id="w", content="Orion public news from the web.", source="https://example.com")]
+
+
+class _OldHybrid:
+    """A 2.2-style custom hybrid retriever (corpus + web): retrieve(self, query)."""
+
+    def retrieve(self, query: str) -> List[Document]:
+        return [PUBLIC, PRIVATE]
+
+
+class _OldGraph:
+    """A 2.2-style custom graph retriever: no filters parameter, no **kwargs."""
+
+    indexer = None  # GraphRAG reads indexer.building (2.2 contract)
+
+    def resolve_mode(self, query: str, mode: str) -> str:
+        return "local"
+
+    def retrieve(self, query: str, mode: str = "local") -> List[Document]:
+        return [Document(id="g", content="Orion entity summary.", metadata={"graph": "entity"})]
+
+
+def test_a_2_2_style_web_retriever_is_called_without_filters_and_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    from raglib.rag_types.web_rag import WebRAG
+
+    web = WebRAG(web_retriever=_OldWeb())
+    with caplog.at_level("WARNING", logger="raglib.components.web_retriever"):
+        assert [doc.id for doc in web.retrieve(_ctx())] == ["w"]  # TypeError before this fix
+        web.retrieve(_ctx())
+    messages = [r.getMessage() for r in caplog.records if "filters were not applied" in r.getMessage()]
+    assert messages == ["filters were not applied by web retriever _OldWeb (its retrieve() has no filters parameter)"]
+    assert [doc.id for doc in web.retrieve(_ctx(filters=None))] == ["w"]  # unfiltered: unchanged
+
+
+def test_a_provider_that_cannot_filter_logs_a_warning_once(caplog: pytest.LogCaptureFixture) -> None:
+    from raglib.components.web_retriever import WebRetriever
+    from raglib.providers.base_provider import BaseSearchProvider
+
+    class Public(BaseSearchProvider):
+        @property
+        def name(self) -> str:
+            return "public_test_provider"
+
+        def search(self, query: str, num_results: int = 5) -> List[Document]:
+            return [Document(id="p", content="Orion news.")]
+
+    retriever = WebRetriever(provider=Public())
+    with caplog.at_level("WARNING", logger="raglib.components.web_retriever"):
+        retriever.retrieve(QUESTION, filters=ACME)
+        retriever.retrieve(QUESTION, filters=ACME)
+        retriever.retrieve(QUESTION)
+    messages = [r.getMessage() for r in caplog.records if "filters were not applied" in r.getMessage()]
+    assert messages == ["filters were not applied by provider public_test_provider"]
+
+
+def test_custom_hybrid_and_graph_retrievers_are_called_as_in_2_2_without_filters() -> None:
+    from raglib import FilterNotSupportedError
+    from raglib.rag_types.graph_rag import GraphRAG
+    from raglib.rag_types.hybrid_rag import HybridRAG
+
+    hybrid = HybridRAG(retriever=None, hybrid_retriever=_OldHybrid())
+    assert len(hybrid.retrieve(_ctx(filters=None))) == 2  # TypeError (filters=None) before this fix
+    with pytest.raises(FilterNotSupportedError):
+        hybrid.retrieve(_ctx())  # would return the corpus unfiltered
+    custom = _Custom(retriever=None, hybrid_retriever=_OldHybrid())
+    assert len(custom._retrieve_by_mode(_ctx(filters=None), QUESTION, "hybrid")) == 2
+    graph = GraphRAG(graph_retriever=_OldGraph(), fuse_with_chunks=False)
+    assert graph.retrieve(_ctx(filters=None)) == []  # only the summary: no chunks, no TypeError
+    with pytest.raises(FilterNotSupportedError):
+        graph.retrieve(_ctx())

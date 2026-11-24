@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, List
 
+from raglib.components.web_retriever import corpus_web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.schemas import Document
 
@@ -36,7 +37,7 @@ class HybridRAG(BaseRAG):
             return self.hybrid_retriever.retrieve(ctx.search_query, filters=ctx.filters)
         if self.retriever is None:
             if self.hybrid_retriever is not None:
-                return self.hybrid_retriever.retrieve(ctx.search_query, filters=ctx.filters)
+                return corpus_web_retrieve(self.hybrid_retriever, ctx.search_query, ctx.filters)
             raise ValueError("HybridRAG requires a retriever")
         ctx.trace.append("hybrid_sparse_dense_retrieve")
         mode = "hybrid" if self.retriever.embedding is not None else "sparse"
