@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**Security: the routing pipeline ignored filters on the hybrid and web routes (also fixed in 2.2.1).** With `rag_type="routing"`, only the vector and graph routes received `filters=` and the access-control filter. When the router chose hybrid or web, corpus documents outside the user's permissions could reach the prompt, including untagged and higher-level documents through `web_search_provider="local"`. Every route now gets the filters.
+
 **Public-dataset chunking benchmark.** `benchmarks/chunking/public_datasets.py` downloads BEIR SciFact (science), NFCorpus (nutrition / medicine), FiQA (finance) and a MIRACL Hindi subset from Hugging Face, and caches them in `~/.cache/raglib/bench`. It builds subsets with their relevance labels (judged documents plus random distractors) and runs `real_eval.py` on each with a local embedding model: `BAAI/bge-base-en-v1.5` for the English sets and `BAAI/bge-m3` for Hindi. No golden set is needed and there are no paid APIs. It needs `pip install raglib-py[hf] pyarrow`.
 
 **Guardrail cost benchmark.** `benchmarks/guardrails/cost_bench.py` runs one question set through four setups: guards off, the production guards, and all guards in local-model mode and in API-only mode. Per setup it reports attacks blocked, answerable questions wrongly blocked, LLM calls (answer model and cheap model), the calls NothingRelevant and TopicGuard saved, the judge escalation rate, latency per guard and judge stage, and estimated cost from a PriceTable. It runs offline by default (mock LLM, fake local classifiers, lexical embedding). Latency is then simulated and labelled as such; with `--local real` or a real `--llm`, latency is measured. Paid providers need `--yes`.

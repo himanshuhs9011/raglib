@@ -23,6 +23,5 @@ class RoutingRAG(BaseRAG):
             raise ValueError("RoutingRAG requires router_retriever")
         route = self.router_retriever.route(ctx.search_query)
         ctx.trace.append(f"route:{route}")
-        if route in {"vector", "graph"}:
-            return self.router_retriever.retrieve_route(route, ctx.search_query, filters=ctx.filters)
-        return self.router_retriever.retrieve_route(route, ctx.search_query)
+        # Every route gets the filters (the hybrid and web routes used to drop them).
+        return self.router_retriever.retrieve_route(route, ctx.search_query, filters=ctx.filters)
