@@ -303,15 +303,16 @@ def test_limits_use_the_pluggable_store() -> None:
 def test_answer_cache_key_includes_the_guard_configuration() -> None:
     cache = AnswerCache()
     question = "When do Acme offices close?"
+    # Build (and ingest into) every RAG first: ingesting documents refreshes a shared answer cache.
     first = _rag(answer_cache=cache, input_guards=[MaxQuestionTokens(1000)])
-    first.query(question)
     same = _rag(answer_cache=cache, input_guards=[MaxQuestionTokens(1000)])
-    assert same.query(question).metadata.get("answer_cache_hit") is True
     changed = _rag(answer_cache=cache, input_guards=[MaxQuestionTokens(500)])
-    assert changed.query(question).metadata.get("answer_cache_hit") is not True
     added = _rag(answer_cache=cache, input_guards=[MaxQuestionTokens(1000)], output_guards="default")
-    assert added.query(question).metadata.get("answer_cache_hit") is not True
     unguarded = _rag(answer_cache=cache)
+    first.query(question)
+    assert same.query(question).metadata.get("answer_cache_hit") is True
+    assert changed.query(question).metadata.get("answer_cache_hit") is not True
+    assert added.query(question).metadata.get("answer_cache_hit") is not True
     assert unguarded.query(question).metadata.get("answer_cache_hit") is not True
     limited = _rag(input_guards=[UserRateLimit(5)])
     before = limited._guards.signature()

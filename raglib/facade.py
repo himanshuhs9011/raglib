@@ -1465,8 +1465,7 @@ class RAG:
         """Drop cached answers built from ``parent_ids`` and the cached vectors of ``old_texts``."""
 
         dropped = 0
-        llm_cache = llm_cache_of(self._llm)
-        if llm_cache is not None:
+        for llm_cache in self._llm_caches():
             dropped += llm_cache.invalidate(parent_ids)
         if self._answer_cache is not None:
             dropped += self._answer_cache.invalidate(parent_ids)
@@ -1489,11 +1488,9 @@ class RAG:
         return self._invalidate_documents(sorted(parent_ids), texts)
 
     def invalidate_all(self) -> None:
-        """Clear the LLM, embedding and answer caches."""
+        """Clear every cache: the response caches of all models, the embedding, answer and judge caches."""
 
         self._purge_caches()
-        if self._answer_cache is not None:
-            self._answer_cache.clear()
 
     def on_document_update(self, source: SourceInput = None, doc_ids: Optional[Sequence[str]] = None) -> Dict[str, int]:
         """Hook for external update jobs (e.g. the nightly corpus sync): event-driven invalidation.
@@ -1582,6 +1579,8 @@ class RAG:
             if self._graph_indexer is not None and to_add:
                 self._add_to_graph(to_add)  # skips chunks it already extracted
             # Record documents only after they are really indexed, so a failed batch is retried next run.
+            if self._answer_cache is not None and any(parent not in self._parents for parent in changed):
+                self._answer_cache.new_documents_added()  # a new document can change cached answers
             self._parents.update(changed)
             self._parent_acl.update(signatures)
             return len(added)
@@ -2251,14 +2250,30 @@ class RAG:
             info["dimension"] = store.dimension
         return info
 
-    def _purge_caches(self) -> None:
-        """Deleted text must not survive in caches (LLM responses, embeddings) - privacy requirement."""
+    def _llm_caches(self) -> List[CachedLLMClient]:
+        """The response caches of every model this RAG uses (main, cheap, graph), without duplicates."""
 
-        llm_cache = llm_cache_of(self._llm)
-        if llm_cache is not None:
+        caches: List[CachedLLMClient] = []
+        for client in (self._llm, getattr(self, "_cheap_llm", None), getattr(self, "_graph_llm", None)):
+            cache = llm_cache_of(client)
+            if cache is not None and all(cache is not known for known in caches):
+                caches.append(cache)
+        return caches
+
+    def _purge_caches(self) -> None:
+        """Deleted text must not survive in caches - privacy requirement. Clears the response caches
+        of every model (main, cheap, graph), the embedding cache, the answer cache and the judge's
+        verdict cache."""
+
+        for llm_cache in self._llm_caches():
             llm_cache.clear()
         if isinstance(self._embedding, CachedEmbedding):
             self._embedding.clear()
+        if getattr(self, "_answer_cache", None) is not None:
+            self._answer_cache.clear()
+        judge = getattr(self, "_judge", None)
+        if judge is not None and judge.cache is not None:
+            judge.cache.clear()
 
     def _known_parents_for(self, source: SourceInput) -> set:
         """Match a source (document id or file path, or a list of them) against indexed documents.

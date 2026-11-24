@@ -47,7 +47,11 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--reranker", help="none | cross_encoder | cohere | llm")
     parser.add_argument("--warm-cache", action="store_true", help="keep caches between queries")
     parser.add_argument("--slowest", metavar="STAGE", help="also print the slowest samples of this stage")
+    parser.add_argument("--yes", action="store_true", help="confirm a run that calls a paid API (--llm / --embedding)")
     return parser.parse_args(argv)
+
+
+FREE_PROVIDERS = {"mock", "offline", "huggingface", "hf", "ollama", "lmstudio", "vllm", "local"}
 
 
 def main(argv: List[str]) -> int:
@@ -68,6 +72,13 @@ def main(argv: List[str]) -> int:
         value = getattr(args, key)
         if value:
             options["embedding_llm" if key == "embedding" else key] = value
+    paid = [name for name in (args.llm, args.embedding)
+            if name and name.split("/", 1)[0].strip().lower() not in FREE_PROVIDERS]
+    if paid and not args.yes:
+        calls = len(queries) * (args.repeats + args.warmup)
+        print(f"Paid providers: {paid}. This run makes about {calls} answer calls (plus rewriting / grading, "
+              "depending on rag_type). Nothing was sent: re-run with --yes to run it.")
+        return 2
     source = (args.source[0] if len(args.source) == 1 else args.source) if args.source else SAMPLE_CORPUS
     rag = RAG(source, **options)
 

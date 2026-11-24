@@ -420,15 +420,22 @@ def inherited_access(search: Any, chunk_ids: Sequence[str]) -> Dict[str, Any]:
     """
 
     access = getattr(search, "access", None)
-    if access is None:
-        return {}
     ids = sorted(set(chunk_ids))
     lookup = getattr(search, "chunk_lookup", None)
     metadatas = []
+    versions: Dict[str, Any] = {}
     for chunk_id in ids:
         chunk = lookup(chunk_id) if lookup is not None else None
-        metadatas.append(dict(chunk.metadata) if chunk is not None else {})
-    return {**access.strictest(metadatas), "source_chunk_ids": ids[:MAX_LISTED_SOURCES], "source_chunk_count": len(ids)}
+        metadata = dict(chunk.metadata) if chunk is not None else {}
+        metadatas.append(metadata)
+        if chunk is not None:
+            versions[str(metadata.get("parent_id") or chunk.id)] = metadata.get("document_version")
+    # What the summary was built from (for cache invalidation), with or without access control.
+    info: Dict[str, Any] = {"source_chunk_ids": ids[:MAX_LISTED_SOURCES], "source_chunk_count": len(ids),
+                            "source_document_versions": versions}
+    if access is not None:
+        info.update(access.strictest(metadatas))
+    return info
 
 
 def _digest(text: str) -> str:

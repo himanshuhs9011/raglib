@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Caches and deletion.**
+- **Cached answers carry the document versions they were built from**, as the sources had them at retrieval. A document updated while an answer was being generated used to leave the old answer cached under the new version, served for 24 hours.
+- **New documents refresh the answer cache.** Adding a document that was not in the index before, including through `on_document_update`, makes cached answers stale, because a new document can answer or supersede a cached question. Pass `AnswerCache(refresh_on_new_documents=False)` to keep them; the trade-off is a lower hit rate when you ingest new documents often.
+- **Answers built from GraphRAG summaries depend on the documents behind them.** Summaries now record `source_chunk_ids` and `source_document_versions` with or without access control.
+- **`delete()` and `invalidate_all()` clear every cache:** the response caches of the main, cheap and graph models, the embedding, answer and judge caches. Deleted text used to survive in `cheap_llm`'s cache. Invalidating a document also drops cached responses of the cheap and graph models. As a result, `benchmark(warm_cache=False)` is really cold.
+- `benchmarks/latency/bench_latency.py` asks for `--yes` before calling a paid `--llm` or `--embedding`.
+
 **Out-of-the-box fixes and the behaviour changes they settle.**
 - **Embedding limits: new indexes split, existing ones are left alone.** `oversized_chunks` now defaults to `None` (auto).
   - In a new index, chunks over the embedding model's limit are split at sentence borders. A single piece longer than the limit (a base64 blob, minified JSON, a long URL) is cut at character level, so no chunk is truncated by the model.

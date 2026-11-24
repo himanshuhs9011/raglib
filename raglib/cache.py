@@ -195,20 +195,42 @@ def normalize_question(question: str) -> str:
 class AnswerCache:
     """Question-level answer cache (the FAQ tier).
 
-    An entry stores the finished ``GenerationResult`` and the version of every source document.
-    It is served only while those versions are unchanged (``version_of`` is the RAG's document
-    version lookup), and dropped by ``invalidate(doc_id)``, ``on_document_update`` or after ``ttl``.
+    An entry stores the finished ``GenerationResult`` and the version of every document it was built
+    from, *as retrieved* (chunks carry ``document_version``; GraphRAG summaries carry
+    ``source_document_versions`` for the chunks behind them). It is served only while the corpus
+    still has those versions (``version_of`` is the RAG's document version lookup) - so a document
+    updated while the answer was being generated never leaves a stale answer behind - and dropped
+    by ``invalidate(doc_id)``, ``on_document_update`` or after ``ttl``.
+
+    ``refresh_on_new_documents=True`` (default): adding a document that was not in the index
+    before makes every cached answer stale (a new document can answer, or supersede the answer
+    to, a cached question). Trade-off: frequent ingestion of new documents lowers the hit rate;
+    pass ``False`` when new documents never change existing answers.
 
     Trade-offs: the same answer goes to everyone asking the same question in a scope (so raglib
     uses it for the public tier only), wording variants miss (keys are normalized text, not
     meaning), and conversation follow-ups bypass it (their answer depends on history).
     """
 
-    def __init__(self, max_entries: int = 5_000, ttl: Optional[float] = 24 * 3600.0, clock: Callable[[], float] = time.monotonic):
+    def __init__(
+        self,
+        max_entries: int = 5_000,
+        ttl: Optional[float] = 24 * 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+        refresh_on_new_documents: bool = True,
+    ):
         """Create an empty answer cache (default TTL: 24 hours)."""
 
         self._cache = TTLCache(max_entries=max_entries, ttl=ttl, clock=clock)
         self.version_of: Optional[Callable[[str], Optional[str]]] = None
+        self.refresh_on_new_documents = refresh_on_new_documents
+        self._generation = 0
+
+    def new_documents_added(self) -> None:
+        """The corpus gained documents: answers cached before are stale (``refresh_on_new_documents``)."""
+
+        if self.refresh_on_new_documents:
+            self._generation += 1
 
     @staticmethod
     def key(question: str, scope: Any = None, pipeline: str = "") -> str:
@@ -226,8 +248,11 @@ class AnswerCache:
         hit, entry = self._cache.lookup(key)
         if not hit:
             return None
-        result, versions = entry
-        if self.version_of is not None and any(self.version_of(doc) != version for doc, version in versions.items()):
+        result, versions, generation = entry if len(entry) == 3 else (*entry, self._generation)
+        stale = generation != self._generation or (
+            self.version_of is not None and any(self.version_of(doc) != version for doc, version in versions.items())
+        )
+        if stale:
             self._cache.discard(key)
             return None
         return copy.deepcopy(result)
@@ -237,9 +262,9 @@ class AnswerCache:
 
         if not caching_allowed() or not getattr(result, "sources", None):
             return False  # answers without sources ("I don't know") are not worth serving again
-        parents = {str(doc.metadata.get("parent_id") or doc.id) for doc in result.sources}
-        versions = {doc: (self.version_of(doc) if self.version_of else None) for doc in parents}
-        self._cache.set(self.key(question, scope, pipeline), (copy.deepcopy(result), versions), deps=parents)
+        versions = answer_dependencies(result.sources, self.version_of)
+        entry = (copy.deepcopy(result), versions, self._generation)
+        self._cache.set(self.key(question, scope, pipeline), entry, deps=set(versions))
         return True
 
     def invalidate(self, doc_ids: Iterable[str]) -> int:
@@ -260,3 +285,27 @@ class AnswerCache:
         """``hits``, ``misses``, ``expired`` and ``entries``."""
 
         return {"hits": self._cache.hits, "misses": self._cache.misses, "expired": self._cache.expired, "entries": len(self)}
+
+
+def answer_dependencies(sources: Iterable[Any], version_of: Optional[Callable[[str], Optional[str]]] = None) -> Dict[str, Optional[str]]:
+    """``{document id: version}`` an answer was built from, as the sources carried them at retrieval.
+
+    A chunk depends on its ``parent_id`` at its ``document_version``; a GraphRAG summary on every
+    document behind it (``source_document_versions``). Only a source without a recorded version is
+    looked up now (``version_of``).
+    """
+
+    versions: Dict[str, Optional[str]] = {}
+    for doc in sources:
+        metadata = getattr(doc, "metadata", {}) or {}
+        behind = metadata.get("source_document_versions")
+        if isinstance(behind, dict) and behind:
+            for parent, version in behind.items():
+                versions.setdefault(str(parent), version)
+            continue
+        parent = str(metadata.get("parent_id") or getattr(doc, "id", ""))
+        version = metadata.get("document_version")
+        if version is None and version_of is not None:
+            version = version_of(parent)
+        versions.setdefault(parent, version)
+    return versions
