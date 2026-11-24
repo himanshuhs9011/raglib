@@ -206,30 +206,34 @@ class HTTPChatClient(BaseLLMClient):
         prompt_tokens = completion_tokens = cache_read = cache_write = 0
         reported = False
         thinking = LeadingThinkFilter()
-        while parsed is not None:
-            raw, usage = parsed
-            if usage is not None:
-                reported = True
-                prompt_tokens = max(prompt_tokens, usage[0])
-                completion_tokens = max(completion_tokens, usage[1])
-                if len(usage) > 2:
-                    cache_read = max(cache_read, usage[2])
-                    cache_write = max(cache_write, usage[3])
-            text = thinking.feed(raw) if raw else ""
-            if text:
-                parts.append(text)
-                yield text
-            event = next(events, None)
-            parsed = None if event is None else self.parse_stream_event(event)
-        tail = thinking.flush()
-        if tail:
-            parts.append(tail)
-            yield tail
-        self._record_usage(
-            (prompt_tokens, completion_tokens, cache_read, cache_write) if reported else None,
-            f"{system}\n{prompt}",
-            "".join(parts),
-        )
+        try:
+            while parsed is not None:
+                raw, usage = parsed
+                if usage is not None:
+                    reported = True
+                    prompt_tokens = max(prompt_tokens, usage[0])
+                    completion_tokens = max(completion_tokens, usage[1])
+                    if len(usage) > 2:
+                        cache_read = max(cache_read, usage[2])
+                        cache_write = max(cache_write, usage[3])
+                text = thinking.feed(raw) if raw else ""
+                if text:
+                    parts.append(text)
+                    yield text
+                event = next(events, None)
+                parsed = None if event is None else self.parse_stream_event(event)
+            tail = thinking.flush()
+            if tail:
+                parts.append(tail)
+                yield tail
+        finally:
+            # Also when the caller stops reading early (a guard truncated or blocked the answer):
+            # the prompt and the text received so far were paid for. Estimated without provider usage.
+            self._record_usage(
+                (prompt_tokens, completion_tokens, cache_read, cache_write) if reported else None,
+                f"{system}\n{prompt}",
+                "".join(parts),
+            )
 
     # ------------------------------------------------------------------ internals
 

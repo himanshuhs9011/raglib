@@ -437,6 +437,8 @@ class RAG:
         self._preset = preset
         self._access: Optional[AccessControl] = AccessControl.coerce(access_control)
         self._parent_acl: Dict[str, str] = {}  # parent document id -> access-tag signature
+        self._fingerprints: Dict[str, str] = {}  # parent document id -> content/settings/tags hash
+        self._pending_fingerprints: Dict[str, str] = {}
 
         effective_chat_key = chat_api_key if chat_api_key is not None else llm_key
         self._llm_rpm = llm_rpm
@@ -827,9 +829,12 @@ class RAG:
                         if pending is not None:
                             pending.join()  # e.g. an answer-cache hit made no LLM call that waited
                 except GuardCancelled as cancelled:
+                    self._merge_parallel(scope, pending)  # every guard's stage and usage before the trace ends
                     result = self._input_blocked(cancelled.decision, tracer, meter, cancelled=True)
                 finally:
                     self._merge_parallel(scope, pending)
+                if result.metadata.get("answer_cache_hit") and tracer._finished is None:
+                    self._finish_faq(result, tracer, meter)
         self._after_guards(result, scope)
         return result, question, mapping
 
@@ -866,10 +871,11 @@ class RAG:
 
     @staticmethod
     def _merge_parallel(scope: GuardScope, pending: Optional[ParallelInputGuards]) -> None:
-        """Put the parallel input guards' decisions after the sequential input ones."""
+        """Wait for the parallel input guards; put their decisions after the sequential input ones (once)."""
 
-        if pending is None:
+        if pending is None or getattr(pending, "_merged", False):
             return
+        pending._merged = True
         try:
             pending.join()
         except GuardCancelled:
@@ -1009,20 +1015,37 @@ class RAG:
         """Return a cached answer, traced as its own short run (tier ``faq``).
 
         The cached answer already passed the output guards when it was generated (the answer-cache
-        key includes the guard configuration hash, so changed guards never reuse it).
+        key includes the guard configuration hash, so changed guards never reuse it). In a guarded
+        query (``tracer`` given) the trace is finished by ``_guarded`` once every guard is done, so
+        the usage and cost they caused are reported (``_finish_faq``).
         """
 
+        cached.metadata.update({"tier": TIER_FAQ, "tier_reason": reason, "answer_cache_hit": True})
+        own = tracer is None
         tracer = tracer or Tracer(on_event=self._rag.on_event)
         tracer.tag("tier", TIER_FAQ)
         with tracer.stage("answer_cache"):
             pass
-        total = tracer.finish(pipeline=self._rag_type, cache_hit={"answer": True}, cost_usd=0.0)
-        cached.metadata.update({"tier": TIER_FAQ, "tier_reason": reason, "answer_cache_hit": True})
-        cached.trace_events = list(tracer.events)
-        cached.usage = {"llm_calls": 0, "total_tokens": 0, "latency_ms": tracer.total_latency_ms(), "wall_latency_ms": total.latency_ms}
-        if self._prices is not None:
-            cached.usage["cost_usd"] = 0.0
+        if own:
+            self._finish_faq(cached, tracer, None)
         return cached
+
+    def _finish_faq(self, cached: GenerationResult, tracer: Tracer, meter: Optional[UsageMeter]) -> None:
+        """End an answer-cache hit's trace with the usage actually spent (guard calls, no answer call)."""
+
+        costs: Dict[str, Any] = {}
+        if self._prices is not None:
+            from raglib.costs import price_run
+
+            costs = price_run(self._prices, meter.breakdown() if meter is not None else {}, tracer.events)
+        total = tracer.finish(pipeline=self._rag_type, cache_hit={"answer": True}, **costs)
+        cached.trace_events = list(tracer.events)
+        usage = meter.as_dict() if meter is not None else {"llm_calls": 0, "total_tokens": 0}
+        if meter is not None:
+            usage["usage_by_model"] = meter.breakdown()
+        cached.usage = {**usage, "latency_ms": tracer.total_latency_ms(), "wall_latency_ms": total.latency_ms, **costs}
+        if self._prices is not None:
+            cached.usage.setdefault("cost_usd", 0.0)
 
     async def aquery(
         self,
@@ -1227,18 +1250,23 @@ class RAG:
                 on_progress(dict(stats))
 
         with usage_scope() as meter:  # ingest cost: embeddings, LLM chunking, graph extraction
-            for loaded in self._loader.iter_load(source):
-                stats["files"] += 1
-                if not loaded:
-                    stats["skipped"] += 1
-                    continue
-                if extra:
-                    loaded = [replace(document, metadata={**document.metadata, **extra}) for document in loaded]
-                pending.extend(self._chunk(loaded))
-                if len(pending) >= batch_size:
-                    flush()
-            flush()
-        self._ingest_meter.merge(meter)
+            try:
+                for loaded in self._loader.iter_load(source):
+                    stats["files"] += 1
+                    if not loaded:
+                        stats["skipped"] += 1
+                        continue
+                    if extra:
+                        loaded = [replace(document, metadata={**document.metadata, **extra}) for document in loaded]
+                    changed_documents = [document for document in loaded if not self._unchanged(document)]
+                    if not changed_documents:
+                        continue  # unchanged: not even re-chunked (the embedding chunker would re-pay its windows)
+                    pending.extend(self._chunk(changed_documents))
+                    if len(pending) >= batch_size:
+                        flush()
+                flush()
+            finally:
+                self._ingest_meter.merge(meter)  # batches embedded before a failure were paid for too
         logger.info(
             "Ingested %d new chunks from %d sources (corpus=%d)",
             stats["chunks_indexed"],
@@ -1418,6 +1446,20 @@ class RAG:
 
         return replace(document, metadata=self._access.tag(document.metadata)) if self._access is not None else document
 
+    def _document_fingerprint(self, document: Document) -> str:
+        """Content + chunking settings + access tags: equal means re-adding changes nothing."""
+
+        raw = json.dumps([document.content, self.chunking_signature(), AccessControl.signature(document.metadata)])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _unchanged(self, document: Document) -> bool:
+        """True when this document is indexed with the same text, chunking settings and tags."""
+
+        fingerprint = self._document_fingerprint(document)
+        with self._ingest_lock:
+            self._pending_fingerprints[document.id] = fingerprint
+            return document.id in self._parents and self._fingerprints.get(document.id) == fingerprint
+
     def _chunk(self, documents: List[Document]) -> List[Document]:
         """Split loaded documents into chunks (children of parent sections with parent_retrieval)."""
 
@@ -1582,6 +1624,10 @@ class RAG:
             if self._answer_cache is not None and any(parent not in self._parents for parent in changed):
                 self._answer_cache.new_documents_added()  # a new document can change cached answers
             self._parents.update(changed)
+            for parent_id in by_parent:  # indexed now: re-adding the same document can skip chunking
+                fingerprint = self._pending_fingerprints.pop(parent_id, None)
+                if fingerprint is not None:
+                    self._fingerprints[parent_id] = fingerprint
             self._parent_acl.update(signatures)
             return len(added)
 
@@ -1604,6 +1650,7 @@ class RAG:
             for parent_id in parent_ids:
                 chunk_ids.extend(self._parents.pop(parent_id, []))
                 self._parent_acl.pop(parent_id, None)
+                self._fingerprints.pop(parent_id, None)
                 self._doc_versions.pop(parent_id, None)
                 for section_id in self._parent_sections.pop(parent_id, []):
                     self._sections.pop(section_id, None)
@@ -1683,6 +1730,7 @@ class RAG:
             "index": self._index_fingerprint(),
             "parents": self._parents,
             "acl": self._parent_acl,
+            "fingerprints": self._fingerprints,
             "versions": self._doc_versions,
             "sections": {section_id: asdict(section) for section_id, section in self._sections.items()},
             "parent_sections": self._parent_sections,
@@ -1743,6 +1791,7 @@ class RAG:
         self._retriever.add_documents(documents)
         self._parents.update({key: list(value) for key, value in payload.get("parents", {}).items()})
         self._parent_acl.update({key: str(value) for key, value in payload.get("acl", {}).items()})
+        self._fingerprints.update({key: str(value) for key, value in payload.get("fingerprints", {}).items()})
         self._doc_versions.update({key: str(value) for key, value in payload.get("versions", {}).items()})
         self._sections.update({key: Document(**value) for key, value in payload.get("sections", {}).items()})
         self._parent_sections.update({key: list(value) for key, value in payload.get("parent_sections", {}).items()})

@@ -171,23 +171,25 @@ class LangChainAdapter(BaseLLMClient):
         parts: List[str] = []
         usage: Optional[Dict[str, int]] = None
         chunk = first
-        while chunk is not None:
-            chunk_usage = getattr(chunk, "usage_metadata", None)
-            if isinstance(chunk_usage, dict) and (chunk_usage.get("input_tokens") or chunk_usage.get("output_tokens")):
-                usage = {
-                    "input_tokens": (usage or {}).get("input_tokens", 0) + int(chunk_usage.get("input_tokens") or 0),
-                    "output_tokens": (usage or {}).get("output_tokens", 0) + int(chunk_usage.get("output_tokens") or 0),
-                }
-            text = self._coerce_content(getattr(chunk, "content", chunk))
-            if text:
-                parts.append(text)
-                yield text
-            chunk = next(iterator, None)
+        try:
+            while chunk is not None:
+                chunk_usage = getattr(chunk, "usage_metadata", None)
+                if isinstance(chunk_usage, dict) and (chunk_usage.get("input_tokens") or chunk_usage.get("output_tokens")):
+                    usage = {
+                        "input_tokens": (usage or {}).get("input_tokens", 0) + int(chunk_usage.get("input_tokens") or 0),
+                        "output_tokens": (usage or {}).get("output_tokens", 0) + int(chunk_usage.get("output_tokens") or 0),
+                    }
+                text = self._coerce_content(getattr(chunk, "content", chunk))
+                if text:
+                    parts.append(text)
+                    yield text
+                chunk = next(iterator, None)
+        finally:  # also when the caller stops reading early: what was sent and received was paid for
 
-        class _Usage:
-            usage_metadata = usage
+            class _Usage:
+                usage_metadata = usage
 
-        self._record_usage(_Usage, f"{system}\n{prompt}", "".join(parts))
+            self._record_usage(_Usage, f"{system}\n{prompt}", "".join(parts))
 
     async def acomplete(self, prompt: str, system: str = "") -> str:
         """Use native ``ainvoke`` when available, else a worker thread."""

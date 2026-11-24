@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Cost and usage accuracy.**
+- **Streams closed early are priced.** When a guard truncated or blocked a streamed answer, the native HTTP and LangChain clients stopped before recording usage, so the run reported 0 tokens and budgets were not charged. Usage is now recorded in a `finally`, estimated when the provider sent none.
+- **Every parallel guard finishes before the trace does.** On a block, the other guards are waited for first: their stages come before `total`, and their usage and cost are counted.
+- **Answer-cache hits report the guard calls they made**, instead of a hard-coded `cost_usd=0`. There is still no answer call.
+- **Unchanged documents skip chunking.** Each document's fingerprint (content, chunking settings, access tags) is kept and saved with the index, so re-adding unchanged documents, also in a fresh process after `load()`, no longer re-runs the embedding chunker and re-pays its sentence windows.
+- **A failed `add()` keeps the cost** of the batches it embedded before the failure in `ingest_usage()`.
+
 **Caches and deletion.**
 - **Cached answers carry the document versions they were built from**, as the sources had them at retrieval. A document updated while an answer was being generated used to leave the old answer cached under the new version, served for 24 hours.
 - **New documents refresh the answer cache.** Adding a document that was not in the index before, including through `on_document_update`, makes cached answers stale, because a new document can answer or supersede a cached question. Pass `AnswerCache(refresh_on_new_documents=False)` to keep them; the trade-off is a lower hit rate when you ingest new documents often.
