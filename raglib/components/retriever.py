@@ -236,7 +236,7 @@ class Retriever:
 
             results = candidates[:k]
             if self.neighbor_window > 0:
-                results = [self._expand_neighbors(doc) for doc in results]
+                results = [self._expand_neighbors(doc, filters) for doc in results]
         logger.debug("Retriever mode=%s returned %d docs", active_mode, len(results))
         return [
             replace(doc, metadata={**doc.metadata, "retriever": active_mode}, source=doc.source or "vector")
@@ -367,15 +367,21 @@ class Retriever:
             remaining.remove(best_doc)
         return selected
 
-    def _expand_neighbors(self, doc: Document) -> Document:
-        """Small-to-big: widen a hit with its neighbouring chunks from the same parent."""
+    def _expand_neighbors(self, doc: Document, filters: Optional[MetadataFilter] = None) -> Document:
+        """Small-to-big: widen a hit with its neighbouring chunks from the same parent.
+
+        Expansion stops at a neighbour that fails ``filters``.
+        """
+
+        def allowed(neighbor: Document) -> bool:
+            return not filters or matches_filter({**neighbor.metadata, "source": neighbor.source}, filters)
 
         parts = [doc.content]
         current = doc
         for _ in range(self.neighbor_window):
             prev_id = current.metadata.get("prev_id")
             prev_doc = self._doc_index.get(prev_id) if prev_id else None
-            if prev_doc is None:
+            if prev_doc is None or not allowed(prev_doc):
                 break
             parts.insert(0, prev_doc.content)
             current = prev_doc
@@ -383,7 +389,7 @@ class Retriever:
         for _ in range(self.neighbor_window):
             next_id = current.metadata.get("next_id")
             next_doc = self._doc_index.get(next_id) if next_id else None
-            if next_doc is None:
+            if next_doc is None or not allowed(next_doc):
                 break
             parts.append(next_doc.content)
             current = next_doc

@@ -14,6 +14,9 @@ from raglib.schemas import Document
 
 logger = logging.getLogger(__name__)
 
+# Providers that search the local corpus instead of the public web; they receive ``filters``.
+CORPUS_BACKED_PROVIDERS = {"local_web"}
+
 
 class WebRetriever:
     """Retrieves documents from web providers with configurable fallback."""
@@ -53,18 +56,22 @@ class WebRetriever:
         else:
             self.fallback_provider = None
 
-    def retrieve(self, query: str) -> List[Document]:
-        """Retrieve top-k web documents for a query."""
+    def retrieve(self, query: str, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """Retrieve top-k web documents for a query.
+
+        ``filters`` restrict providers that search the corpus (``web_search_provider="local"``).
+        Public web results are not corpus documents, so other providers ignore them.
+        """
 
         if not isinstance(query, str) or not query.strip():
             return []
 
         logger.info("WebRetriever querying provider=%s", self.provider.name)
         try:
-            docs = self.provider.search(query=query, num_results=self.top_k)
+            docs = _search(self.provider, query, self.top_k, filters)
         except Exception as exc:  # noqa: BLE001
             report_degraded(f"web_search:{self.provider.name}", exc, logger)
-            fallback_docs = self._retrieve_from_fallback(query=query, cause=exc)
+            fallback_docs = self._retrieve_from_fallback(query=query, cause=exc, filters=filters)
             if fallback_docs:
                 return fallback_docs
             if self.fail_silently:
@@ -73,7 +80,7 @@ class WebRetriever:
 
         return self._normalize_documents(docs=docs, provider_name=self.provider.name)
 
-    def _retrieve_from_fallback(self, query: str, cause: Exception) -> List[Document]:
+    def _retrieve_from_fallback(self, query: str, cause: Exception, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
         """Retrieve from fallback provider after primary provider failure."""
 
         if self.fallback_provider is None:
@@ -87,7 +94,7 @@ class WebRetriever:
         )
 
         try:
-            docs = self.fallback_provider.search(query=query, num_results=self.top_k)
+            docs = _search(self.fallback_provider, query, self.top_k, filters)
         except Exception as fallback_exc:  # noqa: BLE001
             report_degraded(f"web_search:{self.fallback_provider.name}", fallback_exc, logger)
             if self.fail_silently:
@@ -155,3 +162,19 @@ class WebRetriever:
         if not line:
             return "Web result"
         return line[:120]
+
+
+def _search(provider: BaseSearchProvider, query: str, num_results: int, filters: Optional[Dict[str, Any]]) -> List[Document]:
+    """Call ``provider.search``, passing ``filters`` to corpus-backed providers."""
+
+    if filters and provider.name in CORPUS_BACKED_PROVIDERS:
+        return provider.search(query=query, num_results=num_results, filters=filters)  # type: ignore[call-arg]
+    return provider.search(query=query, num_results=num_results)
+
+
+def web_retrieve(web_retriever: Any, query: str, filters: Optional[Dict[str, Any]]) -> List[Document]:
+    """``web_retriever.retrieve`` with ``filters`` (custom retrievers without the argument still work unfiltered)."""
+
+    if filters:
+        return web_retriever.retrieve(query, filters=filters)
+    return web_retriever.retrieve(query)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
+from raglib.components.web_retriever import web_retrieve
 from raglib.core.base import BaseRAG, PipelineContext
 from raglib.schemas import Document
 
@@ -22,4 +23,4 @@ class WebRAG(BaseRAG):
         if self.web_retriever is None:
             raise ValueError("WebRAG requires web_retriever (set web_search_provider)")
         ctx.trace.append("web_retrieve_rerank_generate")
-        return self.web_retriever.retrieve(ctx.search_query)
+        return web_retrieve(self.web_retriever, ctx.search_query, ctx.filters)

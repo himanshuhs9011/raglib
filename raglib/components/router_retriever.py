@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 
 from raglib.components.hybrid_retriever import HybridRetriever
 from raglib.components.retriever import Retriever
-from raglib.components.web_retriever import WebRetriever
+from raglib.components.web_retriever import WebRetriever, web_retrieve
 from raglib.core.intents import (
     is_comparison,
     is_global_question,
@@ -99,18 +99,21 @@ class RouterRetriever:
         """Retrieve from a specific route.
 
         ``filters`` restrict the corpus on every route: the hybrid route passes them to its corpus
-        search, and results that come from the corpus through a corpus-backed search provider
-        (``web_search_provider="local"``) are checked against them. Public web results are not
-        corpus documents, so filters do not apply to them.
+        search, and a corpus-backed search provider (``web_search_provider="local"``) applies them.
+        Public web results are not corpus documents, so filters do not apply to them. The knowledge
+        graph cannot apply filters in 2.2, so a filtered query routed to ``graph`` uses the vector
+        route instead.
         """
 
         filters = kwargs.get("filters")
         if route == ROUTE_WEB and self.web_retriever is not None:
-            return _corpus_hits_filtered(self.web_retriever.retrieve(query), filters)
+            return web_retrieve(self.web_retriever, query, filters)
         if route == ROUTE_HYBRID and self.hybrid_retriever is not None:
-            return _corpus_hits_filtered(self.hybrid_retriever.retrieve(query, **kwargs), filters)
+            return self.hybrid_retriever.retrieve(query, **kwargs)
         if route == ROUTE_GRAPH and self.graph_retriever is not None:
-            return self.graph_retriever.retrieve(query, **kwargs)
+            if not filters:
+                return self.graph_retriever.retrieve(query, **kwargs)
+            logger.warning("RouterRetriever: the graph route cannot apply filters; using the vector route")
         return self.vector_retriever.retrieve(query, **kwargs)
 
     def retrieve(self, query: str, **kwargs: Any) -> List[Document]:
@@ -118,18 +121,3 @@ class RouterRetriever:
 
         return self.retrieve_route(self.route(query), query, **kwargs)
 
-
-CORPUS_BACKED_PROVIDERS = {"local_web"}
-
-
-def _corpus_hits_filtered(documents: List[Document], filters: Any) -> List[Document]:
-    """Drop corpus documents (returned by a corpus-backed search provider) that fail ``filters``."""
-
-    if not filters:
-        return documents
-    from raglib.vectorstores.base_store import matches_filter
-
-    return [
-        doc for doc in documents
-        if doc.metadata.get("provider") not in CORPUS_BACKED_PROVIDERS or matches_filter(doc.metadata, filters)
-    ]

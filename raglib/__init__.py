@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from raglib.access import FilterNotSupportedError
 from raglib.components import (
     BM25Index,
     ContextReducer,
@@ -90,6 +91,7 @@ __all__ = [
     "BM25Index",
     "Retriever",
     "WebRetriever",
+    "FilterNotSupportedError",
     "HybridRetriever",
     "RouterRetriever",
     "MultiQueryRetriever",

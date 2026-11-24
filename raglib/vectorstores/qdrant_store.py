@@ -202,6 +202,9 @@ class QdrantVectorStore(BaseVectorStore):
                 must.extend(self.to_qdrant_filter(item) for item in condition)
                 continue
             if key == "$or":
+                if not condition:  # an empty OR matches nothing; Qdrant's empty "should" would match every point
+                    must.append(models.HasIdCondition(has_id=[]))  # ids are always indexed, so strict mode accepts it
+                    continue
                 must.append(models.Filter(should=[self.to_qdrant_filter(item) for item in condition]))
                 continue
             operators = condition if isinstance(condition, dict) else {"$eq": condition}

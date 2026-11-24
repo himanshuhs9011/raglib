@@ -48,7 +48,7 @@ class GraphRAG(BaseRAG):
             ctx.metadata["graph_building"] = True
         
         
-        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode)
+        graph_docs = self.graph_retriever.retrieve(ctx.search_query, mode=mode, filters=ctx.filters)
         if mode == "global":
             ctx.trace.append(f"global_points:{len(graph_docs)}")
             if graph_docs or self.retriever is None:

@@ -45,7 +45,7 @@ from raglib.components.reflection import ReflectionModule
 from raglib.components.reranker import Reranker
 from raglib.components.retriever import Retriever
 from raglib.components.router_retriever import RouterRetriever
-from raglib.components.web_retriever import WebRetriever
+from raglib.components.web_retriever import WebRetriever, web_retrieve
 from raglib.core.intents import is_greeting
 from raglib.core.runtime import RunState, UsageMeter, run_scope, usage_scope
 from raglib.core.tracing import Tracer
@@ -330,13 +330,13 @@ class BaseRAG:
         """Dispatch retrieval to the selected mode with graceful fallbacks."""
 
         if mode == RETRIEVAL_WEB and self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return web_retrieve(self.web_retriever, query, ctx.filters)
         if mode == RETRIEVAL_HYBRID and self.hybrid_retriever is not None:
-            return self.hybrid_retriever.retrieve(query)
+            return self.hybrid_retriever.retrieve(query, filters=ctx.filters) if ctx.filters else self.hybrid_retriever.retrieve(query)
         if self.retriever is not None:
             return self.retrieve_corpus(ctx, query)
         if self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return web_retrieve(self.web_retriever, query, ctx.filters)
         logger.warning("No retriever available for mode=%s", mode)
         return []
 

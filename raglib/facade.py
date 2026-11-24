@@ -69,7 +69,7 @@ from raglib.loaders.document_loader import DocumentLoader, SourceInput
 from raglib.providers.base_provider import BaseSearchProvider
 from raglib.providers.factory import build_search_provider, normalize_provider_name
 from raglib.schemas import Document, GenerationResult, TraceEvent
-from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord
+from raglib.vectorstores.base_store import BaseVectorStore, MetadataFilter, VectorRecord, matches_filter
 from raglib.vectorstores.in_memory_store import InMemoryVectorStore
 from raglib.vision.base_vision import BaseVisionClient
 from raglib.vision.vision_factory import VisionFactory
@@ -152,14 +152,16 @@ class _LocalSearchProvider(BaseSearchProvider):
 
         return self.PROVIDER_NAME
 
-    def search(self, query: str, num_results: int = 5) -> List[Document]:
-        """Lexical overlap search over the corpus."""
+    def search(self, query: str, num_results: int = 5, filters: Optional[MetadataFilter] = None) -> List[Document]:
+        """Lexical overlap search over the corpus, restricted to documents that pass ``filters``."""
 
         query_terms = token_set(query, remove_stopwords=True) or token_set(query)
         if not query_terms:
             return []
         scored: List[Document] = []
         for document in self._documents_fn():
+            if filters and not matches_filter({**document.metadata, "source": document.source}, filters):
+                continue
             overlap = len(query_terms & token_set(document.content))
             if overlap:
                 scored.append(

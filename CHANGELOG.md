@@ -2,7 +2,20 @@
 
 ## 2.2.1 - unreleased
 
-**Security: the routing pipeline ignored `filters=` on two routes.** With `rag_type="routing"`, `query(..., filters=...)` restricted only the `vector` and `graph` routes. When the router chose `hybrid` or `web`, retrieval ignored the filters, and with `web_search_provider="local"` (which searches your corpus) documents outside the filter could reach the answer prompt and the sources. Both routes now apply the filters to every corpus result. Public web results are not corpus documents, so filters still do not apply to them. Upgrade if you use `rag_type="routing"` with filters for tenant or permission scoping.
+**Security: `filters=` was not enforced on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search over the corpus, but the paths below ignored it. Documents outside the filter could reach the answer prompt and `result.sources`. Upgrade if you use filters for tenant or permission scoping. This release contains only these fixes, and queries without `filters=` behave exactly as in 2.2.0.
+
+Fixed, now apply the filter:
+- `rag_type="routing"`: the `hybrid` and `web` routes.
+- `web_search_provider="local"` (searches your corpus) on every path that calls web search: `rag_type="web"`, the routing `web` and `hybrid` routes, the agent's `search_web` tool, Corrective RAG's web search, and `HybridRetriever`. The provider now drops documents that fail the filter before it picks its top results. Public web results are not corpus documents, so filters still do not apply to them.
+- The decision engine's `web` and `hybrid` modes and its web fallback when there is no corpus retriever (`BaseRAG._retrieve_by_mode`, used by custom `BaseRAG` subclasses).
+- `HybridRAG` without a corpus retriever.
+- `neighbor_window` expansion: it stops at a neighbouring chunk that fails the filter.
+- pgvector and Qdrant: an empty `{"$or": []}` matched every document. It now matches nothing, as in the in-memory store. An empty `$and` still matches everything.
+
+Cannot be filtered in 2.2, now refuse instead of returning unfiltered results:
+- `rag_type="graph"` and `GraphRetriever.retrieve(..., filters=...)` raise the new `raglib.FilterNotSupportedError`. Graph summaries are not linked to the access metadata of their source chunks in 2.2. raglib 2.3 adds filtered GraphRAG.
+- `rag_type="routing"`: a filtered query routed to `graph` uses the filtered `vector` route instead.
+- `rag_type="agentic"`: the `graph_search` tool is not offered to the agent when the query has filters.
 
 ## 2.2.0 - 2026-11-21
 

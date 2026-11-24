@@ -7,6 +7,7 @@ import logging
 import math
 from typing import Callable, Dict, List, Optional, Sequence
 
+from raglib.access import FilterNotSupportedError
 from raglib.core.concurrency import parallel_map
 from raglib.core.intents import is_global_question
 from raglib.core.text import token_set
@@ -294,9 +295,20 @@ class GraphRetriever:
             return "global" if is_global_question(query) else "local"
         return chosen
 
-    def retrieve(self, query: str, top_k: Optional[int] = None, mode: Optional[str] = None, **_: object) -> List[Document]:
-        """Retrieve graph context for a query."""
+    def retrieve(
+        self, query: str, top_k: Optional[int] = None, mode: Optional[str] = None, filters: Optional[Dict] = None, **_: object
+    ) -> List[Document]:
+        """Retrieve graph context for a query.
 
+        Graph summaries are not linked to the access metadata of their source chunks in 2.2, so
+        metadata ``filters`` cannot be enforced: passing any raises ``FilterNotSupportedError``
+        instead of returning unfiltered results.
+        """
+
+        if filters:
+            raise FilterNotSupportedError(
+                "GraphRAG cannot apply metadata filters in raglib 2.2; query without filters= or use another rag_type"
+            )
         if self.resolve_mode(query, mode) == "global":
             return self.global_search.search(query)
         return self.local.search(query, top_k=top_k or self.top_k)
