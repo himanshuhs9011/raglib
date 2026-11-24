@@ -42,7 +42,10 @@ jobs:
           RAGLIB_OFFLINE: "1"
         run: pytest -q -rs
 
-  pgvector:
+  live-stores:
+    # Access control, leak and filter tests against real servers (tests/integration/), with Qdrant
+    # both plain and in strict mode. RAGLIB_REQUIRE_LIVE_STORES=1 fails instead of skipping when a
+    # service is not reachable. Keep the images in step with docker-compose.test.yml.
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -52,14 +55,23 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.20.0
+        ports: ["6333:6333"]
+        options: >-
+          --health-cmd "bash -c ':> /dev/tcp/127.0.0.1/6333'" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,pgvector]"
-      - name: pgvector integration tests
+      - run: pip install -e ".[dev,pgvector,qdrant]"
+      - name: Live vector-store tests
         env:
           RAGLIB_OFFLINE: "1"
+          RAGLIB_REQUIRE_LIVE_STORES: "1"
           RAGLIB_TEST_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
-        run: pytest -q -rs tests/unit/test_v21_improvements.py -k pgvector
+          RAGLIB_TEST_QDRANT_URL: http://localhost:6333
+        run: |
+          pytest -q -rs tests/integration
+          pytest -q -rs tests/unit/test_v21_improvements.py -k pgvector

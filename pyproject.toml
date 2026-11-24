@@ -145,4 +145,5 @@ check_untyped_defs = false
 [tool.pytest.ini_options]
 markers = [
   "e2e: End-to-end tests for the raglib facade and pipelines",
+  "integration: Live vector-store tests (docker-compose.test.yml); skipped when the servers are not running",
 ]

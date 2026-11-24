@@ -25,7 +25,9 @@ def filter_to_sql(filters: Optional[MetadataFilter]) -> Tuple[str, List[Any]]:
     """Translate a raglib metadata filter into a SQL condition on the ``metadata`` JSONB column.
 
     Returns ``(sql, params)``; ``sql`` is ``"TRUE"`` for no filter. Equality uses JSONB
-    containment, so ``{"page": 3}`` matches the number 3 and ``{"lang": "en"}`` the string.
+    containment, so ``{"page": 3}`` matches the number 3 and ``{"lang": "en"}`` the string. A
+    list-valued field matches when one element does (``{"tags": "a"}`` matches ``["a", "b"]``), as
+    in Qdrant and ``matches_filter(..., array_contains=True)``.
     """
 
     if not filters:
@@ -47,19 +49,20 @@ def filter_to_sql(filters: Optional[MetadataFilter]) -> Tuple[str, List[Any]]:
         operators = condition if isinstance(condition, dict) else {"$eq": condition}
         for operator, expected in operators.items():
             if operator == "$eq":
-                clauses.append("metadata @> %s::jsonb")
-                params.append(json.dumps({key: expected}))
+                clauses.append(_CONTAINS)
+                params.extend(_contains_params(key, expected))
             elif operator == "$ne":
-                clauses.append("NOT (metadata @> %s::jsonb)")
-                params.append(json.dumps({key: expected}))
+                clauses.append(f"NOT {_CONTAINS}")
+                params.extend(_contains_params(key, expected))
             elif operator in {"$in", "$nin"}:
                 values = list(expected)
                 if not values:
                     clauses.append("FALSE" if operator == "$in" else "TRUE")
                     continue
-                inner = " OR ".join("metadata @> %s::jsonb" for _ in values)
+                inner = " OR ".join(_CONTAINS for _ in values)
                 clauses.append(f"({inner})" if operator == "$in" else f"NOT ({inner})")
-                params.extend(json.dumps({key: value}) for value in values)
+                for value in values:
+                    params.extend(_contains_params(key, value))
             elif operator in _COMPARISONS:
                 symbol = _COMPARISONS[operator]
                 if isinstance(expected, (int, float)) and not isinstance(expected, bool):
@@ -73,6 +76,15 @@ def filter_to_sql(filters: Optional[MetadataFilter]) -> Tuple[str, List[Any]]:
             else:
                 raise ValueError(f"Unsupported metadata filter operator '{operator}'")
     return (" AND ".join(clauses) or "TRUE"), params
+
+
+# The field equals the value, or is a list that contains it (JSONB containment of a nested key
+# does not look inside arrays for a scalar, so both forms are checked).
+_CONTAINS = "(metadata @> %s::jsonb OR metadata @> %s::jsonb)"
+
+
+def _contains_params(key: str, value: Any) -> List[str]:
+    return [json.dumps({key: value}), json.dumps({key: [value]})]
 
 
 def _vector_literal(vector: Iterable[float]) -> str:

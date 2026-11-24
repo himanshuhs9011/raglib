@@ -788,10 +788,12 @@ If `embedding_llm` is omitted, raglib uses the chat provider's embeddings (OpenA
 ### Vector Stores (`vector_db`)
 
 - **`"memory"`** *(default)*: in-RAM cosine search (numpy-accelerated when installed), persisted with `rag.save()` / `rag.load()`.
-- **`"qdrant"`**: Qdrant (`pip install raglib-py[qdrant]`). In-process by default; `vector_db_kwargs={"path": "./qdrant"}` persists to disk, `{"url": "http://localhost:6333", "api_key": ...}` uses a server or Qdrant Cloud. Filters run inside Qdrant.
+- **`"qdrant"`**: Qdrant (`pip install raglib-py[qdrant]`). In-process by default; `vector_db_kwargs={"path": "./qdrant"}` persists to disk, `{"url": "http://localhost:6333", "api_key": ...}` uses a server or Qdrant Cloud. Filters run inside Qdrant. On a collection in strict mode that rejects filters on unindexed keys (Qdrant Cloud), raglib creates a payload index for each key a filter uses, the first time it is used (`vector_db_kwargs={"payload_indexes": True | False}` to force it on or off). Each index costs Qdrant memory, and the first query that needs one waits while it is built.
 - **`"pgvector"`**: PostgreSQL with the pgvector extension (`pip install raglib-py[pgvector]`), e.g. `vector_db_kwargs={"dsn": "postgresql://user:pass@host/db", "table_name": "docs"}`. Uses an HNSW cosine index when available; filters become parameterized SQL on a JSONB column.
 - **`"chroma"`**: ChromaDB in cosine space. Each `RAG` gets its **own collection** unless you name one, so instances never see each other's data. Use `{"persist_directory": ..., "collection_name": ...}` for a durable index or `{"host": ..., "port": ...}` for a Chroma server.
 - **Your own**: subclass `BaseVectorStore` (`upsert`, `query(filters=...)`, `delete`, `count`).
+
+The access-control and filter tests run against live servers in `tests/integration/`: `docker compose -f docker-compose.test.yml up -d --wait`, then `pytest -q -rs tests/integration`. They are skipped when the servers are not running.
 
 Initialization errors are raised. Pass `vector_db_kwargs={"fallback_to_memory": True}` to opt into a fallback. Every store refuses vectors of a different size than the ones it holds, so switching embedding models fails loudly instead of returning meaningless matches.
 
