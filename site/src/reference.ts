@@ -20,9 +20,9 @@ export const PARAM_GROUPS: ParamGroup[] = [
     intro: "What to index and how it is split.",
     params: [
       { name: "source", default: "None", text: "File, folder, URL, raw text, Document, or a list of these. Can also be added later with rag.add()." },
-      { name: "chunk_size", default: "400", text: "Chunk length in words." },
+      { name: "chunk_size", default: "400", text: "Chunk length in token_counter units: words by default (\"units\"), or model tokens with token_counter=\"auto\" / \"tiktoken\"." },
       { name: "chunk_overlap", default: "50", text: "Words shared by neighbouring chunks, so sentences are not cut off at a boundary." },
-      { name: "chunking_strategy", default: '"fixed"', text: '"fixed" (word windows), "recursive" (paragraph → sentence aware) or "llm" (the LLM picks semantic boundaries; costs LLM calls).' },
+      { name: "chunking_strategy", default: '"fixed"', text: '"fixed" (sentence-packed windows), "recursive" (paragraph → sentence aware), "embedding" (semantic: splits where sentence embeddings change; costs embeddings) or "llm" (the LLM picks boundaries; costs LLM calls).' },
       { name: "output_dir", default: "None", text: "If set, every question and answer is also saved as JSON in this folder." },
     ],
   },

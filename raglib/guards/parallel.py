@@ -49,7 +49,7 @@ class ParallelInputGuards:
         self._decisions: List[Decision] = []
         self.futures: List[Tuple[Guard, Future]] = []
         for guard in self.guards:
-            snapshot = contextvars.copy_context()  # the run's tracer, usage meter and guard scope
+            snapshot = contextvars.copy_context()  # the run's tracer and usage meter (not the guard scope: set later)
             self.futures.append((guard, _EXECUTOR.submit(snapshot.run, self._work, runner, guard, value, context)))
 
     @staticmethod

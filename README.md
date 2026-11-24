@@ -253,7 +253,7 @@ rag = RAG(
     rewrite_query=False,                # LLM query rewriting before retrieval
     # ---- chunking
     chunk_size=400, chunk_overlap=50,   # words (each Chinese/Japanese/Thai character counts as one); a hard limit
-    chunking_strategy="fixed",          # "fixed" | "recursive" | "llm"
+    chunking_strategy="fixed",          # "fixed" | "recursive" | "embedding" (semantic, embeddings) | "llm"
     # ---- retrieval
     retrieval_mode=None,                # "hybrid" (default with embeddings) | "dense" | "sparse"
     fusion="relative",                  # hybrid fusion: "relative" (score-based) | "rrf"
@@ -311,11 +311,11 @@ rag = RAG(
     tier_router=None,                   # callable(question, context) -> "faq" | "cheap" | "full"
     parent_retrieval=None,              # "heading" | "fixed": search small chunks, answer from parent sections
     parent_chunk_size=2000,             # max tokens of a parent section
-    semantic_breakpoint="percentile",   # chunking_strategy="embedding": "percentile" | "fixed"
+    semantic_breakpoint="percentile",   # chunking_strategy="embedding": "percentile" | "standard_deviation" | "interquartile" | "gradient" | "fixed"
     semantic_threshold=None,            # percentile (95) or cosine similarity (0.75) where a chunk ends
     prices=None,                        # PriceTable: USD cost per stage in result.usage
     semantic_min_tokens=None,           # smallest embedding-based chunk (default min(32, chunk_size // 8))
-    token_counter="units",              # "units" (words, not model tokens) | "tiktoken" | "auto" | callable
+    token_counter=None,                 # None = "units" (words; warns, becomes "auto" in 3.0) | "tiktoken" | "auto" | callable
     on_embedding_failure="fallback",    # "raise": a failed embedding call fails ingestion instead of falling back
     abbreviations=None,                 # words that don't end a sentence (default Dr., Mr., e.g., i.e., Inc., No., ...)
     semantic_buffer_size=2,             # sentences compared on each side of a gap
@@ -1081,7 +1081,8 @@ rag.query("Holiday policy?")                                # anonymous: "public
 - **Your own filters** are ANDed with the permission filter, so they can only narrow it. `rag.permission_filter(user)` shows the filter raglib applies.
 - **Permission changes**: re-adding unchanged text with new tags updates its permissions (no re-embedding with the default embedding cache).
 - **GraphRAG**: an entity or relation is used only when one of its source chunks is visible to the user. Its merged description is shown only when all of them are, and a community report only when every member is. Each community report records the chunks it was built from, and every graph summary raglib returns (entities, relations, community reports, global-search points) inherits the strictest access tags of its source chunks: the highest `access_level`, and the intersection of `department` / `allowed_roles`. A report built from three public chunks and one confidential chunk is therefore confidential, and `CitationAccessGuard` checks a cited summary the same way retrieval does: it is visible when the user may read every one of its source chunks (`summary_rule="all_sources"`, the default). A user in both finance and legal can see a summary that mixes the two. The inherited tags are deliberately strict: the intersection of finance and legal is empty, so a tags-only check would refuse that user. `summary_rule="strict_tags"` uses the tags alone, with no chunk lookups.
-- **Conversation memory** is kept per user, so the same `session_id` used by two users never shares history.
+- **Conversation memory** is kept per user and per current permissions: the same `session_id` used by two users never shares history, and a user whose access is lowered starts a new history.
+- **Web results** from a public provider are tagged with the lowest access level (`source_type="web"`), so answers may cite them. Set `internal = True` on a search provider for an intranet or private wiki: its results keep the access tags the provider sets, and without tags nobody may read them.
 - **Backends that cannot filter raise `FilterNotSupportedError`** instead of returning everything: a `BaseVectorStore` with `supports_metadata_filters = False`, a custom graph retriever without `supports_filters = True`, or a search provider that searches your corpus without filter support. Hits that a vector store returns outside the filter are dropped and logged.
 - Index-time work (entity extraction, community reports) reads every document, as embedding does. Use a model you trust with all of your data for `graph_llm`.
 

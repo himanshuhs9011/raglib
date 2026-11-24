@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**Behaviour changes vs 2.2, as they stand in this release.** Everything else is additive or opt-in.
+- **Always-on protections** (`secure_defaults=True`): citation access with `access_control`, a 10-call agent tool limit, and flag-only injection and secret checks.
+  - Normal answers and sources are unchanged, and `result.guard_flags` is new.
+  - With access control, streams trail the model by about one word.
+  - Agents with `max_steps > 10` stop at 10 tool calls.
+  - Turn each off with `secure_defaults={...}`, or all with `secure_defaults=False`.
+- **Embedding limits:** new indexes split chunks the embedding model would truncate. Indexes built before 2.3 keep their chunks exactly as they were, with a warning and no re-chunking (`oversized_chunks=None`; pass `"warn"`, `"split"` or `"raise"` to choose). An embedding model with an unknown limit warns once.
+- **The LLM cache expires after 24 hours** (`llm_cache_ttl`). Queries with `user=` or `filters=` are not cached (`cache_personalized=False`).
+- **Prompts** wrap retrieved and conversation text in an unguessable `<src-…>` delimiter instead of `<source>`. Custom templates get the data rule appended.
+- **Traces:** the `generate` stage times only the LLM call, new stages appear, and a final `total` event is appended to `trace_events`.
+- **Unchanged:** the `fixed` and `recursive` chunkers chunk exactly as in 2.2. The double danda (`॥`) ends a sentence only in the semantic chunkers.
+- **Unchanged default:** `token_counter` still defaults to `"units"`, with a `DeprecationWarning`; it becomes `"auto"` in the next major release.
+
 **Benchmark fix: `real_eval.py` measures what it says.**
 - Its counting wrapper hid the embedding model's tokenizer, so the model limit was estimated (90% of 512 = 460 tiktoken tokens), and "fixed 500/100" chunks between 460 and 512 tokens were split into fragments.
 - Chunk sizes are now measured with the embedding model's own tokenizer, and the model's real limit is used. "Fixed 500" means 500 model tokens.
@@ -73,7 +86,7 @@
 - `CitationAccessGuard` judges a cited GraphRAG summary with `summary_rule="all_sources"` by default: visible when the user may read every one of its source chunks, the same rule retrieval applies. `summary_rule="strict_tags"` uses only the inherited tags. It does no chunk lookups, but it refuses users in several departments a summary that mixes them. Summaries with more than 200 sources, or without source ids, fall back to the tags. Summaries now also carry `source_chunk_count`.
 - Guard API calls are traced in the guard's own stage, so they get their own `CostReport` line. The offline mock LLM answers the guard prompts with simple heuristics, for demos and tests.
 
-**Security: secure by default.** Every `RAG(...)` now gets four protections. None of them changes the answer to a normal question: with them on, plain `RAG(...)` gives the same answers, sources and trace stages as before, and still streams token by token.
+**Security: secure by default.** Every `RAG(...)` now gets four protections. None of them changes the answer to a normal question: with them on, plain `RAG(...)` gives the same answers and sources as before and still streams token by token. Trace stages are unchanged too, except with `rag_type="agentic"`, where each tool call adds a `guard.tool_policy` stage and a `metadata["guards"]` record.
 - `CitationAccessGuard` whenever `access_control=True`. It withholds an answer that cites a document the user may not read, which only happens when a custom retriever, tool or cache slips past the retrieval filters. Turn off with `secure_defaults={"citation_access": False}`.
 - An agent tool limit, `ToolPolicy(max_tool_calls=10)`. It stops a looping agent; the default `max_steps=4` never reaches it. Turn off with `secure_defaults={"tool_limit": False}`, or pass your own `tool_policy=`.
 - Injection flags: `InjectionHeuristic(flag_only=True)` on the question. Turn off with `secure_defaults={"injection_flags": False}`.
@@ -96,7 +109,7 @@ Two protections were already unconditional and stay that way: source delimiters 
 - Security guards fail closed and quality guards fail open; `fail_closed=` overrides this. Deterministic decisions are cached by input hash.
 - Every decision is in `result.metadata["guards"]` (plus `blocked_by` / `block_reason` on a block) and is traced as its own stage `guard.<name>`. Guard stages appear in `on_event`, `LatencyStats` (listed first; the `total` event has a new `blocked_by` run tag) and `CostReport` (each guard on its own line, $0 for tier 0).
 - `preset="production"` turns on the defaults for every stage. This preset is unreleased, so the change is not breaking. A plain `RAG(...)` gets only the secure defaults (see "Security: secure by default").
-- With output guards, `stream()` yields the checked answer in one piece instead of token by token.
+- With output guards, `stream()` checks the answer as it streams. Streaming-safe guards (leak masking, citation access, truncation) release checked pieces, while a guard that is not streaming-safe (`JSONSchemaGuard`, `GroundingGuard`) makes the answer arrive in one piece. See "PII masking is reversible" below.
 - `BaseRAG.run` / `stream` accept optional `tracer=` / `meter=` to continue a caller's trace and usage, and `usage_scope(meter)` reuses an active meter without double counting.
 - An answer refused by a guard is not stored in the answer cache.
 - PII masking is reversible: typed placeholders (`<EMAIL_1>`), a per-request map that is never traced, logged or cached, and the real values restored in the answer returned to the caller (`PIIMasker(restore=True)`). Stored copies (caches, memory, `output_dir`, traces) keep the placeholders. `PIIMasker` always runs before every other guard.
