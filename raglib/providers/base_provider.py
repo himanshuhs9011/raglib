@@ -31,6 +31,10 @@ class BaseSearchProvider(ABC):
 
     searches_corpus: bool = False
     supports_filters: bool = False
+    # An internal search (intranet, a private wiki): with access control its results are not public -
+    # they keep the access tags the provider puts in their metadata, and without tags nobody may read
+    # them (deny by default). Public web results are tagged with the lowest access level.
+    internal: bool = False
 
     @abstractmethod
     def search(self, query: str, num_results: int = 5) -> List[Document]:

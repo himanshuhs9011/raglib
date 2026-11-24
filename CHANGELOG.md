@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Out-of-the-box fixes and the behaviour changes they settle.**
+- **Embedding limits: new indexes split, existing ones are left alone.** `oversized_chunks` now defaults to `None` (auto).
+  - In a new index, chunks over the embedding model's limit are split at sentence borders. A single piece longer than the limit (a base64 blob, minified JSON, a long URL) is cut at character level, so no chunk is truncated by the model.
+  - **Behaviour change vs 2.2:** in a new index with a default local model (all-MiniLM, 256 tokens) and the default `chunk_size=400`, long chunks are now split instead of being truncated by the model.
+  - An index built before 2.3 keeps its chunks exactly as they were: oversized chunks are kept whole with an `EmbeddingLimitWarning`, and nothing is re-chunked or re-embedded on the next `add()`. Pass `oversized_chunks="split"` to re-chunk.
+  - `"warn"` (always keep whole) and `"raise"` are explicit choices.
+- **`preset="production"` works with small embedding models.** The preset no longer forces `oversized_chunks="raise"`. It fits its own `chunk_size` (and overlap) to the embedding model's limit with a 10% margin, so all-MiniLM (256 tokens) gets chunks of about 240 tokens (roughly 180 English words) instead of failing at the first document. A `chunk_size` you pass yourself that cannot fit raises `EmbeddingLimitError` at startup.
+- **The `fixed` and `recursive` strategies chunk exactly as in 2.2.** The double danda (`॥`) ends a sentence only in the semantic strategies (`embedding`, `llm`). The chunking settings now record `splitter_version`.
+- **Web results under access control.** Results from a public web provider are tagged with the lowest access level and `source_type="web"`, so the citation check no longer withholds answers that cite them. A provider can declare `internal = True` (intranet, private wiki). Its results then keep their own access tags, and without tags they are restricted: deny by default.
+- **Re-adding with `access=` to an index saved by 2.2 applies the tags.** Such an index has no saved permission map, and a missing entry used to count as "unchanged", so the tags were never applied.
+
 **Security: guard bypass and leak fixes.**
 - **One LLM gate for every client.** Waiting for the parallel input guards used to live inside particular clients, so with `llm_cache=False` and your own client or a LangChain model, the agent's planner or the query rewriter could call the model before a guard blocked. `RAG` now wraps every model it uses in one `GatedLLMClient`, which waits before complete, JSON, chat, stream and async calls. No streamed token is produced before the guards decide.
 - **Streams own their context.** A stream's trace, usage meter, guard scope and gate used to live in context variables across its `yield`s. They leaked into other queries made between two `next()` calls, and they were lost when a framework ran each step in a fresh context (Starlette): flags dropped, usage was 0 and budgets were not charged. Every stream step now runs in the stream's own context (`raglib.core.runtime.isolated`).

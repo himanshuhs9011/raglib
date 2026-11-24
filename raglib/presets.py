@@ -34,8 +34,6 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         # Chunk sizes in real model tokens (tiktoken when installed), and no silent chunking fallback.
         "token_counter": "auto",
         "on_embedding_failure": "raise",
-        # A chunk the embedding model cannot read in full fails ingestion instead of being split quietly.
-        "oversized_chunks": "raise",
         # Tier 0 guardrails (free rules): PII masking, question length, injection keywords; a
         # "couldn't find this" exit without an LLM call; leak + citation-access checks on answers.
         "input_guards": "default",
@@ -94,9 +92,12 @@ def apply_presets(init: Callable[..., None]) -> Callable[..., None]:
             offline = kwargs.get("offline")
             if offline is None:
                 offline = os.getenv(OFFLINE_ENV_VAR, "").strip().lower() in {"1", "true", "yes", "on"}
+            filled = []
             for key, value in resolve_preset(preset, offline=bool(offline)).items():
                 if key not in bound.arguments:
                     kwargs[key] = value
+                    filled.append(key)
+            self._preset_filled = frozenset(filled)  # e.g. a preset chunk_size may be fitted to the model
             if kwargs.get("reranker") == "cross_encoder" and importlib.util.find_spec("sentence_transformers") is None:
                 logger.warning(
                     "preset=%r uses reranker='cross_encoder', but sentence-transformers is not installed; "

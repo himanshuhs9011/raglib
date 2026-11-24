@@ -84,7 +84,7 @@ def test_raise_policy_and_production_preset() -> None:
         rag.add(Document(id="doc", content=WORDS))
     from raglib.presets import resolve_preset
 
-    assert resolve_preset("production")["oversized_chunks"] == "raise"
+    assert "oversized_chunks" not in resolve_preset("production")  # the preset fits chunk_size instead (see below)
     with pytest.raises(ValueError):
         _rag(TokenizedEmbedding(limit=200), oversized_chunks="truncate")
 

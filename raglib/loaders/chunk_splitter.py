@@ -115,6 +115,18 @@ _SENTENCE_BOUNDARY_RE = re.compile(
     r"|(?<=[\u3002\uff01\uff1f])\s*"
     r"|(?<=[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u3400-\u9fff])[ \t]+"
 )
+# The rule of raglib 2.2 (the double danda U+0965 is not a boundary). The "fixed" and "recursive"
+# strategies keep it, so existing indexes chunk exactly as before; the semantic strategies use the
+# rule above.
+_LEGACY_SENTENCE_BOUNDARY_RE = re.compile(
+    r"(?<=[.!?\u0964])[ \t]+"
+    r"|\s*\n\s*"
+    r"|(?<=[\u3002\uff01\uff1f])\s*"
+    r"|(?<=[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff\u3400-\u9fff])[ \t]+"
+)
+SEMANTIC_STRATEGIES = frozenset({"embedding", "llm"})
+# Bump when a change makes the same settings produce different chunks (recorded in the index).
+SPLITTER_VERSION = 2
 
 # Prefer coarser structure first, then finer units (LangChain-style recursive split).
 DEFAULT_RECURSIVE_SEPARATORS: Sequence[str] = (
@@ -315,8 +327,8 @@ class ChunkSplitter:
 
         from raglib.embedding.limits import ESTIMATE_MARGIN
 
-        if policy not in {"split", "raise"}:
-            raise ValueError("oversized_chunks must be 'split' or 'raise'")
+        if policy not in {"split", "raise", "warn"}:
+            raise ValueError("oversized_chunks must be 'split', 'raise' or 'warn'")
         self._embed_limit = None if not limit else (int(limit) if exact else max(1, int(limit * ESTIMATE_MARGIN)))
         self._embed_reported_limit = limit
         self._embed_counter = counter
@@ -338,6 +350,11 @@ class ChunkSplitter:
                 fitted.append(piece)
                 continue
             tokens = self._embed_counter(piece.text)
+            if self._oversized_policy == "warn":  # existing index: keep chunks as they were, say so
+                if self.on_oversized is not None:
+                    self.on_oversized(document, tokens, 0)
+                fitted.append(piece)
+                continue
             if self._oversized_policy == "raise":
                 from raglib.embedding.limits import EmbeddingLimitError
 
@@ -386,6 +403,7 @@ class ChunkSplitter:
         """The settings that decide chunk boundaries (recorded in an index; same settings = same chunks)."""
 
         info: Dict[str, Any] = {
+            "splitter_version": SPLITTER_VERSION,
             "strategy": self._strategy,
             "chunk_size": self._chunk_size,
             "chunk_overlap": self._overlap,
@@ -676,6 +694,12 @@ class ChunkSplitter:
         spans = [(a + start, b + start) for a, b in unit_spans(text[start:end])]
         if not spans:
             return []
+        if counter is not None:
+            # One unit longer than the limit (a base64 blob, minified JSON, a long URL): cut it at
+            # character level, so no window is ever over the model limit.
+            spans = [part for a, b in spans for part in (
+                [(a, b)] if count(text[a:b]) <= size else _char_windows(text, a, b, size, count)
+            )]
         if counter is None and self.token_counter_name == "units":
             if len(spans) <= size:
                 return [(spans[0][0], spans[-1][1])]
@@ -1133,7 +1157,8 @@ class ChunkSplitter:
 
         segments: List[str] = []
         position = 0
-        for match in _SENTENCE_BOUNDARY_RE.finditer(text):
+        rule = _SENTENCE_BOUNDARY_RE if self._strategy in SEMANTIC_STRATEGIES else _LEGACY_SENTENCE_BOUNDARY_RE
+        for match in rule.finditer(text):
             end = match.end()
             if end <= position:
                 continue
@@ -1207,3 +1232,21 @@ def _gradient(values: Sequence[float]) -> List[float]:
     gradient += [(values[i + 1] - values[i - 1]) / 2.0 for i in range(1, len(values) - 1)]
     gradient.append(values[-1] - values[-2])
     return gradient
+
+
+def _char_windows(text: str, start: int, end: int, size: int, count: Callable[[str], int]) -> List[Tuple[int, int]]:
+    """Consecutive ``(start, end)`` windows of ``text[start:end]`` that each measure ``<= size``."""
+
+    windows: List[Tuple[int, int]] = []
+    position = start
+    while position < end:
+        low, high = position + 1, end
+        while low < high:  # the longest window from ``position`` that fits
+            middle = (low + high + 1) // 2
+            if count(text[position:middle]) <= size:
+                low = middle
+            else:
+                high = middle - 1
+        windows.append((position, low))
+        position = low
+    return windows

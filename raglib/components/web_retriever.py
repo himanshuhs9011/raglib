@@ -79,7 +79,7 @@ class WebRetriever:
                 return []
             raise ProviderError(f"Web retrieval failed for provider={self.provider.name}: {exc}") from exc
 
-        return self._normalize_documents(docs=docs, provider_name=self.provider.name)
+        return self._normalize_documents(docs=docs, provider_name=self.provider.name, provider=self.provider)
 
     def _search(self, provider: BaseSearchProvider, query: str, filters: Optional[MetadataFilter]) -> List[Document]:
         """Call one provider, enforcing ``filters`` on providers that search the local corpus."""
@@ -124,11 +124,19 @@ class WebRetriever:
                 f"'{self.provider.name}' and fallback provider '{self.fallback_provider.name}'"
             ) from fallback_exc
 
-        return self._normalize_documents(docs=docs, provider_name=self.fallback_provider.name)
+        return self._normalize_documents(docs=docs, provider_name=self.fallback_provider.name, provider=self.fallback_provider)
 
-    def _normalize_documents(self, docs: List[Document], provider_name: str) -> List[Document]:
-        """Normalize documents to unified title/content/url/score metadata schema."""
+    def _normalize_documents(self, docs: List[Document], provider_name: str, provider: Any = None) -> List[Document]:
+        """Normalize documents to unified title/content/url/score metadata schema.
 
+        With access control (``public_access_level`` set by ``RAG``), results of a public provider
+        are tagged ``source_type="web"`` at the lowest access level, so the citation check and the
+        "non-public" rules treat them as public. Results of an ``internal`` or corpus provider keep
+        their own tags (none means restricted).
+        """
+
+        level = getattr(self, "public_access_level", None)
+        restricted = bool(getattr(provider, "internal", False) or getattr(provider, "searches_corpus", False))
         normalized: List[Document] = []
         for idx, doc in enumerate(docs[: self.top_k]):
             title = str(doc.metadata.get("title", "")).strip() or self._derive_title(doc.content)
@@ -147,6 +155,11 @@ class WebRetriever:
                 "provider": doc.metadata.get("provider", provider_name),
                 "score": score,
             }
+            if level is not None and not restricted:
+                metadata.setdefault("access_level", level)
+                metadata.setdefault("source_type", "web")
+            elif level is not None:
+                metadata.setdefault("source_type", "internal")
 
             normalized.append(
                 replace(

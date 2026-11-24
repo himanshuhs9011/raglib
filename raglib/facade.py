@@ -315,7 +315,7 @@ class RAG:
         semantic_overlap_sentences: int = 0,
         allow_web_after_private: bool = False,
         embedding_max_tokens: Optional[int] = None,
-        oversized_chunks: str = "split",
+        oversized_chunks: Optional[str] = None,
         embedding_timeout: Optional[float] = None,
         reranker_timeout: float = 10.0,
         input_guards: GuardSpec = None,
@@ -526,6 +526,7 @@ class RAG:
         )
         self._chunking_fallbacks: List[Dict[str, str]] = []
         self._oversized_chunks: List[Dict[str, Any]] = []
+        self._semantic_min_tokens_setting = semantic_min_tokens
         self._configure_embedding_limit(embedding_max_tokens, oversized_chunks)
         self._index_signatures: set = set()  # chunking signatures of the chunks already in this index
         self._settings_warned = False
@@ -573,6 +574,8 @@ class RAG:
         if validate_web_search_api_key and self._web_provider is not None:
             self._validate_web_provider_connection(self._web_provider)
         self._web_retriever = WebRetriever(provider=self._web_provider, top_k=top_k) if self._web_provider else None
+        if self._web_retriever is not None and self._access is not None:
+            self._web_retriever.public_access_level = self._access.levels[0]  # public web results are public
         self._hybrid_retriever = (
             HybridRetriever(vector_retriever=self._retriever, web_retriever=self._web_retriever)
             if self._web_retriever is not None
@@ -1269,8 +1272,9 @@ class RAG:
         from raglib.core.text import count_tokens
         from raglib.embedding.limits import ESTIMATE_MARGIN, TOKENIZER_SAMPLE, EmbeddingLimitWarning
 
-        if policy not in {"split", "raise"}:
-            raise ValueError("oversized_chunks must be 'split' or 'raise'")
+        if policy not in {None, "split", "raise", "warn"}:
+            raise ValueError("oversized_chunks must be 'split', 'raise', 'warn' or None")
+        self._oversized_setting = policy
         embedding = self._embedding
         limit = override or (embedding.max_input_tokens if embedding is not None else None)
         self._embedding_limit = limit
@@ -1288,28 +1292,65 @@ class RAG:
             counter: Callable[[str], int] = lambda text: embedding.count_input_tokens(text) or 0  # noqa: E731
         else:
             counter = count_tokens  # tiktoken when installed, else ~4 characters per token
-        self._splitter.set_embedding_limit(limit, counter, exact, policy, on_oversized=self._record_oversized)
+        self._splitter.set_embedding_limit(limit, counter, exact, policy or "split", on_oversized=self._record_oversized)
         # Startup check: how many model tokens does a chunk of chunk_size (in the chunker's units) hold?
         ratio = counter(TOKENIZER_SAMPLE) / max(1, self._splitter._count_tokens(TOKENIZER_SAMPLE))
         usable = limit if exact else int(limit * ESTIMATE_MARGIN)
         expected = self._splitter._chunk_size * ratio
-        if expected > usable:
-            safe = max(1, int(usable / ratio))
-            message = (
-                f"chunk_size={self._splitter._chunk_size} ({self._splitter.token_counter_name}) is about {expected:.0f} "
-                f"tokens for {embedding.model_name or type(embedding).__name__}, which reads at most {limit}"
-                f"{'' if exact else ' (estimated)'}. Chunks over the limit will be "
-                f"{'rejected' if policy == 'raise' else 'split further'} at ingest. Use chunk_size<={safe} to avoid it."
-            )
-            warnings.warn(message, EmbeddingLimitWarning, stacklevel=4)
-            logger.warning(message)
+        if expected <= usable:
+            return
+        safe = max(1, int(usable / ratio))
+        model = embedding.model_name or type(unwrap_embedding(embedding)).__name__
+        filled = getattr(self, "_preset_filled", frozenset())
+        if self._preset == "production" and "chunk_size" in filled:
+            # The preset's chunk_size is a target, not a promise: fit it to the model, with a margin.
+            fitted = max(16, int(safe * 0.9))
+            self._splitter._chunk_size = fitted
+            if "chunk_overlap" in filled:
+                self._splitter._overlap = fitted // 5
+            if self._semantic_min_tokens_setting is None:
+                self._splitter._semantic_min_tokens = max(1, min(32, fitted // 8))
+            logger.info("preset='production': chunk_size %d -> %d to fit %s (reads at most %d tokens)",
+                        expected / ratio, fitted, model, limit)
+            return
+        message = (
+            f"chunk_size={self._splitter._chunk_size} ({self._splitter.token_counter_name}) is about {expected:.0f} "
+            f"tokens for {model}, which reads at most {limit}{'' if exact else ' (estimated)'}. Use chunk_size<={safe} to avoid it"
+        )
+        if self._preset == "production":  # your own chunk_size with the production preset: fail early
+            from raglib.embedding.limits import EmbeddingLimitError
+
+            raise EmbeddingLimitError(message + ", or pass oversized_chunks='split' to split such chunks at ingest.")
+        action = {"warn": "kept whole (and truncated by the model)", "raise": "rejected",
+                  None: "split further (kept whole in an index built before raglib 2.3)"}.get(policy, "split further")
+        message += f". Chunks over the limit are {action} at ingest."
+        warnings.warn(message, EmbeddingLimitWarning, stacklevel=4)
+        logger.warning(message)
+
+    def _oversized_policy(self) -> str:
+        """``oversized_chunks``, or (default) split in new indexes and keep chunks as they were in an index
+        built before chunking signatures existed (raglib 2.2): re-chunking it would re-embed everything."""
+
+        if self._oversized_setting:
+            return self._oversized_setting
+        return "warn" if "" in self._index_signatures else "split"
 
     def _record_oversized(self, document: Document, tokens: int, parts: int) -> None:
-        """A chunk was split to fit the embedding model: count it and warn once per ingest call."""
+        """A chunk was split to fit the embedding model (``parts=0``: kept whole); count it and warn."""
 
         from raglib.embedding.limits import EmbeddingLimitWarning
 
         self._oversized_chunks.append({"document_id": document.id, "tokens": tokens, "parts": parts})
+        if parts == 0:
+            if len(self._oversized_chunks) == 1 or len(self._oversized_chunks) % 1000 == 0:
+                warnings.warn(
+                    f"A chunk of {document.id!r} has {tokens} tokens, over the embedding limit of {self._embedding_limit}; "
+                    "it was kept whole because this index was built before raglib 2.3 (the model truncates it). "
+                    "Pass oversized_chunks='split' and re-add your documents to split such chunks.",
+                    EmbeddingLimitWarning,
+                    stacklevel=2,
+                )
+            return
         if len(self._oversized_chunks) == 1 or len(self._oversized_chunks) % 1000 == 0:
             warnings.warn(
                 f"A chunk of {document.id!r} had {tokens} tokens, over the embedding limit of {self._embedding_limit}; "
@@ -1380,6 +1421,8 @@ class RAG:
     def _chunk(self, documents: List[Document]) -> List[Document]:
         """Split loaded documents into chunks (children of parent sections with parent_retrieval)."""
 
+        if getattr(self._splitter, "_embed_limit", None) is not None:
+            self._splitter._oversized_policy = self._oversized_policy()
         signature = self.chunking_signature()
         if self._parent_retrieval is None:
             return [self._tag(_signed(chunk, signature)) for chunk in self._splitter.split(documents)]
@@ -1500,7 +1543,10 @@ class RAG:
                 signature = AccessControl.signature(parent_chunks[0].metadata)
                 version = hashlib.sha256(json.dumps([new_ids, signature]).encode("utf-8")).hexdigest()[:16]
                 if old_ids == new_ids:
-                    if self._parent_acl.get(parent_id, signature) != signature:
+                    known = self._parent_acl.get(parent_id)
+                    # An index saved before permissions were recorded has no entry: tags on the new
+                    # chunks then count as a change (otherwise they would never be applied).
+                    if (known is None and signature != _UNTAGGED_SIGNATURE) or (known is not None and known != signature):
                         _stamp_version(parent_chunks, version)
                         retagged.extend(parent_chunks)  # same text, new permissions
                         signatures[parent_id] = signature
@@ -2396,6 +2442,9 @@ def _stamp_version(chunks: List[Document], version: str) -> None:
 
     for chunk in chunks:
         chunk.metadata["document_version"] = version
+
+
+_UNTAGGED_SIGNATURE = AccessControl.signature({})
 
 
 def _signed(chunk: Document, signature: str) -> Document:

@@ -83,7 +83,7 @@ rag = RAG(
     embedding_base_url=None,
     embedding_timeout=None,                # seconds per embedding API request (None = the client default, 60 s)
     embedding_max_tokens=None,             # model input limit (default: known per model, e.g. bge 512, OpenAI 8191)
-    oversized_chunks=<<OVERSIZED>>,               # chunk longer than the model reads: "raise" | "split" (never silently truncated)
+    oversized_chunks=<<OVERSIZED>>,               # chunk longer than the model reads: None (split in new indexes) | "split" | "warn" | "raise"
 
     # ---------------------------------------------------------------- vision (OCR of scanned PDF pages)
     vision_llm=None,                       # e.g. "openai" to read image-only pages
@@ -269,7 +269,7 @@ def render_pipeline(preset: str = "production", llm: str = "openai", docs: str =
         "<<EMBEDDING_TTL>>": repr(values.get("embedding_cache_ttl")),
         "<<TOKEN_COUNTER>>": f'"{values.get("token_counter", "units")}"',
         "<<ON_FAILURE>>": f'"{values.get("on_embedding_failure", "fallback")}"',
-        "<<OVERSIZED>>": f'"{values.get("oversized_chunks", "split")}"',
+        "<<OVERSIZED>>": _repr(values.get("oversized_chunks")),
         "<<INPUT_GUARDS>>": _repr(values.get("input_guards")),
         "<<RETRIEVAL_GUARDS>>": _repr(values.get("retrieval_guards")),
         "<<OUTPUT_GUARDS>>": _repr(values.get("output_guards")),
