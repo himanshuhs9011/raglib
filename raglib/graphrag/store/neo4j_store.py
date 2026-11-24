@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from raglib.graphrag.schemas import Community, Entity, Relation, merge_descriptions
 from raglib.graphrag.store.base import BaseGraphStore
@@ -131,23 +131,37 @@ class Neo4jGraphStore(BaseGraphStore):
     def remove_chunks(self, chunk_ids: Iterable[str]) -> List[str]:
         """Remove chunk references; delete orphaned relations and entities."""
 
+        return self.remove_chunks_detailed(chunk_ids)[0]
+
+    def remove_chunks_detailed(self, chunk_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
+        """Remove chunk references; delete orphans; blank the description of what remains.
+
+        Neo4j keeps one merged description per node / relation, not one per chunk, so a description
+        that may quote a removed chunk is cleared (re-adding the remaining documents restores it).
+        """
+
         ids = list(chunk_ids)
         if not ids:
-            return []
+            return [], []
         self._run(
             "MATCH (:RagEntity {namespace: $namespace})-[r:RAG_REL]->() "
             "WHERE any(c IN r.chunks WHERE c IN $ids) "
-            "SET r.chunks = [c IN r.chunks WHERE NOT c IN $ids] "
+            "SET r.chunks = [c IN r.chunks WHERE NOT c IN $ids], r.description = '' "
             "WITH r WHERE size(r.chunks) = 0 DELETE r",
+            ids=ids,
+        )
+        changed = self._run(
+            "MATCH (e:RagEntity {namespace: $namespace}) WHERE any(c IN e.chunks WHERE c IN $ids) "
+            "AND size([c IN e.chunks WHERE NOT c IN $ids]) > 0 RETURN e.id AS id",
             ids=ids,
         )
         removed = self._run(
             "MATCH (e:RagEntity {namespace: $namespace}) WHERE any(c IN e.chunks WHERE c IN $ids) "
-            "SET e.chunks = [c IN e.chunks WHERE NOT c IN $ids] "
+            "SET e.chunks = [c IN e.chunks WHERE NOT c IN $ids], e.description = '' "
             "WITH e WHERE size(e.chunks) = 0 WITH e, e.id AS id DETACH DELETE e RETURN id",
             ids=ids,
         )
-        return [row["id"] for row in removed]
+        return [row["id"] for row in removed], [row["id"] for row in changed]
 
     def set_communities(self, communities: Sequence[Community]) -> None:
         """Replace communities and IN_COMMUNITY assignments."""

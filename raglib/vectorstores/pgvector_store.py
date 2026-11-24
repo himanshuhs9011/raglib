@@ -36,6 +36,8 @@ def filter_to_sql(filters: Optional[MetadataFilter]) -> Tuple[str, List[Any]]:
         if key in {"$and", "$or"}:
             parts = [filter_to_sql(item) for item in condition]
             if not parts:
+                if key == "$or":
+                    clauses.append("FALSE")  # an empty OR matches nothing (an empty AND everything)
                 continue
             joiner = " AND " if key == "$and" else " OR "
             clauses.append("(" + joiner.join(sql for sql, _ in parts) + ")")

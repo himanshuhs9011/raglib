@@ -7,9 +7,9 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from raglib.graphrag.schemas import Community, Entity, Relation, merge_descriptions
+from raglib.graphrag.schemas import Community, Entity, Relation, merge_descriptions, rebuild_description
 from raglib.graphrag.store.base import BaseGraphStore
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,13 @@ class NetworkXGraphStore(BaseGraphStore):
                         type=entity.type,
                         description=entity.description,
                         source_chunk_ids=list(dict.fromkeys(entity.source_chunk_ids)),
+                        descriptions=_fragments(entity),
                     )
                     changed.append(entity.id)
                     continue
                 before = existing.text_hash()
                 existing.description = merge_descriptions(existing.description, entity.description)
+                existing.descriptions.update(_fragments(entity))
                 if existing.type in {"", "CONCEPT"} and entity.type not in {"", "CONCEPT"}:
                     existing.type = entity.type
                 for chunk_id in entity.source_chunk_ids:
@@ -79,6 +81,7 @@ class NetworkXGraphStore(BaseGraphStore):
                         description=relation.description,
                         weight=relation.weight,
                         source_chunk_ids=list(dict.fromkeys(relation.source_chunk_ids)),
+                        descriptions=_fragments(relation),
                     )
                     self._relations[key] = stored
                     self._adjacency[relation.source].add(key)
@@ -89,12 +92,20 @@ class NetworkXGraphStore(BaseGraphStore):
                     existing.weight += relation.weight
                     existing.source_chunk_ids.extend(new_chunks)
                 existing.description = merge_descriptions(existing.description, relation.description)
+                existing.descriptions.update(_fragments(relation))
 
     def remove_chunks(self, chunk_ids: Iterable[str]) -> List[str]:
         """Drop chunk references and delete orphaned entities/relations."""
 
+        return self.remove_chunks_detailed(chunk_ids)[0]
+
+    def remove_chunks_detailed(self, chunk_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
+        """Like ``remove_chunks``; also rebuilds the descriptions of what remains from the remaining
+        chunks. Returns ``(removed entity ids, entity ids whose text changed)``."""
+
         removed_chunks = set(chunk_ids)
         removed_entities: List[str] = []
+        changed: List[str] = []
         with self._lock:
             for key in list(self._relations):
                 relation = self._relations[key]
@@ -106,18 +117,25 @@ class NetworkXGraphStore(BaseGraphStore):
                 else:
                     relation.weight = max(1.0, relation.weight * len(remaining) / len(relation.source_chunk_ids))
                     relation.source_chunk_ids = remaining
+                    relation.descriptions = {c: d for c, d in relation.descriptions.items() if c in remaining}
+                    relation.description = rebuild_description(relation, remaining)
             for entity_id in list(self._entities):
                 entity = self._entities[entity_id]
                 remaining = [c for c in entity.source_chunk_ids if c not in removed_chunks]
+                if len(remaining) == len(entity.source_chunk_ids):
+                    continue
                 if remaining:
                     entity.source_chunk_ids = remaining
+                    entity.descriptions = {c: d for c, d in entity.descriptions.items() if c in remaining}
+                    entity.description = rebuild_description(entity, remaining)
+                    changed.append(entity_id)
                     continue
                 for key in list(self._adjacency.get(entity_id, ())):
                     self._drop_relation(key)
                 self._adjacency.pop(entity_id, None)
                 del self._entities[entity_id]
                 removed_entities.append(entity_id)
-        return removed_entities
+        return removed_entities, changed
 
     def _drop_relation(self, key: str) -> None:
         """Remove a relation and its adjacency entries."""
@@ -262,3 +280,13 @@ class NetworkXGraphStore(BaseGraphStore):
                 self._adjacency[relation.source].add(relation.key)
                 self._adjacency[relation.target].add(relation.key)
             self._communities = {item["id"]: Community.from_dict(item) for item in payload.get("communities", [])}
+
+
+def _fragments(item: Any) -> Dict[str, str]:
+    """The per-chunk description fragment(s) an extracted entity/relation brings."""
+
+    known = dict(getattr(item, "descriptions", None) or {})
+    if item.description:
+        for chunk_id in item.source_chunk_ids:
+            known.setdefault(chunk_id, item.description)
+    return known

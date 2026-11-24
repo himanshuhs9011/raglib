@@ -21,6 +21,8 @@ def _point_id(document_id: str) -> str:
     return str(uuid.uuid5(_NAMESPACE, document_id))
 
 
+NEVER_KEY = "__raglib_never_matches__"  # no point has this payload key
+
 class QdrantVectorStore(BaseVectorStore):
     """Vector storage in Qdrant (cosine distance).
 
@@ -202,6 +204,9 @@ class QdrantVectorStore(BaseVectorStore):
                 must.extend(self.to_qdrant_filter(item) for item in condition)
                 continue
             if key == "$or":
+                if not condition:  # an empty OR matches nothing; Qdrant's empty "should" would match all
+                    must.append(models.FieldCondition(key=NEVER_KEY, match=models.MatchValue(value=NEVER_KEY)))
+                    continue
                 must.append(models.Filter(should=[self.to_qdrant_filter(item) for item in condition]))
                 continue
             operators = condition if isinstance(condition, dict) else {"$eq": condition}

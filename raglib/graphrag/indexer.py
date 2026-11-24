@@ -176,7 +176,7 @@ class GraphIndexer:
         if not ids:
             return
         with self._lock, self._rw.write():
-            removed = self.store.remove_chunks(ids)
+            removed, changed = self.store.remove_chunks_detailed(ids)
             self.extractor.forget(ids)
             if self.entity_vectors is not None and removed:
                 self.entity_vectors.delete(removed)
@@ -184,7 +184,26 @@ class GraphIndexer:
             self.skipped_chunk_ids.difference_update(ids)
             for chunk_id in ids:
                 self.extraction_attempts.pop(chunk_id, None)
+            self._clear_reports_built_from(set(ids), set(removed) | set(changed))
             self._dirty = True
+        self._embed_entities(changed)  # their text changed: a vector of the old text must not match
+
+    def _clear_reports_built_from(self, chunk_ids: set, entity_ids: set) -> None:
+        """Clear community reports written from a removed chunk (or about an entity that changed);
+        they are rewritten on the next community rebuild and are never served meanwhile."""
+
+        from raglib.graphrag.communities import member_chunk_ids
+
+        communities = self.store.communities()
+        stale = False
+        for community in communities:
+            sources = set(community.source_chunk_ids or member_chunk_ids(community, self.store))
+            if community.summary and (sources & chunk_ids or set(community.entity_ids) & entity_ids):
+                community.title, community.summary, community.findings = "", "", []
+                community.report_signature, community.embedding, community.source_chunk_ids = "", None, []
+                stale = True
+        if stale:
+            self.store.set_communities(communities)
 
     def _resolve(self, entities: List[Entity], relations: List[Relation]) -> Tuple[List[Entity], List[Relation]]:
         """Map new entity keys onto existing near-duplicate entities (embedding similarity)."""

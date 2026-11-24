@@ -43,6 +43,9 @@ class Entity:
     description: str = ""
     source_chunk_ids: List[str] = field(default_factory=list)
     community_ids: Dict[str, str] = field(default_factory=dict)  # level (str for JSON) -> community id
+    # chunk id -> the description extracted from that chunk, so removing a chunk can rebuild the
+    # merged ``description`` from what remains (deleted text must not survive in the graph).
+    descriptions: Dict[str, str] = field(default_factory=dict)
 
     def embedding_text(self) -> str:
         """Text used to embed the entity for query-time entity search."""
@@ -76,6 +79,7 @@ class Relation:
     description: str = ""
     weight: float = 1.0
     source_chunk_ids: List[str] = field(default_factory=list)
+    descriptions: Dict[str, str] = field(default_factory=dict)  # chunk id -> description (see Entity)
 
     @property
     def key(self) -> str:
@@ -162,3 +166,19 @@ class ExtractionResult:
             entities=[Entity.from_dict(item) for item in data.get("entities", [])],
             relations=[Relation.from_dict(item) for item in data.get("relations", [])],
         )
+
+
+def rebuild_description(item: Any, remaining: List[str]) -> str:
+    """The merged description of the chunks that remain, or ``""`` when a fragment is unknown.
+
+    Entities and relations from graphs saved before per-chunk fragments existed have no fragments:
+    their description is dropped rather than kept, because it may quote a removed chunk.
+    """
+
+    fragments = getattr(item, "descriptions", None) or {}
+    if any(chunk_id not in fragments for chunk_id in remaining):
+        return ""
+    merged = ""
+    for chunk_id in remaining:
+        merged = merge_descriptions(merged, fragments[chunk_id])
+    return merged

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Security: access-control leak fixes.**
+- **Deleted graph text no longer survives.** Removing or replacing a document used to trim an entity's or relation's source chunks but keep its merged description, so a public user could still read text from a deleted confidential chunk. Entities and relations now keep a description per source chunk (`Entity.descriptions`, `Relation.descriptions`) and rebuild the merged text from the chunks that remain. Graphs saved before this release have no per-chunk descriptions, so the description is dropped instead; Neo4j stores always drop it. Changed entities are re-embedded, and community reports built from a removed chunk are cleared until the next rebuild. A report is also hidden when one of its recorded source chunks is not visible.
+- **"Non-public" now means any restriction:** a level above the lowest, or a department or role restriction. Agent web search turns off after such a document, and the grounding judge always checks answers built from one.
+- **Conversation memory is keyed by user plus current permissions,** so a demoted user starts a new history instead of reading answers that quote documents above their new level. With access control, histories stored before this release are not found under the new key.
+- **An empty `$or` matches nothing in every store.** pgvector used to match everything; Qdrant now uses an explicit never-matching condition.
+
 **Security: the routing pipeline ignored filters on the hybrid and web routes (also fixed in 2.2.1).** With `rag_type="routing"`, only the vector and graph routes received `filters=` and the access-control filter. When the router chose hybrid or web, corpus documents outside the user's permissions could reach the prompt, including untagged and higher-level documents through `web_search_provider="local"`. Every route now gets the filters.
 
 **Public-dataset chunking benchmark.** `benchmarks/chunking/public_datasets.py` downloads BEIR SciFact (science), NFCorpus (nutrition / medicine), FiQA (finance) and a MIRACL Hindi subset from Hugging Face, and caches them in `~/.cache/raglib/bench`. It builds subsets with their relevance labels (judged documents plus random distractors) and runs `real_eval.py` on each with a local embedding model: `BAAI/bge-base-en-v1.5` for the English sets and `BAAI/bge-m3` for Hindi. No golden set is needed and there are no paid APIs. It needs `pip install raglib-py[hf] pyarrow`.

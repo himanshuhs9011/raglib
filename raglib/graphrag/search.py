@@ -70,6 +70,8 @@ class ChunkGate:
 
         member_ids = set(community.entity_ids)
         entities = store.get_entities(member_ids)
+        if community.source_chunk_ids and not self.all_allowed(community.source_chunk_ids):
+            return False  # written from a chunk this user may not see (or that no longer exists)
         return len(entities) == len(member_ids) and all(self.all_allowed(e.source_chunk_ids) for e in entities)
 
 

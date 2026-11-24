@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from raglib.graphrag.schemas import Community, Entity, Relation
 
@@ -31,6 +31,12 @@ class BaseGraphStore(ABC):
         """Drop chunk references; delete orphaned entities/relations. Returns removed entity ids."""
 
     @abstractmethod
+    def remove_chunks_detailed(self, chunk_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
+        """``(removed entity ids, entity ids whose text changed)``. Stores that cannot rebuild a
+        description should blank it for every entity/relation that lost a chunk."""
+
+        return self.remove_chunks(chunk_ids), []
+
     def set_communities(self, communities: Sequence[Community]) -> None:
         """Replace all communities (and the entity -> community assignments)."""
 
