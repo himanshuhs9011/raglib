@@ -96,12 +96,19 @@ class RouterRetriever:
         return route
 
     def retrieve_route(self, route: str, query: str, **kwargs: Any) -> List[Document]:
-        """Retrieve from a specific route."""
+        """Retrieve from a specific route.
 
+        ``filters`` restrict the corpus on every route: the hybrid route passes them to its corpus
+        search, and results that come from the corpus through a corpus-backed search provider
+        (``web_search_provider="local"``) are checked against them. Public web results are not
+        corpus documents, so filters do not apply to them.
+        """
+
+        filters = kwargs.get("filters")
         if route == ROUTE_WEB and self.web_retriever is not None:
-            return self.web_retriever.retrieve(query)
+            return _corpus_hits_filtered(self.web_retriever.retrieve(query), filters)
         if route == ROUTE_HYBRID and self.hybrid_retriever is not None:
-            return self.hybrid_retriever.retrieve(query)
+            return _corpus_hits_filtered(self.hybrid_retriever.retrieve(query, **kwargs), filters)
         if route == ROUTE_GRAPH and self.graph_retriever is not None:
             return self.graph_retriever.retrieve(query, **kwargs)
         return self.vector_retriever.retrieve(query, **kwargs)
@@ -110,3 +117,19 @@ class RouterRetriever:
         """Route then retrieve."""
 
         return self.retrieve_route(self.route(query), query, **kwargs)
+
+
+CORPUS_BACKED_PROVIDERS = {"local_web"}
+
+
+def _corpus_hits_filtered(documents: List[Document], filters: Any) -> List[Document]:
+    """Drop corpus documents (returned by a corpus-backed search provider) that fail ``filters``."""
+
+    if not filters:
+        return documents
+    from raglib.vectorstores.base_store import matches_filter
+
+    return [
+        doc for doc in documents
+        if doc.metadata.get("provider") not in CORPUS_BACKED_PROVIDERS or matches_filter(doc.metadata, filters)
+    ]

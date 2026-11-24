@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.2.1 - unreleased
+
+**Security: the routing pipeline ignored `filters=` on two routes.** With `rag_type="routing"`, `query(..., filters=...)` restricted only the `vector` and `graph` routes. When the router chose `hybrid` or `web`, retrieval ignored the filters, and with `web_search_provider="local"` (which searches your corpus) documents outside the filter could reach the answer prompt and the sources. Both routes now apply the filters to every corpus result. Public web results are not corpus documents, so filters still do not apply to them. Upgrade if you use `rag_type="routing"` with filters for tenant or permission scoping.
+
 ## 2.2.0 - 2026-11-21
 
 **Benchmark.** raglib's RAG types are now measured on MultiHop-RAG, a public third-party dataset: method, code and every answer are in `benchmarks/multihop_rag/`, and results are on the website's Benchmarks page.
