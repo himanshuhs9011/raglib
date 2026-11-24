@@ -127,3 +127,29 @@ def test_beir_subset_from_parquet(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(public, "download", lambda url, target: next(p for k, p in files.items() if k in url))
     docs_dir, golden, info = public.prepare_beir("scifact", tmp_path / "cache", max_queries=10, max_docs=2, seed=1)
     assert info["queries"] == 1 and len(list(docs_dir.glob("*.txt"))) == 2 and "a.txt" in golden.read_text(encoding="utf-8")
+
+
+def test_a_snippet_straddling_a_chunk_boundary_counts_when_both_chunks_are_retrieved() -> None:
+    text = "Intro words here. The launch window opens in March and closes in April. Outro words follow."
+    cut = text.index("in March")  # the snippet is split across two chunks
+    first = Document(id="c1", content=text[:cut], metadata={"parent_id": "d", "start_char": 0, "end_char": cut})
+    second = Document(id="c2", content=text[cut:], metadata={"parent_id": "d", "start_char": cut, "end_char": len(text)})
+    row = {"relevant_text": ["The launch window opens in March and closes in April."], "relevant_ids": []}
+    assert real_eval.score([first, second], row, 2, {"d": text}) == (1.0, 1.0)  # covered together: a hit
+    assert real_eval.score([first], row, 1, {"d": text})[0] == 0.0  # half of it: not found
+    assert real_eval.score([first, second], row, 2)[0] == 0.0  # without offsets: the old containment rule
+
+
+def test_counting_embedding_passes_the_model_tokenizer_and_limit_through() -> None:
+    from raglib.embedding.mock_embedding import MockEmbedding
+
+    class Model(MockEmbedding):
+        @property
+        def max_input_tokens(self):
+            return 512
+
+        def count_input_tokens(self, text):
+            return 2 * len(text.split())
+
+    counting = real_eval.CountingEmbedding(Model())
+    assert counting.max_input_tokens == 512 and counting.count_input_tokens("a b c") == 6

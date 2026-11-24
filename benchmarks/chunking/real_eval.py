@@ -21,9 +21,17 @@ Golden set: one JSON object per line (see ``golden.example.jsonl``)::
 relevant when it contains one of the snippets (case- and whitespace-insensitive). ``relevant_ids``
 (document ids, or file paths absolute or relative to ``--docs``) works too.
 
-Reported per configuration: recall@k, precision@k, number of chunks, average chunk size (tiktoken
-tokens when installed), and the embedding tokens/cost that configuration needs on its own. Configs
-share one embedding cache, so the real spend is lower than the sum of the rows.
+Reported per configuration: recall@k, precision@k, number of chunks, average chunk size, and the
+embedding tokens/cost that configuration needs on its own. Configs share one embedding cache, so the
+real spend is lower than the sum of the rows.
+
+Chunk sizes (``--chunk-size``, the size column) are measured with the embedding model's own tokenizer
+when it has one (local Hugging Face models), so "fixed 500" means 500 model tokens: chunks fit a
+512-token model and are never split into fragments to fit it. Without a tokenizer, tiktoken.
+
+Scoring by ``relevant_text``: a snippet counts as found when the retrieved chunks *together* cover it
+in its document (chunk character offsets), so a snippet that straddles a chunk boundary is a hit when
+both chunks are retrieved; a retrieved chunk is relevant when it overlaps a snippet.
 """
 
 from __future__ import annotations
@@ -51,6 +59,13 @@ class CountingEmbedding(BaseEmbedding):
     def __init__(self, inner: BaseEmbedding) -> None:
         self.inner = inner
         self.tokens = 0
+
+    @property
+    def max_input_tokens(self) -> Optional[int]:
+        return self.inner.max_input_tokens  # the real limit (512 for bge-base), not a guess
+
+    def count_input_tokens(self, text: str) -> Optional[int]:
+        return self.inner.count_input_tokens(text)  # the model's own tokenizer
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         self.tokens += sum(count_tokens(text) for text in texts)
@@ -94,16 +109,72 @@ def load_golden(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def score(sources: Sequence[Any], row: Dict[str, Any], k: int) -> Tuple[float, float]:
-    """(recall@k, precision@k) for one question."""
+def _snippet_spans(text: str, snippet: str) -> List[Tuple[int, int]]:
+    """Where ``snippet`` occurs in ``text`` (case- and whitespace-insensitive)."""
+
+    words = snippet.split()
+    if not words:
+        return []
+    pattern = r"\s+".join(re.escape(word) for word in words)
+    return [match.span() for match in re.finditer(pattern, text, flags=re.IGNORECASE)]
+
+
+def _covered(span: Tuple[int, int], intervals: List[Tuple[int, int]]) -> bool:
+    """True when the union of ``intervals`` covers ``span`` (whitespace gaps between chunks allowed)."""
+
+    start, end = span
+    reach = start
+    for a, b in sorted(intervals):
+        if a > reach + 1:  # a gap (one separator character is fine)
+            if a >= end:
+                break
+            return False
+        reach = max(reach, b)
+        if reach >= end:
+            return True
+    return reach >= end
+
+
+def score(sources: Sequence[Any], row: Dict[str, Any], k: int, documents: Optional[Dict[str, str]] = None) -> Tuple[float, float]:
+    """(recall@k, precision@k) for one question.
+
+    With ``documents`` (document id -> text) and chunk offsets, ``relevant_text`` snippets are
+    matched by coverage: found when the retrieved chunks of a document together cover an occurrence;
+    a chunk is relevant when it overlaps one. Otherwise a chunk must contain the whole snippet.
+    """
 
     top = list(sources)[:k]
     if row["relevant_text"]:
-        snippets = [_normalize(text) for text in row["relevant_text"]]
+        snippets = [text for text in row["relevant_text"] if text.strip()]
+        positioned = documents is not None and all(
+            "start_char" in doc.metadata and "end_char" in doc.metadata and doc.metadata.get("parent_id") in documents
+            for doc in top
+        )
+        if positioned:
+            found, relevant = 0, set()
+            spans_by_doc: Dict[str, List[Tuple[int, int]]] = {}
+            for index, doc in enumerate(top):
+                spans_by_doc.setdefault(doc.metadata["parent_id"], []).append((doc.metadata["start_char"], doc.metadata["end_char"]))
+            for snippet in snippets:
+                hit = False
+                for parent, text in documents.items():
+                    occurrences = _snippet_spans(text, snippet)
+                    if not occurrences:
+                        continue
+                    if any(_covered(span, spans_by_doc.get(parent, [])) for span in occurrences):
+                        hit = True
+                    for index, doc in enumerate(top):
+                        if doc.metadata["parent_id"] == parent and any(
+                            doc.metadata["start_char"] < b and doc.metadata["end_char"] > a for a, b in occurrences
+                        ):
+                            relevant.add(index)
+                found += hit
+            return found / len(snippets), len(relevant) / k
+        normalized = [_normalize(text) for text in snippets]
         contents = [_normalize(doc.content) for doc in top]
-        found = sum(1 for snippet in snippets if any(snippet in content for content in contents))
-        relevant_chunks = sum(1 for content in contents if any(snippet in content for snippet in snippets))
-        return found / len(snippets), relevant_chunks / k
+        found = sum(1 for snippet in normalized if any(snippet in content for content in contents))
+        relevant_chunks = sum(1 for content in contents if any(snippet in content for snippet in normalized))
+        return found / len(normalized), relevant_chunks / k
     wanted = [_path(item) for item in row["relevant_ids"]]
     hits = [any(_matches_id(doc, item) for item in wanted) for doc in top]
     covered = sum(1 for item in wanted if any(_matches_id(doc, item) for doc in top))
@@ -143,6 +214,14 @@ def configurations(args: argparse.Namespace) -> List[Tuple[str, Dict[str, Any]]]
     return configs
 
 
+def load_embedding(provider: str, model: str) -> BaseEmbedding:
+    """The shared embedding model (a seam for tests: replace it with a fake)."""
+
+    from raglib import RAG
+
+    return RAG(chat_llm="mock", embedding_llm=provider, embedding_model=model or None, token_counter="auto")._embedding
+
+
 def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--docs", required=True, help="folder (or file) with your documents")
@@ -179,24 +258,33 @@ def main(argv: List[str]) -> int:
         print(f"'{provider}' is a paid API: nothing was sent. Check the estimate above and re-run with --yes to run it.")
         return 2
 
-    shared = RAG(chat_llm="mock", embedding_llm=provider, embedding_model=model or None, token_counter="auto")._embedding
+    shared = load_embedding(provider, model)
+    from raglib.embedding.limits import TOKENIZER_SAMPLE
+
+    model_tokens = shared.count_input_tokens(TOKENIZER_SAMPLE) is not None
+    token_counter: Any = (lambda text: shared.count_input_tokens(text) or 0) if model_tokens else "auto"
+    measure = token_counter if model_tokens else count_tokens
+    unit = "the embedding model's tokens" if model_tokens else "tiktoken tokens (no model tokenizer)"
+    print(f"Chunk sizes in {unit}.")
+    texts = {doc.id: doc.content for doc in documents}
     rows: List[Dict[str, Any]] = []
     for label, options in configs:
         counting = CountingEmbedding(shared)
         rag = RAG(
-            chat_llm="mock", embedding_llm=counting, vector_db="memory", retrieval_mode=args.mode, token_counter="auto",
+            chat_llm="mock", embedding_llm=counting, vector_db="memory", retrieval_mode=args.mode, token_counter=token_counter,
             chunk_size=args.chunk_size, chunk_overlap=args.overlap if options["chunking_strategy"] == "fixed" else 0,
             top_k=args.k, **options,
         )
         rag.add(documents)
         chunks = rag.retriever.documents
-        scores = [score(rag.retriever.retrieve(row["question"], top_k=args.k), row, args.k) for row in golden]
+        scores = [score(rag.retriever.retrieve(row["question"], top_k=args.k), row, args.k, texts) for row in golden]
         rows.append({
             "config": label,
             "recall": statistics.fmean(recall for recall, _ in scores),
             "precision": statistics.fmean(precision for _, precision in scores),
             "chunks": len(chunks),
-            "avg_tokens": statistics.fmean(count_tokens(chunk.content) for chunk in chunks) if chunks else 0.0,
+            "avg_tokens": statistics.fmean(measure(chunk.content) for chunk in chunks) if chunks else 0.0,
+            "split_to_fit": rag.ingest_usage()["oversized_chunks_split"],
             "embedding_tokens": counting.tokens,
             "usd": counting.tokens * args.price_per_1m / 1e6 if args.price_per_1m is not None else None,
             "fallbacks": rag.ingest_usage()["chunking_fallbacks"],
@@ -204,12 +292,12 @@ def main(argv: List[str]) -> int:
         print(f"  done: {label}")
 
     k = args.k
-    print(f"\n| config | recall@{k} | precision@{k} | chunks | avg tokens | embedding tokens | cost |")
-    print("| :--- |" + " ---: |" * 6)
+    print(f"\n| config | recall@{k} | precision@{k} | chunks | avg tokens | split to fit model | embedding tokens | cost |")
+    print("| :--- |" + " ---: |" * 7)
     for row in rows:
         usd = f"${row['usd']:.4f}" if row["usd"] is not None else "-"
         print(f"| {row['config']} | {row['recall']:.3f} | {row['precision']:.3f} | {row['chunks']} | "
-              f"{row['avg_tokens']:.0f} | {row['embedding_tokens']:,} | {usd} |")
+              f"{row['avg_tokens']:.0f} | {row['split_to_fit']} | {row['embedding_tokens']:,} | {usd} |")
     if any(row["fallbacks"] for row in rows):
         print("\nWarning: some documents fell back to recursive chunking (embedding errors); see ingest_usage().")
     if args.json:

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Benchmark fix: `real_eval.py` measures what it says.**
+- Its counting wrapper hid the embedding model's tokenizer, so the model limit was estimated (90% of 512 = 460 tiktoken tokens), and "fixed 500/100" chunks between 460 and 512 tokens were split into fragments.
+- Chunk sizes are now measured with the embedding model's own tokenizer, and the model's real limit is used. "Fixed 500" means 500 model tokens.
+- A snippet that straddles a chunk boundary counts as found when the retrieved chunks together cover it (chunk offsets), and a chunk counts toward precision when it overlaps a snippet. The old containment rule penalized smaller chunks.
+- A "split to fit model" column shows any remaining splits.
+- Smoke run with a fake bge-like model (12 documents of about 1,450 words, 48 questions): the old script turned "fixed 500/100" into 72 chunks, 24 of them fragments under 64 tokens. The new one makes 48 chunks of 286-462 tokens with no splits.
+
 **Cost and usage accuracy.**
 - **Streams closed early are priced.** When a guard truncated or blocked a streamed answer, the native HTTP and LangChain clients stopped before recording usage, so the run reported 0 tokens and budgets were not charged. Usage is now recorded in a `finally`, estimated when the provider sent none.
 - **Every parallel guard finishes before the trace does.** On a block, the other guards are waited for first: their stages come before `total`, and their usage and cost are counted.
