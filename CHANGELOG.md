@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.2.1 - unreleased
+## 2.2.1 - 2026-11-25
 
 **Security: `filters=` was not enforced on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search over the corpus, but the paths below ignored it. Documents outside the filter could reach the answer prompt and `result.sources`. Upgrade if you use filters for tenant or permission scoping. This release contains only these fixes, and queries without `filters=` behave exactly as in 2.2.0.
 
@@ -16,9 +16,9 @@ Fixed, now apply the filter:
 - `rag_type="routing"`: a filtered query routed to `graph` uses the filtered `vector` route instead.
 - `rag_type="agentic"`: the `graph_search` tool is not offered to the agent when the query has filters.
 
-Custom retrievers written for 2.2 keep working:
-- A custom web retriever whose `retrieve()` has no `filters` parameter is called without filters, and a warning is logged once.
-- A custom hybrid (corpus + web) retriever without a `filters` parameter raises `FilterNotSupportedError` on a filtered query, because it would search the corpus unfiltered. Unfiltered queries call it exactly as before.
+**Behaviour change: a custom hybrid retriever without a `filters` parameter now raises on filtered queries.** If you pass your own hybrid (corpus + web) retriever and its `retrieve()` does not accept `filters`, a query with `filters=` now raises `FilterNotSupportedError`. In 2.2.0 it was called without the filter. Why: a hybrid retriever searches your corpus, so calling it without the filter would return corpus documents outside it. Unfiltered queries call it exactly as before. To fix it, add a `filters` parameter to `retrieve()` and apply it to the corpus search, for example `def retrieve(self, query, filters=None): ...` passing `filters=filters` to your corpus retriever.
+
+A custom web retriever whose `retrieve()` has no `filters` parameter keeps working: it is called without filters, and a warning is logged once. Web results are not corpus documents.
 
 **Known limit.** Only the built-in corpus provider (`web_search_provider="local"`) can apply filters. Any other search provider, including your own provider that searches private data, is called without them. When a query has filters, raglib logs `filters were not applied by provider <name>` once per provider and does not raise. Public web results are not corpus documents, so this is expected for providers like DuckDuckGo or Tavily. Filter inside a custom provider that searches private data yourself.
 
