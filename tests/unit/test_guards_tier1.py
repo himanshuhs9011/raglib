@@ -222,7 +222,8 @@ def test_openai_chat_provider_gets_the_moderation_endpoint() -> None:
 
 def test_label_score_reads_pipeline_outputs() -> None:
     assert label_score([[{"label": "INJECTION", "score": 0.8}, {"label": "SAFE", "score": 0.2}]], ["injection"]) == 0.8
-    assert label_score([{"label": "SAFE", "score": 0.9}], ["injection"]) == pytest.approx(0.1)
+    assert label_score([{"label": "SAFE", "score": 0.9}], ["injection"], ["safe"]) == pytest.approx(0.1)
+    assert label_score([{"label": "SAFE", "score": 0.9}], ["injection"]) is None  # SAFE not declared: unsure
     assert label_score(0.42, ["x"]) == 0.42
 
 

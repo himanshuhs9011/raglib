@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Security: guard bypass and leak fixes.**
+- **One LLM gate for every client.** Waiting for the parallel input guards used to live inside particular clients, so with `llm_cache=False` and your own client or a LangChain model, the agent's planner or the query rewriter could call the model before a guard blocked. `RAG` now wraps every model it uses in one `GatedLLMClient`, which waits before complete, JSON, chat, stream and async calls. No streamed token is produced before the guards decide.
+- **Streams own their context.** A stream's trace, usage meter, guard scope and gate used to live in context variables across its `yield`s. They leaked into other queries made between two `next()` calls, and they were lost when a framework ran each step in a fresh context (Starlette): flags dropped, usage was 0 and budgets were not charged. Every stream step now runs in the stream's own context (`raglib.core.runtime.isolated`).
+- **Guard errors are sanitized before truncating.** A guard that raised with a long question in its message used to leak the question's start into metadata, the trace and logs.
+- **Unreadable classifier outputs are unsure, never safe.** An unknown label, `None`, a string or an out-of-range score from a local model used to read as "safe" with confidence 1.0. They now count as unsure: they escalate to the judge, or security guards fail closed. Classifier guards declare `negative_labels` (e.g. `SAFE`, `neutral`) so known negatives still read correctly.
+- **The agent's web query also drops glued and spelled-out copies of document text** (`ZXSECRET42`, `Z X S E C R E T 4 2`), not only split-up ones.
+
 **Security: access-control leak fixes.**
 - **Deleted graph text no longer survives.** Removing or replacing a document used to trim an entity's or relation's source chunks but keep its merged description, so a public user could still read text from a deleted confidential chunk. Entities and relations now keep a description per source chunk (`Entity.descriptions`, `Relation.descriptions`) and rebuild the merged text from the chunks that remain. Graphs saved before this release have no per-chunk descriptions, so the description is dropped instead; Neo4j stores always drop it. Changed entities are re-embedded, and community reports built from a removed chunk are cleared until the next rebuild. A report is also hidden when one of its recorded source chunks is not visible.
 - **"Non-public" now means any restriction:** a level above the lowest, or a department or role restriction. Agent web search turns off after such a document, and the grounding judge always checks answers built from one.

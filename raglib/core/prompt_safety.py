@@ -117,14 +117,28 @@ def safe_web_query(question: str, model_input: str, retrieved_texts: Iterable[st
     question_words = _WORD_RE.findall(question or "")
     seen = {word.casefold() for word in question_words}
     document_words = set()
+    squashed_documents = []  # alphanumerics only: "ZX-SECRET-42 Zeta Corp" -> "zxsecret42zetacorp"
     for text in retrieved_texts:
         for word in _WORD_RE.findall(text or ""):
             document_words.add(word.casefold())
             document_words.update(part for part in _parts(word) if part)  # "ZX-SECRET-42" -> zx, secret, 42
+        squashed_documents.append(_squash(text or ""))
+
+    def copied(fragment: str) -> bool:
+        """A glued-together copy of document text ("ZXSECRET42", "Zetacorp")."""
+
+        squashed = _squash(fragment)
+        return len(squashed) >= GLUED_MIN_CHARS and any(squashed in text for text in squashed_documents)
+
+    words = _WORD_RE.findall(model_input or "")
+    spelled = _spelled_out_runs(words)  # "Z X S E C R E T 4 2": single characters, rejoined
     keywords = []
-    for word in _WORD_RE.findall(model_input or ""):
+    for index, word in enumerate(words):
         key = word.casefold()
-        if key in seen or key in document_words or any(part in document_words for part in _parts(word)):
+        run = spelled.get(index)
+        if run is not None and copied(run):
+            continue
+        if key in seen or key in document_words or any(part in document_words for part in _parts(word)) or copied(word):
             continue
         seen.add(key)
         keywords.append(word)
@@ -135,6 +149,30 @@ def safe_web_query(question: str, model_input: str, retrieved_texts: Iterable[st
             break
         query = candidate
     return query
+
+
+GLUED_MIN_CHARS = 6  # shorter fragments occur inside ordinary words too often to judge
+
+
+def _squash(text: str) -> str:
+    return "".join(ch for ch in text.casefold() if ch.isalnum())
+
+
+def _spelled_out_runs(words: list) -> dict:
+    """word index -> the joined run of 3+ consecutive single-character words it belongs to."""
+
+    runs: dict = {}
+    start = None
+    for index in range(len(words) + 1):
+        single = index < len(words) and len(words[index]) == 1
+        if single and start is None:
+            start = index
+        elif not single and start is not None:
+            if index - start >= 3:
+                joined = "".join(words[start:index])
+                runs.update({position: joined for position in range(start, index)})
+            start = None
+    return runs
 
 
 def _parts(word: str) -> list:

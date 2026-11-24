@@ -51,6 +51,7 @@ class ModelGuard(Guard):
     parallel = True
     task = ""
     positive_labels: Tuple[str, ...] = ()
+    negative_labels: Tuple[str, ...] = ()  # labels known to mean "not positive"; anything else is unsure
 
     def __init__(
         self,
@@ -162,10 +163,12 @@ class ModelGuard(Guard):
             decision = allow(reason=reason, confidence=0.0)
         return _with_mode(decision, self.mode)
 
-    def _local_probability(self, text: str) -> float:
+    def _local_probability(self, text: str) -> Optional[float]:
+        """The local model's probability, or ``None`` when its output cannot be read (unsure)."""
+
         assert self._local is not None
         output = self._local(text[:2000]) if self._local_is_pipeline else self._local(text)
-        return label_score(output, self.positive_labels)
+        return label_score(output, self.positive_labels, self.negative_labels)
 
 
 class TopicGuard(Guard):
@@ -321,15 +324,13 @@ class InjectionClassifier(_InputSafetyGuard):
     task = "injection"
     judge_flag = "injection"
     positive_labels = ("injection", "label_1", "jailbreak", "unsafe")
+    negative_labels = ("safe", "benign", "legit", "label_0")
     block_message = "This question looks like an attempt to change the assistant's instructions, so it was not answered."
 
     def _tier1(self, value: str) -> Tuple[Decision, bool]:
-        if self.mode == "local":
-            p = self._local_probability(value)
-        else:
-            p = self._api_probability(value)
-            if p is None:
-                return self._unsure(f"unparseable verdict ({self.backend}): unsure"), True
+        p = self._local_probability(value) if self.mode == "local" else self._api_probability(value)
+        if p is None:
+            return self._unsure(f"unreadable verdict ({self.mode}: {self.backend}): unsure"), True
         reason = f"injection p={p:.2f} ({self.mode}: {self.backend})"
         if p >= self.threshold:
             return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode), False
@@ -357,6 +358,7 @@ class ToxicityClassifier(_InputSafetyGuard):
     task = "toxicity"
     judge_flag = "toxic"
     positive_labels = ("toxic", "toxicity", "severe_toxic", "obscene", "threat", "insult", "identity_hate", "label_1")
+    negative_labels = ("non-toxic", "non_toxic", "nontoxic", "not_toxic", "neutral", "label_0")
     block_message = "This message was not answered because it appears to contain abusive or harmful content."
 
     def __init__(self, threshold: float = 0.7, check_answers: bool = False, moderation: Any = None, **kwargs: Any):
@@ -379,8 +381,8 @@ class ToxicityClassifier(_InputSafetyGuard):
             p = float(self._moderation.score(value))
         else:
             p = self._api_probability(value)
-            if p is None:
-                return self._unsure(f"unparseable verdict ({self.backend}): unsure"), True
+        if p is None:
+            return self._unsure(f"unreadable verdict ({self.mode}: {self.backend}): unsure"), True
         reason = f"toxicity p={p:.2f} ({self.mode}: {self.backend})"
         if p >= self.threshold:
             return _with_mode(block(self.block_message, reason=reason, confidence=_certainty(p)), self.mode), False
@@ -420,6 +422,7 @@ class GroundingGuard(ModelGuard):
     stages = ("output",)
     parallel = False
     positive_labels = ("entailment", "entailed", "supported")
+    negative_labels = ("neutral", "contradiction", "not_entailment")
     block_message = "I couldn't verify this answer against the documents, so it was withheld."
 
     def __init__(
@@ -466,6 +469,10 @@ class GroundingGuard(ModelGuard):
         sentences = sentences[: self.max_sentences]
         if self.mode == "local":
             supported = self._local_supported(sentences, sources)
+            if supported is None:  # the NLI output could not be read: unsure
+                tier1 = self._unsure(f"unreadable NLI output (local: {self.backend}): unsure")
+                why = self._escalation(tier1, True, context)
+                return self._escalate(value, sources, tier1, why, non_public) if why else tier1
             tier1 = self._verdict(supported, f"{supported:.0%} of the answer supported (local: {self.backend})")
             why = "non-public sources" if non_public and self._judge is not None else self._escalation(tier1, False, context)
             return self._escalate(value, sources, tier1, why, non_public) if why else tier1
@@ -502,7 +509,9 @@ class GroundingGuard(ModelGuard):
         decision.judge = "cached" if result.cached else result.status
         return decision
 
-    def _local_supported(self, sentences: List[str], sources: List[str]) -> float:
+    def _local_supported(self, sentences: List[str], sources: List[str]) -> Optional[float]:
+        """Share of supported sentences, or ``None`` when an NLI output cannot be read."""
+
         assert self._local is not None
         hits = 0
         for sentence in sentences:
@@ -513,7 +522,10 @@ class GroundingGuard(ModelGuard):
                     self._local({"text": premise, "text_pair": sentence}) if self._local_is_pipeline
                     else self._local(premise, sentence)
                 )
-                best = max(best, label_score(output, self.positive_labels))
+                score = label_score(output, self.positive_labels, self.negative_labels)
+                if score is None:
+                    return None
+                best = max(best, score)
                 if best >= self.threshold:
                     break
             hits += best >= self.threshold

@@ -275,3 +275,28 @@ def guard_join() -> None:
     gate = _GUARD_GATE.get()
     if gate is not None:
         gate.join()
+
+
+def isolated(generator: Iterator[Any]) -> Iterator[Any]:
+    """Run every step of ``generator`` inside one context that belongs to this stream.
+
+    A streaming run keeps per-run state in context variables (trace, usage meter, guard scope and
+    gate) across its ``yield``s. Run plainly, that state would leak into whatever the caller does
+    between two ``next()`` calls (another query would inherit it), and a framework that runs each
+    ``next()`` in a fresh copy of its own context (Starlette's ``iterate_in_threadpool``) would lose
+    it between steps. Here every step runs with ``Context.run`` in the stream's own context: the
+    state survives across steps and never reaches the caller. Returns the generator's return value.
+    """
+
+    import contextvars
+
+    context = contextvars.copy_context()
+    try:
+        while True:
+            try:
+                value = context.run(next, generator)
+            except StopIteration as stop:
+                return stop.value
+            yield value
+    finally:
+        context.run(generator.close)

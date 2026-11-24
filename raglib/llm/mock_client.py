@@ -27,10 +27,9 @@ class MockLLMClient(BaseLLMClient):
     def complete(self, prompt: str, system: str = "") -> str:
         """Return a deterministic completion keyed on the prompt's purpose (usage is estimated)."""
 
-        from raglib.core.runtime import guard_join, record_usage
+        from raglib.core.runtime import record_usage
         from raglib.core.text import count_tokens
 
-        guard_join()
         answer = self._respond(prompt, system)
         record_usage(count_tokens(f"{system}\n{prompt}"), count_tokens(answer), estimated=True, model="mock/mock")
         return answer

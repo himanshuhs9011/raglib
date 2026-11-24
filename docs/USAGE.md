@@ -714,7 +714,8 @@ rag = RAG(
 These figures are rough: they depend on hardware, text length and your model prices. Measure your own with `LatencyStats` (each guard is its own stage) and `CostReport` (each guard on its own line).
 
 **Parallel with retrieval.** Tier 1 input classifiers (`InjectionClassifier`, `ToxicityClassifier`, or any guard with `tier >= 1` and `parallel = True`) start in worker threads while retrieval runs:
-- Every LLM call waits for them first: generation, and also the agent's planner, the query rewriter and the router. A blocked question therefore never reaches a model.
+- Every LLM call waits for them first: generation, and also the agent's planner, the query rewriter and the router. `RAG` puts one gate (`GatedLLMClient`) in front of every model it uses, so this holds for any client, including your own `BaseLLMClient` and LangChain models, with or without `llm_cache`. A blocked question therefore never reaches a model, and a stream emits no token before the guards have decided.
+- Each stream runs in its own context, so iterating it from a web framework that gives every `next()` a fresh context (Starlette's `iterate_in_threadpool`), or interleaving it with other queries, keeps its guards, flags, usage and budget to itself.
 - When a guard blocks, the next pipeline stage to start (a vector search, the reranker, a tool call) is cancelled instead of running. The result carries `blocked_by` and a `retrieval_cancelled` tag on the trace.
 - The trade-off: retrieval work that had already started (embedding the query, a vector search) is paid for even when the question is then blocked. A model call never is.
 - `TopicGuard` runs first, not in parallel, because its embedding call is the one retrieval then reuses.

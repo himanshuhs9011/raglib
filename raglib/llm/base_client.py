@@ -107,9 +107,7 @@ class CachedLLMClient(BaseLLMClient):
         """Return a cached completion or call the wrapped client."""
 
         from raglib.cache import caching_allowed
-        from raglib.core.runtime import guard_join
 
-        guard_join()  # parallel input guards decide before any model call
         if not caching_allowed():
             return self.inner.complete(prompt=prompt, system=system)
         key = hashlib.sha256(f"{system}\x00{prompt}".encode("utf-8")).hexdigest()
@@ -127,9 +125,7 @@ class CachedLLMClient(BaseLLMClient):
         import json
 
         from raglib.cache import caching_allowed
-        from raglib.core.runtime import guard_join
 
-        guard_join()
         if not caching_allowed():
             value = self.inner.complete_json(prompt, system=system, default=_MISSING)
             return default if value is _MISSING else value
@@ -157,17 +153,11 @@ class CachedLLMClient(BaseLLMClient):
     def chat(self, messages: List[Dict[str, str]]) -> str:
         """Delegate chat calls without caching (transcripts rarely repeat)."""
 
-        from raglib.core.runtime import guard_join
-
-        guard_join()
         return self.inner.chat(messages)
 
     def stream(self, prompt: str, system: str = "") -> Iterator[str]:
         """Delegate streaming to the wrapped client."""
 
-        from raglib.core.runtime import guard_join
-
-        guard_join()
         return self.inner.stream(prompt=prompt, system=system)
 
     def __getattr__(self, name: str) -> Any:
@@ -268,9 +258,64 @@ class FallbackLLMClient(BaseLLMClient):
         return getattr(self.clients[0], "rate_limiter", None)
 
 
-def unwrap_llm(client: Optional[BaseLLMClient]) -> Optional[BaseLLMClient]:
-    """Return the innermost client behind caching wrappers."""
+class GatedLLMClient(BaseLLMClient):
+    """The one gate every model call of a ``RAG`` passes through (``RAG`` wraps each model it uses).
 
-    while isinstance(client, CachedLLMClient):
+    Before any call - complete, JSON, chat, stream, async - it waits for the query's parallel input
+    guards (``raglib.core.runtime.guard_join``), whatever the client type and cache setting, so a
+    question a guard blocks never reaches a model and no streamed token is produced before the
+    guards decided. Outside a guarded query it is a pass-through.
+    """
+
+    def __init__(self, inner: BaseLLMClient):
+        self.inner = inner
+
+    @staticmethod
+    def _wait() -> None:
+        from raglib.core.runtime import guard_join
+
+        guard_join()
+
+    def complete(self, prompt: str, system: str = "") -> str:
+        self._wait()
+        return self.inner.complete(prompt=prompt, system=system)
+
+    def complete_json(self, prompt: str, system: str = "", default: Any = None) -> Any:
+        self._wait()
+        return self.inner.complete_json(prompt, system=system, default=default)
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        self._wait()
+        return self.inner.chat(messages)
+
+    def stream(self, prompt: str, system: str = "") -> Iterator[str]:
+        self._wait()  # before the request is even sent
+        yield from self.inner.stream(prompt=prompt, system=system)
+
+    async def acomplete(self, prompt: str, system: str = "") -> str:
+        import asyncio
+
+        return await asyncio.to_thread(self.complete, prompt, system)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "inner":
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+
+def unwrap_llm(client: Optional[BaseLLMClient]) -> Optional[BaseLLMClient]:
+    """Return the innermost client behind caching and gating wrappers."""
+
+    while isinstance(client, (CachedLLMClient, GatedLLMClient)):
         client = client.inner
     return client
+
+
+def llm_cache_of(client: Optional[BaseLLMClient]) -> Optional["CachedLLMClient"]:
+    """The ``CachedLLMClient`` inside ``client``'s wrappers, if any."""
+
+    while client is not None:
+        if isinstance(client, CachedLLMClient):
+            return client
+        client = getattr(client, "inner", None) if isinstance(client, GatedLLMClient) else None
+    return None

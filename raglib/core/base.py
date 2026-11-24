@@ -229,9 +229,21 @@ class BaseRAG:
         Output guards: when all are ``streaming_safe`` (leak masking, citation access, truncation)
         the answer streams in checked pieces (``raglib.guards.streaming``: up to a sentence behind
         the model); any other output guard (JSON schema, ...) makes the answer arrive in one piece
-        after it was checked.
+        after it was checked. Each step runs in the stream's own context (``isolated``).
         """
 
+        from raglib.core.runtime import isolated
+
+        return (yield from isolated(self._stream_steps(query, session_id, filters, tracer, meter)))
+
+    def _stream_steps(
+        self,
+        query: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        tracer: Optional[Tracer],
+        meter: Optional[UsageMeter],
+    ) -> GeneratorType[str, None, Optional[GenerationResult]]:
         if type(self).answer is not BaseRAG.answer or self.generator is None:
             result = self.run(query, session_id=session_id, filters=filters, tracer=tracer, meter=meter)
             yield result.answer

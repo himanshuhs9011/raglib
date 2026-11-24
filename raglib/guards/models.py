@@ -72,30 +72,46 @@ def load_local_model(spec: Any, task: str, allow_download: bool = False) -> Call
     return transformers.pipeline(pipeline_task, model=model, tokenizer=tokenizer, top_k=None)
 
 
-def label_score(output: Any, positive: Sequence[str]) -> float:
-    """Probability of the positive label(s) from a scorer's output.
+def label_score(output: Any, positive: Sequence[str], negative: Sequence[str] = ()) -> Optional[float]:
+    """Probability of the positive label(s) from a scorer's output, or ``None`` when it cannot be read.
 
-    Accepts a float, ``{"label": ..., "score": ...}``, or a (nested) list of those - the shapes
-    transformers pipelines return (``top_k=None`` gives every label).
+    Accepts a probability (0..1), ``{"label": ..., "score": ...}``, or a (nested) list of those - the
+    shapes transformers pipelines return (``top_k=None`` gives every label). Labels are matched
+    case-insensitively against ``positive``; when none is present but every label is a known
+    ``negative`` (e.g. a lone ``SAFE``), the probability is what the negatives leave over.
+    Anything else - an unknown label, ``None``, a string, a number outside 0..1 - is ``None``:
+    *unsure*, never "safe".
     """
 
+    if isinstance(output, bool) or output is None or isinstance(output, (str, bytes)):
+        return None
     if isinstance(output, (int, float)):
-        return float(output)
+        return float(output) if 0.0 <= float(output) <= 1.0 else None
     while isinstance(output, list) and len(output) == 1 and isinstance(output[0], list):
         output = output[0]
     items = output if isinstance(output, list) else [output]
-    wanted = {label.lower() for label in positive}
-    best, seen = 0.0, False
+    scores: Dict[str, float] = {}
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        label, score = str(item.get("label", "")).lower(), float(item.get("score", 0.0))
-        if label in wanted:
-            best, seen = max(best, score), True
-    if not seen and len(items) == 1 and isinstance(items[0], dict):
-        # A single "SAFE" / "neutral" label: its score is the confidence in the negative class.
-        return 1.0 - float(items[0].get("score", 0.0))
-    return best
+        if not isinstance(item, dict) or "label" not in item:
+            return None
+        try:
+            score = float(item.get("score", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if not 0.0 <= score <= 1.0:
+            return None
+        label = str(item["label"]).lower()
+        scores[label] = max(score, scores.get(label, 0.0))
+    if not scores:
+        return None
+    wanted = {label.lower() for label in positive}
+    found = [score for label, score in scores.items() if label in wanted]
+    if found:
+        return max(found)
+    known_negatives = {label.lower() for label in negative}
+    if known_negatives and all(label in known_negatives for label in scores):
+        return max(0.0, 1.0 - sum(scores.values()))
+    return None
 
 
 def cheapest_llm(rag: Any) -> Tuple[Optional[Any], Optional[str]]:

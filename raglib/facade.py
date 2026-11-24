@@ -68,6 +68,8 @@ from raglib.llm.base_client import (
     BaseLLMClient,
     CachedLLMClient,
     FallbackLLMClient,
+    GatedLLMClient,
+    llm_cache_of,
     unwrap_llm,
 )
 from raglib.llm.constants import PROVIDER_DEFAULT_VISION_MODEL
@@ -465,7 +467,10 @@ class RAG:
             self._llm_raw = FallbackLLMClient(clients)
         if prompt_caching:
             _enable_prompt_caching(self._llm_raw)
-        self._llm: BaseLLMClient = CachedLLMClient(self._llm_raw, ttl=llm_cache_ttl) if llm_cache else self._llm_raw
+        # Every model call passes the guard gate, whatever the client and cache setting.
+        self._llm: BaseLLMClient = GatedLLMClient(
+            CachedLLMClient(self._llm_raw, ttl=llm_cache_ttl) if llm_cache else self._llm_raw
+        )
         self._chat_provider = chat_provider
         self._cache_personalized = cache_personalized
         self._prices: Optional[PriceTable] = PriceTable.coerce(prices)
@@ -688,7 +693,7 @@ class RAG:
             )[0]
             if prompt_caching:
                 _enable_prompt_caching(cheap_raw)
-            cheap = CachedLLMClient(cheap_raw, ttl=llm_cache_ttl) if llm_cache else cheap_raw
+            cheap = GatedLLMClient(CachedLLMClient(cheap_raw, ttl=llm_cache_ttl) if llm_cache else cheap_raw)
             self._cheap_llm = cheap
             self._cheap_rag = self._build_orchestrator(
                 "advanced",
@@ -1045,8 +1050,24 @@ class RAG:
         ``user_id`` / ``request``: as in ``query``. With output guards the answer streams in
         checked pieces (see ``raglib.guards.streaming``); a non-streaming-safe output guard
         (``JSONSchemaGuard``) makes it arrive in one piece.
+
+        Each step runs in the stream's own context, so iterating it from a web framework that
+        uses a fresh context per step, or interleaving it with other queries, is safe.
         """
 
+        from raglib.core.runtime import isolated
+
+        return (yield from isolated(self._stream_steps(question, session_id, filters, user, user_id, request)))
+
+    def _stream_steps(
+        self,
+        question: str,
+        session_id: Optional[str],
+        filters: Optional[MetadataFilter],
+        user: Union[UserContext, Mapping[str, Any], None],
+        user_id: Optional[str],
+        request: Optional[Mapping[str, Any]],
+    ) -> Iterator[str]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
         question = question.strip()
@@ -1401,8 +1422,9 @@ class RAG:
         """Drop cached answers built from ``parent_ids`` and the cached vectors of ``old_texts``."""
 
         dropped = 0
-        if isinstance(self._llm, CachedLLMClient):
-            dropped += self._llm.invalidate(parent_ids)
+        llm_cache = llm_cache_of(self._llm)
+        if llm_cache is not None:
+            dropped += llm_cache.invalidate(parent_ids)
         if self._answer_cache is not None:
             dropped += self._answer_cache.invalidate(parent_ids)
         if old_texts and isinstance(self._embedding, CachedEmbedding):
@@ -2102,7 +2124,7 @@ class RAG:
         finally:
             self._llm_max_tokens = saved_max_tokens
         logger.info("GraphRAG indexing model: %s", getattr(unwrap_llm(client), "model_name", type(client).__name__))
-        return CachedLLMClient(client) if llm_cache else client
+        return GatedLLMClient(CachedLLMClient(client) if llm_cache else client)
 
     def _build_graph(self, graph_store: Optional[Any], graph_kwargs: Dict[str, Any]) -> None:
         """Create the GraphRAG indexer and retriever."""
@@ -2186,8 +2208,9 @@ class RAG:
     def _purge_caches(self) -> None:
         """Deleted text must not survive in caches (LLM responses, embeddings) - privacy requirement."""
 
-        if isinstance(self._llm, CachedLLMClient):
-            self._llm.clear()
+        llm_cache = llm_cache_of(self._llm)
+        if llm_cache is not None:
+            llm_cache.clear()
         if isinstance(self._embedding, CachedEmbedding):
             self._embedding.clear()
 

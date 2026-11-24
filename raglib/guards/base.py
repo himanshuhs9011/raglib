@@ -292,7 +292,7 @@ def run_guarded(guard: Guard, call: Any, raw: Any) -> Decision:
     try:
         decision = call()
     except Exception as exc:  # noqa: BLE001 - the failure policy decides
-        error = sanitize(f"{type(exc).__name__}: {str(exc)[:200]}", raw)
+        error = (sanitize(f"{type(exc).__name__}: {exc}", raw) or "")[:300]  # sanitize the whole text, then cut
         logger.warning("Guard %s failed (%s)", guard.name, error)
         decision = (
             block("This request could not be checked safely. Please try again.", reason="guard error")
