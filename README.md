@@ -793,7 +793,7 @@ If `embedding_llm` is omitted, raglib uses the chat provider's embeddings (OpenA
 - **`"chroma"`**: ChromaDB in cosine space. Each `RAG` gets its **own collection** unless you name one, so instances never see each other's data. Use `{"persist_directory": ..., "collection_name": ...}` for a durable index or `{"host": ..., "port": ...}` for a Chroma server.
 - **Your own**: subclass `BaseVectorStore` (`upsert`, `query(filters=...)`, `delete`, `count`).
 
-The access-control and filter tests run against live servers in `tests/integration/`: `docker compose -f docker-compose.test.yml up -d --wait`, then `pytest -q -rs tests/integration`. They are skipped when the servers are not running.
+Filters select the same documents in every store, list-valued fields included (`{"department": "legal"}` matches `["hr", "legal"]`). The access-control and filter tests in `tests/integration/` run against every store: the in-process ones always, and live pgvector and Qdrant (plain and strict mode) after `docker compose -f docker-compose.test.yml up -d --wait`. The live ones are skipped when the servers are not running.
 
 Initialization errors are raised. Pass `vector_db_kwargs={"fallback_to_memory": True}` to opt into a fallback. Every store refuses vectors of a different size than the ones it holds, so switching embedding models fails loudly instead of returning meaningless matches.
 

@@ -1,4 +1,7 @@
-"""Live vector-store fixtures: PostgreSQL + pgvector and Qdrant (plain and strict mode).
+"""Vector-store fixtures: every backend raglib ships, so the same tests run against all of them.
+
+Offline stores always run: in-memory, Chroma (in-process) and Qdrant (in-process). Live servers:
+PostgreSQL + pgvector and Qdrant, plain and in strict mode.
 
 Start the servers with ``docker compose -f docker-compose.test.yml up -d --wait``. The defaults
 match that file; override them with ``RAGLIB_TEST_PG_DSN`` and ``RAGLIB_TEST_QDRANT_URL``.
@@ -18,7 +21,9 @@ import pytest
 PG_DSN = os.getenv("RAGLIB_TEST_PG_DSN", "postgresql://postgres:postgres@localhost:5433/postgres")
 QDRANT_URL = os.getenv("RAGLIB_TEST_QDRANT_URL", "http://localhost:6333")
 REQUIRED = os.getenv("RAGLIB_REQUIRE_LIVE_STORES", "").strip().lower() in {"1", "true", "yes"}
-STORES = ["pgvector", "qdrant", "qdrant_strict"]
+OFFLINE_STORES = ["memory", "chroma", "qdrant_local"]
+LIVE_STORES = ["pgvector", "qdrant", "qdrant_strict"]
+STORES = OFFLINE_STORES + LIVE_STORES
 
 
 def _unavailable(reason: str) -> None:
@@ -90,14 +95,31 @@ def make_store(request: pytest.FixtureRequest) -> Iterator[Callable[[int], Any]]
 
     kind = request.param
     created: List[Any] = []
-    if kind == "pgvector":
+    client: Any = None
+    if kind == "chroma":
+        pytest.importorskip("chromadb")
+    elif kind == "qdrant_local":
+        pytest.importorskip("qdrant_client")
+    elif kind == "pgvector":
         _pg_ready()
-    else:
+    elif kind in {"qdrant", "qdrant_strict"}:
         client = _qdrant_client()
 
     def factory(dimension: int) -> Any:
         suffix = uuid.uuid4().hex[:10]
-        if kind == "pgvector":
+        if kind == "memory":
+            from raglib.vectorstores.in_memory_store import InMemoryVectorStore
+
+            store: Any = InMemoryVectorStore()
+        elif kind == "chroma":
+            from raglib.vectorstores.chroma_store import ChromaVectorStore
+
+            store = ChromaVectorStore(collection_name=f"raglib_it_{suffix}")
+        elif kind == "qdrant_local":
+            from raglib.vectorstores.qdrant_store import QdrantVectorStore
+
+            store = QdrantVectorStore(collection_name=f"raglib_it_{suffix}", location=":memory:")
+        elif kind == "pgvector":
             from raglib.vectorstores.pgvector_store import PGVectorStore
 
             store = PGVectorStore(PG_DSN, table_name=f"raglib_it_{suffix}")

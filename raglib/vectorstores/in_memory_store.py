@@ -214,7 +214,8 @@ class InMemoryVectorStore(BaseVectorStore):
                 )
             allowed: Optional[Set[str]] = None
             if filters:
-                allowed = {rid for rid, (_, meta) in self._payload.items() if matches_filter(meta, filters)}
+                # List-valued fields match by element, as in Qdrant, pgvector and Chroma.
+                allowed = {rid for rid, (_, meta) in self._payload.items() if matches_filter(meta, filters, array_contains=True)}
                 if not allowed:
                     return []
             scored = self._top_numpy(query_embedding, top_k, allowed)

@@ -330,7 +330,7 @@ class Retriever:
         allow = None
         if filters:
             allow = lambda doc_id: matches_filter(  # noqa: E731
-                {**self._doc_index[doc_id].metadata, "source": self._doc_index[doc_id].source}, filters
+                {**self._doc_index[doc_id].metadata, "source": self._doc_index[doc_id].source}, filters, array_contains=True
             )
         documents: List[Document] = []
         for doc_id, score in self._bm25.search(query, top_k=limit, allow=allow):
@@ -456,7 +456,7 @@ class Retriever:
 
         def visible(neighbor: Optional[Document]) -> bool:
             return neighbor is not None and (
-                not filters or matches_filter({**neighbor.metadata, "source": neighbor.source}, filters)
+                not filters or matches_filter({**neighbor.metadata, "source": neighbor.source}, filters, array_contains=True)
             )
 
         parts = [doc.content]

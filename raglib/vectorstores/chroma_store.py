@@ -191,11 +191,11 @@ class ChromaVectorStore(BaseVectorStore):
                 items = [item for item in (ChromaVectorStore._to_chroma_where(sub) for sub in value) if item]
                 if not items:
                     if key == "$or":  # an empty OR matches nothing; Chroma cannot express it directly
-                        clauses.append({"_raglib_match_nothing": True})
+                        clauses.append(_MATCH_NOTHING)
                     continue
                 clauses.append(items[0] if len(items) == 1 else {key: items})
             else:
-                clauses.append({key: value})
+                clauses.extend(_field_clauses(key, value))
         if not clauses:
             return None
         return clauses[0] if len(clauses) == 1 else {"$and": clauses}
@@ -210,6 +210,8 @@ class ChromaVectorStore(BaseVectorStore):
                 continue
             if isinstance(value, (str, int, float, bool)):
                 normalized[key] = value
+            elif _native_list(value):
+                normalized[key] = list(value)  # filters match an element, as in Qdrant and pgvector
             else:
                 normalized[key] = "__json__" + json.dumps(value, ensure_ascii=False, default=str)
         return normalized
@@ -228,3 +230,76 @@ class ChromaVectorStore(BaseVectorStore):
                     pass
             restored[key] = value
         return restored
+
+
+_MATCH_NOTHING: Dict[str, Any] = {"_raglib_match_nothing": True}  # no record has this key
+_SCALARS = (str, int, float, bool)
+_ARRAYS: Optional[bool] = None
+
+
+def _chroma_arrays() -> bool:
+    """True when the installed chromadb stores list metadata and filters it with ``$contains``."""
+
+    global _ARRAYS
+    if _ARRAYS is None:
+        try:
+            from chromadb.api import types
+
+            _ARRAYS = hasattr(types, "_validate_metadata_list_value")
+        except Exception:  # noqa: BLE001
+            _ARRAYS = False
+    return _ARRAYS
+
+
+def _native_list(value: Any) -> bool:
+    """A non-empty list of one scalar type, which Chroma can store and match by element."""
+
+    if not isinstance(value, (list, tuple)) or not value or not _chroma_arrays():
+        return False
+    kinds = {type(item) for item in value}
+    return len(kinds) == 1 and kinds.pop() in _SCALARS
+
+
+def _field_clauses(key: str, condition: Any) -> List[Dict[str, Any]]:
+    """Chroma clauses for one field. With array support, ``$eq``/``$ne``/``$in``/``$nin`` also match
+    an element of a list-valued field (``{"tags": "a"}`` matches ``["a", "b"]``)."""
+
+    operators = condition if isinstance(condition, dict) else {"$eq": condition}
+    if not _chroma_arrays() or key.startswith("_acl_"):  # access-control keys are always single booleans
+        return [{key: condition}]
+    clauses: List[Dict[str, Any]] = []
+    for operator, expected in operators.items():
+        if operator == "$eq":
+            clauses.append(_equals(key, expected))
+        elif operator == "$ne":
+            clauses.append(_differs(key, expected))
+        elif operator == "$in":
+            values = list(expected)
+            clauses.append(_any([_equals(key, value) for value in values]) if values else _MATCH_NOTHING)
+        elif operator == "$nin":
+            values = list(expected)
+            if values:
+                clauses.append(_all([_differs(key, value) for value in values]))
+        else:
+            clauses.append({key: {operator: expected}})
+    return clauses
+
+
+def _equals(key: str, value: Any) -> Dict[str, Any]:
+    if isinstance(value, _SCALARS):
+        return {"$or": [{key: {"$eq": value}}, {key: {"$contains": value}}]}
+    return {key: {"$eq": value}}
+
+
+def _differs(key: str, value: Any) -> Dict[str, Any]:
+    if isinstance(value, _SCALARS):
+        return {"$and": [{key: {"$ne": value}}, {key: {"$not_contains": value}}]}
+    return {key: {"$ne": value}}
+
+
+def _any(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return items[0] if len(items) == 1 else {"$or": items}
+
+
+def _all(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return items[0] if len(items) == 1 else {"$and": items}

@@ -204,6 +204,18 @@ class _LocalSearchProvider(BaseSearchProvider):
         return scored[:num_results]
 
 
+def _accepts_keyword(method: Any, name: str) -> bool:
+    """True when ``method`` takes the keyword ``name`` (or ``**kwargs``)."""
+
+    import inspect
+
+    try:
+        parameters = inspect.signature(method).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
 def _env_flag(name: str) -> bool:
     """Return True when an environment flag is set to a truthy value."""
 
@@ -1004,13 +1016,16 @@ class RAG:
         pipeline = self._cheap_rag if tier == TIER_CHEAP else self._rag
         if tracer is not None:
             tracer.tag("tier", tier)
-        generation = cache.generation if cache is not None else None  # before retrieval starts
+        generation = getattr(cache, "generation", None) if cache is not None else None  # before retrieval starts
         with run_tags(tier=tier):
             result = pipeline.run(question, session_id=session_key, filters=filters, **run_kwargs)
         result.metadata.update({"tier": tier, "tier_reason": decision.reason, "answer_cache_hit": False})
         if cacheable and cache is not None and not result.metadata.get("blocked_by"):
             # A guard's refusal is not cached: new documents may answer the question next time.
-            cache.put(question, result, scope, cache_key, generation=generation)
+            if generation is not None and _accepts_keyword(cache.put, "generation"):
+                cache.put(question, result, scope, cache_key, generation=generation)
+            else:  # an AnswerCache subclass written before put(generation=) existed
+                cache.put(question, result, scope, cache_key)
         return result
 
     def _faq_result(self, cached: GenerationResult, reason: str, tracer: Optional[Tracer] = None) -> GenerationResult:

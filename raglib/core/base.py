@@ -510,12 +510,12 @@ class BaseRAG:
     def _retrieve_by_mode(self, ctx: PipelineContext, query: str, mode: str) -> List[Document]:
         """Dispatch retrieval to the selected mode with graceful fallbacks."""
 
-        from raglib.components.web_retriever import web_retrieve
+        from raglib.components.web_retriever import corpus_web_retrieve, web_retrieve
 
         if mode == RETRIEVAL_WEB and self.web_retriever is not None:
             return web_retrieve(self.web_retriever, query, ctx.filters)
         if mode == RETRIEVAL_HYBRID and self.hybrid_retriever is not None:
-            return self.hybrid_retriever.retrieve(query, filters=ctx.filters)
+            return corpus_web_retrieve(self.hybrid_retriever, query, ctx.filters)
         if self.retriever is not None:
             return self.retrieve_corpus(ctx, query)
         if self.web_retriever is not None:

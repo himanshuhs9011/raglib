@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from typing import List
 
 from raglib.schemas import Document
@@ -48,8 +49,17 @@ class BaseSearchProvider(ABC):
         """Return the provider identifier."""
 
 
+# Set by ProviderChain on each result: the index of the provider in the chain that returned it.
+CHAIN_INDEX_KEY = "_raglib_chain_index"
+
+
 class ProviderChain(BaseSearchProvider):
-    """Tries providers in order and falls back when one fails."""
+    """Tries providers in order and falls back when one fails.
+
+    Each result records which provider returned it (``CHAIN_INDEX_KEY``), so access control
+    judges it by that provider: a public provider's results stay public, an internal one's stay
+    restricted.
+    """
 
     CHAIN_NAME: str = "provider_chain"
 
@@ -66,7 +76,7 @@ class ProviderChain(BaseSearchProvider):
 
     @property
     def internal(self) -> bool:  # type: ignore[override]
-        """True when any provider in the chain is internal (all its results are then checked)."""
+        """True when any provider in the chain is internal (each result is judged by its own provider)."""
 
         return any(getattr(provider, "internal", False) for provider in self.providers)
 
@@ -80,10 +90,13 @@ class ProviderChain(BaseSearchProvider):
         """Execute provider search with ordered fallback on failure."""
 
         errors: List[str] = []
-        for provider in self.providers:
+        for index, provider in enumerate(self.providers):
             try:
                 logger.info("ProviderChain trying provider=%s", provider.name)
-                docs = provider.search(query=query, num_results=num_results)
+                docs = [
+                    replace(doc, metadata={**doc.metadata, CHAIN_INDEX_KEY: index})
+                    for doc in provider.search(query=query, num_results=num_results)
+                ]
                 if docs:
                     logger.info(
                         "ProviderChain succeeded with provider=%s docs=%d",

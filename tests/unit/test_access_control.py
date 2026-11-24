@@ -382,8 +382,17 @@ def test_chroma_where_is_normalized_recursively() -> None:
                 check(item)
 
     check(where)
-    assert ChromaVectorStore._to_chroma_where({"a": 1}) == {"a": 1}
-    assert ChromaVectorStore._to_chroma_where({"a": 1, "b": 2}) == {"$and": [{"a": 1}, {"b": 2}]}
+    from raglib.vectorstores.chroma_store import _chroma_arrays
+
+    if _chroma_arrays():  # equality also matches an element of a list-valued field
+        one = {"$or": [{"a": {"$eq": 1}}, {"a": {"$contains": 1}}]}
+        two = {"$or": [{"b": {"$eq": 2}}, {"b": {"$contains": 2}}]}
+        assert ChromaVectorStore._to_chroma_where({"a": 1}) == one
+        assert ChromaVectorStore._to_chroma_where({"a": 1, "b": 2}) == {"$and": [one, two]}
+        assert ChromaVectorStore._to_chroma_where({"_acl_any_role": True}) == {"_acl_any_role": True}
+    else:
+        assert ChromaVectorStore._to_chroma_where({"a": 1}) == {"a": 1}
+        assert ChromaVectorStore._to_chroma_where({"a": 1, "b": 2}) == {"$and": [{"a": 1}, {"b": 2}]}
 
 
 def test_permission_filter_is_pushed_into_a_real_chroma_store() -> None:

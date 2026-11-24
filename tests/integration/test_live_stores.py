@@ -1,4 +1,8 @@
-"""Access control, leak and filter-semantics tests against live pgvector and Qdrant servers.
+"""Access control, leak and filter-semantics tests against every vector store raglib ships
+(in-memory, Chroma, Qdrant in-process; live pgvector and Qdrant, plain and strict mode).
+
+``test_store_filters_match_raglib_semantics`` is the shared filter test: the same filters must
+select the same documents in every store, list-valued fields included.
 
 The store is queried directly as well as through raglib, because the retriever re-checks dense
 hits against the filter: an end-to-end test alone would pass even if a store returned too much.
@@ -131,6 +135,10 @@ FILTERS: List[Dict[str, Any]] = [
     {"$or": [{"access_level": "internal"}, {"tenant": "globex"}]},
     {"department": "legal"},  # list-valued metadata: "contains"
     {"department": {"$in": ["finance", "nobody"]}},
+    {"department": {"$in": ["legal"]}},
+    {"department": {"$nin": ["legal"]}},
+    {"$and": [{"department": "hr"}, {"tenant": "globex"}]},
+    {"department": {"$ne": "hr"}},
 ]
 
 

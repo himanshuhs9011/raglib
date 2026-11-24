@@ -218,8 +218,6 @@ class QdrantVectorStore(BaseVectorStore):
     def _indexes_wanted(self) -> bool:
         """``payload_indexes``, or (None) whether the collection rejects unindexed filtering."""
 
-        if self._payload_indexes is not None:
-            return self._payload_indexes
         if self._needs_indexes is None:
             info = self._client.get_collection(self._collection_name)
             strict = getattr(info.config, "strict_mode_config", None)
@@ -227,7 +225,9 @@ class QdrantVectorStore(BaseVectorStore):
                 strict is not None and getattr(strict, "enabled", False)
                 and getattr(strict, "unindexed_filtering_retrieve", None) is False
             )
-            self._indexed.update((getattr(info, "payload_schema", None) or {}).keys())
+            self._indexed.update((getattr(info, "payload_schema", None) or {}).keys())  # existing indexes
+        if self._payload_indexes is not None:
+            return self._payload_indexes
         return self._needs_indexes
 
     def _ensure_indexes(self, filters: MetadataFilter) -> None:
@@ -298,6 +298,9 @@ def _filter_fields(filters: MetadataFilter, models: Any) -> Dict[str, Any]:
             values = list(expected) if operator in {"$in", "$nin"} else [expected]
             if not values:
                 continue
+            numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
+            if operator in {"$gt", "$gte", "$lt", "$lte"} and not numeric:
+                continue  # Qdrant ranges are numeric; a keyword index cannot serve them
             if all(isinstance(value, bool) for value in values):
                 schema = models.PayloadSchemaType.BOOL
             elif all(isinstance(value, int) and not isinstance(value, bool) for value in values):
