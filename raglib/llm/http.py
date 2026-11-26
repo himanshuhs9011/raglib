@@ -39,7 +39,14 @@ class ProviderHTTPError(RuntimeError):
         self.headers: Dict[str, str] = dict(headers or {})
         self.response = _ResponseInfo(self.headers, status_code)
         self.url = url
-        super().__init__(f"Error code: {status_code} - {_error_text(body)}")
+        message = f"Error code: {status_code} - {_error_text(body)}"
+        if status_code == 410:
+            # The provider retired the model (or endpoint): retrying cannot help, a new model name can.
+            message += (
+                " -- the provider no longer serves this model (HTTP 410 Gone, usually end of life). "
+                "Pass another model name (embedding_model=... / llm=...); the provider's model list shows the current ones."
+            )
+        super().__init__(message)
 
 
 class ProviderConnectionError(RuntimeError):

@@ -39,7 +39,7 @@ from raglib.graph_context import (
     GraphNode,
 )
 from raglib.llm.base_client import BaseLLMClient, CachedLLMClient
-from raglib.llm.clients import build_chat_client
+from raglib.llm.clients import LLMOutputTruncatedError, build_chat_client
 from raglib.llm.mock_client import MockLLMClient
 from raglib.llm.providers import ModelSpec, list_models, load_providers, register_provider, unregister_provider
 from raglib.loaders.chunk_splitter import ChunkSplitter
@@ -92,6 +92,7 @@ __all__ = [
     "Retriever",
     "WebRetriever",
     "FilterNotSupportedError",
+    "LLMOutputTruncatedError",
     "HybridRetriever",
     "RouterRetriever",
     "MultiQueryRetriever",
@@ -133,4 +134,4 @@ __all__ = [
     "GraphContextWindow",
 ]
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"

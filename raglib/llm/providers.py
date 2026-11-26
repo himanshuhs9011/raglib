@@ -187,7 +187,7 @@ PROVIDERS: Dict[str, ProviderSpec] = {
                      base_url="https://api.cerebras.ai/v1", key_prefixes=("csk-",), description="Cerebras"),
         ProviderSpec("nvidia", KIND_OPENAI_COMPATIBLE, "nvidia/nemotron-3.5-lightning-30b-a3b", ("NVIDIA_API_KEY",),
                      base_url="https://integrate.api.nvidia.com/v1", base_url_env=("NVIDIA_BASE_URL",),
-                     key_prefixes=("nvapi-",), default_embedding_model="nvidia/nemotron-3-embed-1b",
+                     key_prefixes=("nvapi-",), default_embedding_model="nvidia/nemotron-3.5-embed-1b",
                      supports_vision=True, embedding_input_types=("passage", "query"),
                      embedding_params={"truncate": "END"}, stream_usage=True,
                      description="NVIDIA NIM (build.nvidia.com; self-hosted NIM via NVIDIA_BASE_URL)"),

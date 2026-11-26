@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.2.2 - 2026-11-26
+
+Bug fixes only.
+
+**The default NVIDIA embedding model was retired.** NVIDIA ended `nvidia/nemotron-3-embed-1b` on 2026-11-23 and now answers HTTP 410, so `RAG(embedding_llm="nvidia")` with default settings failed at the first `add()`. The default is now `nvidia/nemotron-3.5-embed-1b`. A retired model (HTTP 410 from any provider) now gives a clear error that says the provider no longer serves the model and that you need another model name. It is not retried. If you set `embedding_model="nvidia/nemotron-3-embed-1b"` yourself, change it: an index built with the old model must be rebuilt with the new one, because their vectors are not compatible.
+
+**A cut-off answer was returned as an empty success.** When the model hit its output limit (`llm_max_tokens`) before writing any answer text, which is common with reasoning models that think past the limit, raglib returned `""` as a normal answer. In a test with a reasoning model and a 1024-token limit, 20 of 34 answers were empty. Now:
+- No answer text at the limit raises the new `raglib.LLMOutputTruncatedError`, which says to raise `llm_max_tokens`.
+- An answer cut off after some text is returned as before and listed in `result.metadata["degraded"]` (`llm_output_truncated:<provider>:<model>`), with a warning in the log.
+- This applies to the OpenAI-compatible, Anthropic and Gemini clients, streaming included. Answers that end normally are unchanged.
+
 ## 2.2.1 - 2026-11-25
 
 **Security: `filters=` was not enforced on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search over the corpus, but the paths below ignored it. Documents outside the filter could reach the answer prompt and `result.sources`. Upgrade if you use filters for tenant or permission scoping. This release contains only these fixes, and queries without `filters=` behave exactly as in 2.2.0.
