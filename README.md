@@ -790,7 +790,7 @@ If `embedding_llm` is omitted, raglib uses the chat provider's embeddings (OpenA
 - **`"memory"`** *(default)*: in-RAM cosine search (numpy-accelerated when installed), persisted with `rag.save()` / `rag.load()`.
 - **`"qdrant"`**: Qdrant (`pip install raglib-py[qdrant]`). In-process by default; `vector_db_kwargs={"path": "./qdrant"}` persists to disk, `{"url": "http://localhost:6333", "api_key": ...}` uses a server or Qdrant Cloud. Filters run inside Qdrant. On a collection in strict mode that rejects filters on unindexed keys (Qdrant Cloud), raglib creates a payload index for each key a filter uses, the first time it is used (`vector_db_kwargs={"payload_indexes": True | False}` to force it on or off). Each index costs Qdrant memory, and the first query that needs one waits while it is built.
 - **`"pgvector"`**: PostgreSQL with the pgvector extension (`pip install raglib-py[pgvector]`), e.g. `vector_db_kwargs={"dsn": "postgresql://user:pass@host/db", "table_name": "docs"}`. Uses an HNSW cosine index when available; filters become parameterized SQL on a JSONB column.
-- **`"chroma"`**: ChromaDB in cosine space. Each `RAG` gets its **own collection** unless you name one, so instances never see each other's data. Use `{"persist_directory": ..., "collection_name": ...}` for a durable index or `{"host": ..., "port": ...}` for a Chroma server.
+- **`"chroma"`**: ChromaDB in cosine space. Each `RAG` gets its **own collection** unless you name one, so instances never see each other's data. Use `{"persist_directory": ..., "collection_name": ...}` for a durable index or `{"host": ..., "port": ...}` for a Chroma server. Never expose a Chroma server to untrusted networks: chromadb has open advisories in its server (pre-auth code injection, authorization) with no fixed release yet (checked 2026-11-26).
 - **Your own**: subclass `BaseVectorStore` (`upsert`, `query(filters=...)`, `delete`, `count`).
 
 Filters select the same documents in every store, list-valued fields included (`{"department": "legal"}` matches `["hr", "legal"]`). The access-control and filter tests in `tests/integration/` run against every store: the in-process ones always, and live pgvector and Qdrant (plain and strict mode) after `docker compose -f docker-compose.test.yml up -d --wait`. The live ones are skipped when the servers are not running.
@@ -1061,6 +1061,8 @@ raglib graph papers/ --out graph.html
 | Data at rest | `output_dir`, `save()`, Chroma and graph files contain document text and Q&A. | Store them on encrypted disks; delete with `rag.delete(source)` (removes chunks, vectors and graph entities). |
 
 If a key was ever committed to git, rotating it is the only fix: deleting the line does not remove it from history.
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md) (GitHub private vulnerability reporting).
 
 ## Access Control
 
