@@ -50,7 +50,11 @@ google = []
 ollama = []
 hf = ["sentence-transformers>=2.6.0"]
 # wrap your own LangChain chat model: RAG(chat_llm=ChatOpenAI(...))
-langchain = ["langchain-core>=1.3.3"]
+langchain = [
+  # 1.3.3 fixes PYSEC-2026-2563/2564 but needs Python 3.10+
+  "langchain-core>=1.3.3; python_version >= '3.10'",
+  "langchain-core>=0.2.0; python_version < '3.10'",
+]
 # retrieval quality
 rerank = ["sentence-transformers>=2.6.0"]
 # optional local models for tier 1 guards (InjectionClassifier, ToxicityClassifier, GroundingGuard);
@@ -87,7 +91,13 @@ bench = [
 ]
 # observability (raglib.exporters)
 prometheus = ["prometheus-client>=0.17.0"]
-otel = ["opentelemetry-api>=1.45.2", "opentelemetry-sdk>=1.45.2"]
+otel = [
+  # 1.45.2 fixes CVE-2026-114603 / CVE-2026-126360 but needs Python 3.10+
+  "opentelemetry-api>=1.45.2; python_version >= '3.10'",
+  "opentelemetry-sdk>=1.45.2; python_version >= '3.10'",
+  "opentelemetry-api>=1.20.0; python_version < '3.10'",
+  "opentelemetry-sdk>=1.20.0; python_version < '3.10'",
+]
 # bundles
 all-llm = []
 all = [
@@ -104,7 +114,8 @@ all = [
   "ddgs>=6.0.0",
 ]
 dev = [
-  "pytest>=9.0.3",
+  "pytest>=9.0.3; python_version >= '3.10'",  # PYSEC-2026-1845; 9.x needs Python 3.10+
+  "pytest>=7.4.0; python_version < '3.10'",
   "pytest-cov>=4.1.0",
   "ruff>=0.5.0",
   "build>=1.0.0",
