@@ -38,6 +38,9 @@ class _Custom(BaseRAG):
 
 
 def test_a_2_2_style_web_retriever_is_called_without_filters(caplog: pytest.LogCaptureFixture) -> None:
+    import raglib.components.web_retriever as web_module
+
+    web_module._warned.clear()  # warnings are once per process; start clean
     from raglib.rag_types.web_rag import WebRAG
 
     web = WebRAG(web_retriever=_OldWeb())

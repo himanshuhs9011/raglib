@@ -96,6 +96,11 @@ class WebRetriever:
             from raglib.core.runtime import record_search_usage
 
             record_search_usage(f"web:{provider.name}", 1)  # billable API call (priced per 1K searches)
+            if filters and not getattr(provider, "internal", False):
+                _warn_once(
+                    f"provider:{provider.name}",
+                    f"filters were not applied by provider {provider.name} (public web results are not corpus documents)",
+                )
         docs = provider.search(query=query, num_results=self.top_k)
         if filters and getattr(provider, "internal", False):
             docs = [doc for doc in docs if not _internal(provider, doc) or self._internal_visible(doc, filters)]

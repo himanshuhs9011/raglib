@@ -230,6 +230,38 @@ All of them now apply the filter. GraphRAG uses an entity, relation or community
 - `matches_filter(..., array_contains=True)` gives list-valued fields "contains" semantics, like every vector store and BM25 now use. The function's own default is unchanged.
 - Custom retrievers written for 2.2 keep working. A web retriever whose `retrieve()` has no `filters` parameter is called without filters, with a warning logged once. A hybrid (corpus + web) retriever without one is called exactly as before on unfiltered queries, and raises `FilterNotSupportedError` on filtered ones (it would search the corpus unfiltered). An `AnswerCache` subclass whose `put()` has no `generation` parameter is called without it.
 - Chroma `where` translation is recursive, so nested `$and`/`$or` filters with several keys per clause work.
+## 2.2.2 - 2026-11-26
+
+Bug fixes only.
+
+**The default NVIDIA embedding model was retired.** NVIDIA ended `nvidia/nemotron-3-embed-1b` on 2026-11-23 and now answers HTTP 410, so `RAG(embedding_llm="nvidia")` with default settings failed at the first `add()`. The default is now `nvidia/nemotron-3.5-embed-1b`. A retired model (HTTP 410 from any provider) now gives a clear error that says the provider no longer serves the model and that you need another model name. It is not retried. If you set `embedding_model="nvidia/nemotron-3-embed-1b"` yourself, change it: an index built with the old model must be rebuilt with the new one, because their vectors are not compatible.
+
+**A cut-off answer was returned as an empty success.** When the model hit its output limit (`llm_max_tokens`) before writing any answer text, which is common with reasoning models that think past the limit, raglib returned `""` as a normal answer. In a test with a reasoning model and a 1024-token limit, 20 of 34 answers were empty. Now:
+- No answer text at the limit raises the new `raglib.LLMOutputTruncatedError`, which says to raise `llm_max_tokens`.
+- An answer cut off after some text is returned as before and listed in `result.metadata["degraded"]` (`llm_output_truncated:<provider>:<model>`), with a warning in the log.
+- This applies to the OpenAI-compatible, Anthropic and Gemini clients, streaming included. Answers that end normally are unchanged.
+
+## 2.2.1 - 2026-11-25
+
+**Security: `filters=` was not enforced on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search over the corpus, but the paths below ignored it. Documents outside the filter could reach the answer prompt and `result.sources`. Upgrade if you use filters for tenant or permission scoping. This release contains only these fixes, and queries without `filters=` behave exactly as in 2.2.0.
+
+Fixed, now apply the filter:
+- `rag_type="routing"`: the `hybrid` and `web` routes.
+- `web_search_provider="local"` (searches your corpus) on every path that calls web search: `rag_type="web"`, the routing `web` and `hybrid` routes, the agent's `search_web` tool, Corrective RAG's web search, and `HybridRetriever`. The provider now drops documents that fail the filter before it picks its top results. Public web results are not corpus documents, so filters still do not apply to them.
+- The decision engine's `web` and `hybrid` modes and its web fallback when there is no corpus retriever (`BaseRAG._retrieve_by_mode`, used by custom `BaseRAG` subclasses).
+- `HybridRAG` without a corpus retriever.
+- `neighbor_window` expansion: it stops at a neighbouring chunk that fails the filter.
+- pgvector and Qdrant: an empty `{"$or": []}` matched every document. It now matches nothing, as in the in-memory store. An empty `$and` still matches everything.
+
+**Behaviour change: GraphRAG with `filters=` now raises.** `rag_type="graph"` (and `GraphRetriever.retrieve(..., filters=...)`) raises the new `raglib.FilterNotSupportedError` whenever `filters=` are given. In 2.2.0 it returned graph results that ignored the filter. Why: in 2.2 the graph's entity, relation and community summaries are not linked to the metadata of the chunks they were built from, so there is no way to tell which of them a filter allows. Refusing is the only safe answer. Queries without `filters=` are unchanged. raglib 2.3 adds filtered GraphRAG: summaries are used only when the chunks behind them pass the filter. The other pipelines that can use the graph keep working:
+- `rag_type="routing"`: a filtered query routed to `graph` uses the filtered `vector` route instead.
+- `rag_type="agentic"`: the `graph_search` tool is not offered to the agent when the query has filters.
+
+**Behaviour change: a custom hybrid retriever without a `filters` parameter now raises on filtered queries.** If you pass your own hybrid (corpus + web) retriever and its `retrieve()` does not accept `filters`, a query with `filters=` now raises `FilterNotSupportedError`. In 2.2.0 it was called without the filter. Why: a hybrid retriever searches your corpus, so calling it without the filter would return corpus documents outside it. Unfiltered queries call it exactly as before. To fix it, add a `filters` parameter to `retrieve()` and apply it to the corpus search, for example `def retrieve(self, query, filters=None): ...` passing `filters=filters` to your corpus retriever.
+
+A custom web retriever whose `retrieve()` has no `filters` parameter keeps working: it is called without filters, and a warning is logged once. Web results are not corpus documents.
+
+**Known limit.** Only the built-in corpus provider (`web_search_provider="local"`) can apply filters. Any other search provider, including your own provider that searches private data, is called without them. When a query has filters, raglib logs `filters were not applied by provider <name>` once per provider and does not raise. Public web results are not corpus documents, so this is expected for providers like DuckDuckGo or Tavily. Filter inside a custom provider that searches private data yourself.
 
 ## 2.2.0 - 2026-11-21
 
