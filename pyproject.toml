@@ -98,6 +98,7 @@ all = [
   "networkx>=3.0",
   "PyMuPDF>=1.23.0",
   "python-docx>=1.0.0",
+  "lxml>=6.1.0",
   "python-pptx>=0.6.21",
   "openpyxl>=3.1",
   "ddgs>=6.0.0",
