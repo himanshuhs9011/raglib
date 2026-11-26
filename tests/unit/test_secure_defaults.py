@@ -155,7 +155,7 @@ def test_tool_call_limit_stops_a_looping_agent() -> None:
 
 def test_each_protection_can_be_turned_off_and_configured_guards_replace_defaults() -> None:
     assert _rag(secure_defaults={"injection_flags": False})._guards.input == []
-    assert _rag(secure_defaults={"secret_flags": False})._guards.output == []
+    assert _rag(secure_defaults={"secret_flags": False, "external_links": False})._guards.output == []
     assert _rag(secure_defaults={"tool_limit": False})._guards.tool_policy is None
     assert _rag(secure_defaults=False)._guards is None
     blocking = _rag(input_guards=[InjectionHeuristic()])._guards.input

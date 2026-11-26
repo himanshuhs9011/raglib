@@ -126,6 +126,9 @@ class Guard:
     streaming_safe = False
     # Characters a streaming-safe guard needs held back (None = RAG(stream_holdback_chars=...)).
     stream_holdback: Optional[int] = None
+    # Quiet guards leave no trace stage and no record when they allow (like flag-only guards), so
+    # an always-on guard does not change normal results; a modification or block is recorded.
+    quiet = False
     block_message = "This request was blocked by a safety check."
 
     def __init__(self, fail_closed: Optional[bool] = None, message: Optional[str] = None, flag_only: bool = False):
@@ -229,8 +232,8 @@ class GuardRunner:
         decisions: List[Decision] = []
         for guard in sorted((g for g in guards if stage in g.stages), key=guard_sort_key):
             decision = self._check(guard, stage, value, context)
-            if decision.flag or not guard.flag_only:
-                decisions.append(decision)  # a flag-only guard that found nothing leaves no record
+            if decision.flag or decision.action != ALLOW or not (guard.flag_only or guard.quiet):
+                decisions.append(decision)  # a flag-only or quiet guard that found nothing leaves no record
             if decision.action == MODIFY:
                 value = decision.value
                 if stage == "input" and isinstance(value, str):
@@ -240,8 +243,8 @@ class GuardRunner:
         return value, decisions, None
 
     def _check(self, guard: Guard, stage: str, value: Any, context: GuardContext) -> Decision:
-        if guard.flag_only:
-            # Flag-only guards are quiet: no trace stage, no cache; a finding becomes an on_event notice.
+        if guard.flag_only or guard.quiet:
+            # Flag-only and quiet guards: no trace stage, no cache; a finding becomes an on_event notice.
             started = time.perf_counter()
             decision = run_guarded(guard, lambda: guard.check(value, context), value)
             decision.guard, decision.stage = guard.name, stage

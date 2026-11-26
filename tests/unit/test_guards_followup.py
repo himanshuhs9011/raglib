@@ -228,7 +228,7 @@ def test_streamed_guard_decisions_are_aggregated_and_traced() -> None:
             result = stop.value
             break
     output = [d for d in result.metadata["guards"] if d["stage"] == "output"]
-    assert [d["guard"] for d in output] == ["output_leak", "citation_access"]
+    assert [d["guard"] for d in output] == ["output_leak", "citation_access"]  # external_links: quiet, nothing removed
     assert output[0]["action"] == "modify"
     events = [e for e in result.trace_events if e.stage == "guard.output_leak"]
     assert len(events) == 1 and events[0].meta["streamed"] is True

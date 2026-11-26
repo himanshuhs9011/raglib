@@ -8,6 +8,10 @@
 * ``injection_flags`` - ``InjectionHeuristic(flag_only=True)`` on the question.
 * ``secret_flags`` - ``OutputLeakGuard(check_pii=False, flag_only=True)``: API keys, tokens and
   private keys in the answer.
+* ``external_links`` - ``ExternalLinkGuard()``: removes images, HTML tags and links in the answer that
+  point anywhere the retrieved sources did not (a prompt injection could otherwise make a chat UI
+  send retrieved text to an attacker's server). Unlike the others it changes such answers; links
+  to the sources are kept. Allow more hosts with ``output_guards=[ExternalLinkGuard(allow_domains=[...])]``.
 
 The two flag-only guards never block or modify: their findings go to ``result.guard_flags`` and a
 ``guard_flag`` event on ``on_event``. Flag-only output guards run once on the finished answer, so
@@ -27,11 +31,18 @@ import threading
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from raglib.guards.base import Guard
-from raglib.guards.rules import CitationAccessGuard, InjectionHeuristic, OutputLeakGuard, ToolPolicy, resolve_guards
+from raglib.guards.rules import (
+    CitationAccessGuard,
+    ExternalLinkGuard,
+    InjectionHeuristic,
+    OutputLeakGuard,
+    ToolPolicy,
+    resolve_guards,
+)
 
 logger = logging.getLogger("raglib.guards")
 
-SECURE_DEFAULTS = ("citation_access", "tool_limit", "injection_flags", "secret_flags")
+SECURE_DEFAULTS = ("citation_access", "tool_limit", "injection_flags", "secret_flags", "external_links")
 DEFAULT_MAX_TOOL_CALLS = 10
 GUARD_TIP_ENV = "RAGLIB_GUARD_TIP"
 GUARDRAILS_DOCS_URL = "https://github.com/himanshuhs9011/raglib#guardrails"
@@ -76,6 +87,8 @@ def with_secure_defaults(
         inputs.append(InjectionHeuristic(flag_only=True))
     if options.get("secret_flags") and not _has(outputs, OutputLeakGuard):
         outputs.append(OutputLeakGuard(check_pii=False, flag_only=True))
+    if options.get("external_links") and not _has(outputs, ExternalLinkGuard):
+        outputs.append(ExternalLinkGuard())
     if options.get("citation_access") and access_control and not _has(outputs, CitationAccessGuard):
         outputs.append(CitationAccessGuard())
     if tool_policy is None and options.get("tool_limit"):

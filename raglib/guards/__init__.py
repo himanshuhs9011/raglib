@@ -48,6 +48,7 @@ from raglib.guards.parallel import GuardCancelled, ParallelInputGuards
 from raglib.guards.rules import (
     NOTHING_RELEVANT_THRESHOLDS,
     CitationAccessGuard,
+    ExternalLinkGuard,
     GuardSkippedWarning,
     InjectionHeuristic,
     JSONSchemaGuard,
@@ -156,6 +157,7 @@ __all__ = [
     "ModerationClient",
     "NothingRelevant",
     "OutputLeakGuard",
+    "ExternalLinkGuard",
     "PIIMasker",
     "ParallelInputGuards",
     "RECOMMENDED_LOCAL_MODELS",

