@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 
 from raglib import RAG
+from raglib.llm.base_client import BaseLLMClient
 from raglib.loaders.document_loader import DocumentLoader
 from raglib.loaders.exceptions import DocumentLoadError
-from raglib.llm.base_client import BaseLLMClient
 
 
 def test_a_file_over_max_file_bytes_is_refused_before_parsing(tmp_path: Path) -> None:
@@ -98,3 +98,12 @@ def test_plain_rag_refuses_an_absurdly_long_question_without_a_model_call() -> N
     assert "blocked_by" not in normal.metadata and "guards" not in normal.metadata  # quiet for normal questions
     assert "blocked_by" not in RAG(["x"], chat_llm=_Counting(), embedding_llm="mock", secure_defaults={"question_limit": False}).query(
         "q " + "padding " * 20000).metadata
+
+
+def test_raw_text_is_not_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "Salary of Jane Doe is 98k"
+    with caplog.at_level("INFO", logger="raglib.loaders.document_loader"):
+        DocumentLoader().load(secret)
+    info = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert info and all(secret not in message for message in info)
+    assert any("25-character source" in message for message in info)

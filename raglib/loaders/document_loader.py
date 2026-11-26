@@ -161,7 +161,9 @@ class DocumentLoader:
             raise FileNotFoundError(f"Source file or directory not found: '{normalized}'")
 
         if "\n" not in normalized and len(normalized) < 200:
-            logger.info("Source %r is not an existing file or URL; indexing it as raw text", normalized[:60])
+            # The text itself only at DEBUG: raw text passed to add() can be private.
+            logger.info("A %d-character source is not an existing file or URL; indexing it as raw text", len(normalized))
+            logger.debug("Raw-text source: %r", normalized[:60])
         stable_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
         yield [Document(f"raw-{stable_id}", normalized, {"loader": "raw_text"}, 0.0, "text")]
 
