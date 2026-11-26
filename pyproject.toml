@@ -87,7 +87,7 @@ bench = [
 ]
 # observability (raglib.exporters)
 prometheus = ["prometheus-client>=0.17.0"]
-otel = ["opentelemetry-api>=1.20.0", "opentelemetry-sdk>=1.20.0"]
+otel = ["opentelemetry-api>=1.45.2", "opentelemetry-sdk>=1.45.2"]
 # bundles
 all-llm = []
 all = [
