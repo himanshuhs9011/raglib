@@ -324,8 +324,8 @@ def test_answer_cache_key_includes_the_guard_configuration() -> None:
 
 
 def test_production_preset_caps_generated_tokens() -> None:
-    assert resolve_preset("production")["llm_max_tokens"] == 1024
-    assert RAG(CORPUS, preset="production", offline=True)._llm_max_tokens == 1024
+    assert resolve_preset("production")["llm_max_tokens"] == 4096
+    assert RAG(CORPUS, preset="production", offline=True)._llm_max_tokens == 4096
     assert RAG(CORPUS, preset="production", offline=True, llm_max_tokens=300)._llm_max_tokens == 300
 
 

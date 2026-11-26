@@ -42,7 +42,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "tool_policy": "default",
         # Caps what each answer can cost: the model stops generating here (MaxOutputTokens only
         # trims what is shown). 1024 tokens is ~750 words, plenty for a cited answer.
-        "llm_max_tokens": 1024,
+        "llm_max_tokens": 4096,  # room for a reasoning model to think and still answer
     },
 }
 

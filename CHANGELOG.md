@@ -13,6 +13,8 @@
 - **Prompts** wrap retrieved and conversation text in an unguessable `<src-…>` delimiter instead of `<source>`. Custom templates get the data rule appended.
 - **Traces:** the `generate` stage times only the LLM call, new stages appear, and a final `total` event is appended to `trace_events`.
 - **Unchanged:** the `fixed` and `recursive` chunkers chunk exactly as in 2.2. The double danda (`॥`) ends a sentence only in the semantic chunkers.
+- **Cut-off answers (also in 2.2.2):** no answer text at the output limit raises `LLMOutputTruncatedError` instead of returning `""`. An answer cut off after some text is flagged in `result.metadata["degraded"]`. `preset="production"` now caps output at 4096 tokens instead of 1024, because reasoning models count their thinking against it.
+- **NVIDIA embeddings (also in 2.2.2):** the default is `nvidia/nemotron-3.5-embed-1b`, since `nemotron-3-embed-1b` was retired on 2026-11-23 (HTTP 410). A retired model now gives a clear, non-retried error.
 - **Unchanged default:** `token_counter` still defaults to `"units"`, with a `DeprecationWarning`; it becomes `"auto"` in the next major release.
 
 **Benchmark fix: `real_eval.py` measures what it says.**
@@ -118,7 +120,7 @@ Two protections were already unconditional and stay that way: source delimiters 
 - Rate-limit and budget identity: `RAG(rate_limit_key=fn)`, `query(..., user_id=..., request={...})` (no access control needed), a per-guard `key=`, and `anonymous_policy="skip" | "shared" | "block"` (default `"skip"`). A `session_id` alone no longer counts as an identity. Counters go through a pluggable `GuardStore` (`RAG(guard_store=...)`). The default `InMemoryGuardStore` is per process.
 - The answer-cache key includes a hash of the active guard configuration, so changing guards never serves old cached answers.
 - `RAG(stream_holdback_chars=64)`: how far streamed text may trail the model while streaming-safe output guards check it. The minimum is 40 (the longest secret prefix that can contain a space, a PEM header), and smaller values raise `ValueError`. Release still happens at the end of a sentence or once text is past the window.
-- `preset="production"` sets `llm_max_tokens=1024`, which caps what each answer costs. `MaxOutputTokens` only trims what is shown.
+- `preset="production"` sets `llm_max_tokens=4096`, which caps what each answer costs, reasoning included (1024 left reasoning models no room to answer). `MaxOutputTokens` only trims what is shown.
 - Guard messages, reasons, errors and log lines are sanitized: the checked text is removed, and PII and secrets are masked. The internal retrieval-block exception is now `GuardBlockedError` (`GuardBlocked` is kept as an alias).
 
 **Security: filters were not applied on several retrieval paths.** `query(..., filters=...)` restricted dense and BM25 search, but these paths ignored it and could return documents outside the filter:

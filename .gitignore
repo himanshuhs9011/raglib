@@ -40,3 +40,6 @@ Desktop.ini
 
 # Generated run reports (contain local paths and document content)
 examples/reports/
+
+# Security audit notes (lists weaknesses; never commit)
+AUDIT.md

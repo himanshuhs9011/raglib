@@ -210,9 +210,9 @@ rag = RAG(
 | `"cross_encoder"` (local `BAAI/bge-reranker-base`) | `reranker` | `"none"` |
 | 3 chunks sent to the LLM | `top_k` | 5 |
 | tier 0 guardrails on every stage (see [Guardrails](#guardrails)) | `input_guards` / `retrieval_guards` / `output_guards` / `tool_policy` | off |
-| `llm_max_tokens=1024`: each answer stops after 1024 generated tokens (~750 words), which caps its cost | `llm_max_tokens` | provider default |
+| `llm_max_tokens=4096`: each answer stops after 4096 generated tokens, reasoning included, which caps its cost | `llm_max_tokens` | provider default |
 
-`preset="production"` sets `llm_max_tokens=1024`. That is plenty for cited answers, but apps that generate long summaries or reports should raise it, e.g. `RAG(..., preset="production", llm_max_tokens=4096)`. Otherwise long outputs are cut off mid-text. The cap applies to the chat, cheap and fallback models that raglib builds from a provider name. GraphRAG extraction has its own limit (`graph_kwargs={"extraction_max_tokens": ...}`). `MaxOutputTokens` is different: it only trims what is shown, after the tokens were paid for.
+`preset="production"` sets `llm_max_tokens=4096`. Reasoning models count their hidden thinking against it: with 1024, a reasoning model used the whole budget thinking on 20 of 34 questions about one paper. Apps that generate long reports should raise it further. An answer cut off at the limit is flagged in `result.metadata["degraded"]`, and no answer text at all raises `LLMOutputTruncatedError` instead of returning an empty answer. The cap applies to the chat, cheap and fallback models that raglib builds from a provider name. GraphRAG extraction has its own limit (`graph_kwargs={"extraction_max_tokens": ...}`). `MaxOutputTokens` is different: it only trims what is shown, after the tokens were paid for.
 
 `raglib init [PATH] --preset production` does the same as `raglib-py --production`. Both refuse to overwrite a file unless you pass `--force`. The cross-encoder needs `pip install raglib-py[rerank]`. Without it raglib logs a warning and keeps the hybrid order.
 
@@ -676,7 +676,7 @@ Hosted OpenAI-compatible APIs only need `pip install "raglib-py[openai]"`.
 | **xAI Grok** | `"xai"` / `"grok"` | `grok-3-mini` | `XAI_API_KEY` | – |
 | **Perplexity** | `"perplexity"` | `sonar` | `PERPLEXITY_API_KEY` | – |
 | **Cerebras** | `"cerebras"` | `llama-3.3-70b` | `CEREBRAS_API_KEY` | – |
-| **NVIDIA NIM** (build.nvidia.com or self-hosted via `NVIDIA_BASE_URL`) | `"nvidia"` / `"nim"` | `nvidia/nemotron-3.5-lightning-30b-a3b` | `NVIDIA_API_KEY` | yes (`nvidia/nemotron-3-embed-1b`); OCR with `nvidia/nemotron-3.5-super-vl-120b-a12b` |
+| **NVIDIA NIM** (build.nvidia.com or self-hosted via `NVIDIA_BASE_URL`) | `"nvidia"` / `"nim"` | `nvidia/nemotron-3.5-lightning-30b-a3b` | `NVIDIA_API_KEY` | yes (`nvidia/nemotron-3.5-embed-1b`); OCR with `nvidia/nemotron-3.5-super-vl-120b-a12b` |
 | **Azure OpenAI** | `"azure/<deployment>"` | – | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | yes (deployment) |
 | **Ollama** (local) | `"ollama"` | `llama3.1` | – | yes |
 | **LM Studio** (local) | `"lmstudio/<model>"` | – | – | with `embedding_model` |
@@ -1139,7 +1139,7 @@ When a `RAG(...)` is created without `preset="production"` and without any guard
 | `OutputLeakGuard()` | output | Masks API keys, cloud keys, private keys and JWTs in the answer. It also masks personal data that is *not* in the sources the user could read (a support e-mail from your docs is kept). Phone numbers with `phone=True`. | Free. Same regex limits as `PIIMasker`. |
 | `CitationAccessGuard()` | output | With access control, withholds an answer that cites a document the user cannot read (defense in depth), and strips `[n]` markers that point past the source list. | Free. |
 | `JSONSchemaGuard(schema)` | output | The answer must be JSON matching `schema` (a code fence is unwrapped). Uses `jsonschema` when it is installed, otherwise a built-in subset (`type`, `required`, `properties`, `items`, `enum`). | Free. It blocks; it does not re-ask the model. |
-| `MaxOutputTokens(800)` | output | Truncates (or with `action="block"`, withholds) long answers. While streaming, the truncating version also stops reading the model's stream. | Free. On `query` it limits what is shown, not what you pay: the tokens were already generated. `llm_max_tokens` (1024 in `preset="production"`) is what caps cost, because the model stops there. |
+| `MaxOutputTokens(800)` | output | Truncates (or with `action="block"`, withholds) long answers. While streaming, the truncating version also stops reading the model's stream. | Free. On `query` it limits what is shown, not what you pay: the tokens were already generated. `llm_max_tokens` (4096 in `preset="production"`) is what caps cost, because the model stops there. |
 | `ToolPolicy(...)` | agent | `allowed_tools={"support": ["search_docs"]}` (the union over the user's roles; `default_tools` applies to everyone else), `max_tool_calls=8` per question, `max_argument_chars=1000`, and `argument_checks={"sql": fn}`. A blocked call is sent back to the agent as the tool's answer. | Free. A tool the user may not call is never offered to the model. |
 
 **PII look-alikes.** Every number pattern is bounded on both sides, so it never matches inside a longer word or number, a decimal, version or price (`1.2.3`, `4,111.50`), a path or an id (`ORD-4111111111111111`). Card numbers must pass Luhn and use one kind of separator. Aadhaar numbers must pass Verhoeff (a random 12-digit invoice number fails about 90% of the time) and use consistent separators. PAN numbers must be upper case with a valid holder-type letter (`AAAPA9999A`). Phone numbers are off by default, because order ids, invoice numbers and dates look too much like them.

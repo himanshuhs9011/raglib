@@ -44,7 +44,7 @@ from raglib.graph_context import (
 )
 from raglib.latency import LatencySample, LatencyStats, benchmark
 from raglib.llm.base_client import BaseLLMClient, CachedLLMClient
-from raglib.llm.clients import build_chat_client
+from raglib.llm.clients import LLMOutputTruncatedError, build_chat_client
 from raglib.llm.mock_client import MockLLMClient
 from raglib.llm.providers import ModelSpec, list_models, load_providers, register_provider, unregister_provider
 from raglib.loaders.chunk_splitter import ChunkSplitter, EmbeddingChunkingError, IndexSettingsWarning
@@ -94,6 +94,7 @@ __all__ = [
     "AccessControl",
     "UserContext",
     "FilterNotSupportedError",
+    "LLMOutputTruncatedError",
     "access_tags",
     "RAG",
     "ask",
