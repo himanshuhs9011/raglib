@@ -1,4 +1,4 @@
-export const VERSION = "2.2.0";
+export const VERSION = "2.2.1";
 
 const REPO = "https://github.com/himanshuhs9011/raglib";
 export const LINKS = {
