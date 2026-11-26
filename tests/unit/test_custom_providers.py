@@ -276,7 +276,7 @@ def test_nvidia_embeddings_send_input_type_and_truncate(fake: FakeProvider, monk
     fake.reply(json={"data": [{"index": 0, "embedding": [1.0, 0.0]}, {"index": 1, "embedding": [0.0, 1.0]}]})
     rag = RAG(["alpha", "beta"], llm="nvidia", chat_api_key="nvapi-x")
     documents_request = fake.requests[0]["json"]
-    assert documents_request["model"] == "nvidia/nemotron-3-embed-1b"
+    assert documents_request["model"] == "nvidia/nemotron-3.5-embed-1b"
     assert documents_request["input_type"] == "passage" and documents_request["truncate"] == "END"
 
     fake.reply(json={"data": [{"index": 0, "embedding": [1.0, 0.0]}]})

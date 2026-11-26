@@ -47,6 +47,17 @@ def azure_api_version() -> str:
     return os.getenv("OPENAI_API_VERSION") or os.getenv("AZURE_OPENAI_API_VERSION") or AZURE_DEFAULT_API_VERSION
 
 
+class LLMOutputTruncatedError(RuntimeError):
+    """The model hit its output limit (``max_tokens``) before writing any answer text.
+
+    Reasoning models can spend the whole budget thinking. Raised instead of returning an empty
+    answer as if it succeeded; raise ``llm_max_tokens`` (or turn the model's thinking off).
+    """
+
+
+_LENGTH_REASONS = {"length", "max_tokens", "MAX_TOKENS"}
+
+
 class HTTPChatClient(BaseLLMClient):
     """Shared request / retry / usage / streaming logic; subclasses map one wire protocol."""
 
@@ -123,6 +134,11 @@ class HTTPChatClient(BaseLLMClient):
 
         raise NotImplementedError
 
+    def finish_reason(self, body: Any) -> Optional[str]:
+        """Why the model stopped (from a response body or one stream event), when it says."""
+
+        return None
+
     def image_content(self, prompt: str, image_b64: str, mime_type: str) -> Any:
         """The user-message content that carries an image (protocol specific)."""
 
@@ -193,9 +209,9 @@ class HTTPChatClient(BaseLLMClient):
             # (e.g. Anthropic "overloaded_error") is retried like an HTTP error.
             events = post_sse(url, payload, headers, timeout=self.timeout)
             first = next(events, None)
-            return events, (None if first is None else self.parse_stream_event(first))
+            return events, first, (None if first is None else self.parse_stream_event(first))
 
-        events, parsed = retry_call(
+        events, event, parsed = retry_call(
             open_stream,
             max_retries=self._max_retries,
             base_delay=self._retry_base_delay,
@@ -206,6 +222,7 @@ class HTTPChatClient(BaseLLMClient):
         prompt_tokens = completion_tokens = 0
         reported = False
         thinking = LeadingThinkFilter()
+        finish: Optional[str] = None
         while parsed is not None:
             raw, usage = parsed
             if usage is not None:
@@ -216,6 +233,7 @@ class HTTPChatClient(BaseLLMClient):
             if text:
                 parts.append(text)
                 yield text
+            finish = self.finish_reason(event.get("data") if isinstance(event, dict) else None) or finish
             event = next(events, None)
             parsed = None if event is None else self.parse_stream_event(event)
         tail = thinking.flush()
@@ -223,6 +241,7 @@ class HTTPChatClient(BaseLLMClient):
             parts.append(tail)
             yield tail
         self._record_usage((prompt_tokens, completion_tokens) if reported else None, f"{system}\n{prompt}", "".join(parts))
+        self._check_truncation("".join(parts), finish)
 
     # ------------------------------------------------------------------ internals
 
@@ -243,7 +262,32 @@ class HTTPChatClient(BaseLLMClient):
         )
         text, usage = self.parse_response(body)
         self._record_usage(usage, prompt_text, text)
-        return strip_leading_think(text)
+        answer = strip_leading_think(text)
+        self._check_truncation(answer, self.finish_reason(body))
+        return answer
+
+    def _check_truncation(self, text: str, finish: Optional[str]) -> None:
+        """Raise when the output limit left no answer text; flag (``metadata["degraded"]``) a cut answer."""
+
+        if finish not in _LENGTH_REASONS:
+            return
+        limit = getattr(self, "max_tokens", None)
+        where = f"{self._provider}:{self.model_name}"
+        stripped = text.lstrip()
+        if stripped.startswith(_THINK_OPEN) and _THINK_CLOSE not in stripped:
+            text = ""  # cut off inside an unclosed <think> block: no answer was written
+        if not text.strip():
+            raise LLMOutputTruncatedError(
+                f"{where} reached its output limit (max_tokens={limit}) before writing any answer text; reasoning "
+                "models can spend the whole budget thinking. Raise llm_max_tokens (RAG(llm_max_tokens=...))."
+            )
+        from raglib.core.runtime import report_degraded
+
+        report_degraded(
+            f"llm_output_truncated:{where}",
+            LLMOutputTruncatedError(f"the answer was cut off at the output limit (max_tokens={limit})"),
+            logger,
+        )
 
     @staticmethod
     def _record_usage(usage: Usage, prompt_text: str, completion: str) -> None:
@@ -439,6 +483,13 @@ class OpenAICompatibleClient(HTTPChatClient):
         text = _text_of(message.get("content"))
         return text, self._usage(body)
 
+    def finish_reason(self, body):
+        """``choices[0].finish_reason`` ("length" when ``max_tokens`` stopped it)."""
+
+        choices = (body.get("choices") or []) if isinstance(body, dict) else []
+        reason = choices[0].get("finish_reason") if choices and isinstance(choices[0], dict) else None
+        return str(reason) if reason else None
+
     def parse_stream_event(self, event):
         """``choices[0].delta.content``; the final chunk may carry ``usage``."""
 
@@ -512,6 +563,14 @@ class AnthropicClient(HTTPChatClient):
         usage = body.get("usage") or {}
         counts = (int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0))
         return text, counts if any(counts) else None
+
+    def finish_reason(self, body):
+        """``stop_reason`` of a message, or of a stream's ``message_delta`` ("max_tokens")."""
+
+        if not isinstance(body, dict):
+            return None
+        reason = body.get("stop_reason") or (body.get("delta") or {}).get("stop_reason")
+        return str(reason) if reason else None
 
     def parse_stream_event(self, event):
         """``content_block_delta`` text; usage arrives in ``message_start`` and ``message_delta``."""
@@ -599,6 +658,13 @@ class GeminiClient(HTTPChatClient):
         parts = (candidates[0].get("content") or {}).get("parts") or []
         text = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict) and not part.get("thought"))
         return text, self._usage(body)
+
+    def finish_reason(self, body):
+        """``candidates[0].finishReason`` ("MAX_TOKENS")."""
+
+        candidates = (body.get("candidates") or []) if isinstance(body, dict) else []
+        reason = candidates[0].get("finishReason") if candidates and isinstance(candidates[0], dict) else None
+        return str(reason) if reason else None
 
     def parse_stream_event(self, event):
         """Each SSE event is a partial ``GenerateContentResponse``."""

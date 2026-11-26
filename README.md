@@ -536,7 +536,7 @@ Hosted OpenAI-compatible APIs only need `pip install "raglib-py[openai]"`.
 | **xAI Grok** | `"xai"` / `"grok"` | `grok-3-mini` | `XAI_API_KEY` | – |
 | **Perplexity** | `"perplexity"` | `sonar` | `PERPLEXITY_API_KEY` | – |
 | **Cerebras** | `"cerebras"` | `llama-3.3-70b` | `CEREBRAS_API_KEY` | – |
-| **NVIDIA NIM** (build.nvidia.com or self-hosted via `NVIDIA_BASE_URL`) | `"nvidia"` / `"nim"` | `nvidia/nemotron-3.5-lightning-30b-a3b` | `NVIDIA_API_KEY` | yes (`nvidia/nemotron-3-embed-1b`); OCR with `nvidia/nemotron-3.5-super-vl-120b-a12b` |
+| **NVIDIA NIM** (build.nvidia.com or self-hosted via `NVIDIA_BASE_URL`) | `"nvidia"` / `"nim"` | `nvidia/nemotron-3.5-lightning-30b-a3b` | `NVIDIA_API_KEY` | yes (`nvidia/nemotron-3.5-embed-1b`); OCR with `nvidia/nemotron-3.5-super-vl-120b-a12b` |
 | **Azure OpenAI** | `"azure/<deployment>"` | – | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` | yes (deployment) |
 | **Ollama** (local) | `"ollama"` | `llama3.1` | – | yes |
 | **LM Studio** (local) | `"lmstudio/<model>"` | – | – | with `embedding_model` |
