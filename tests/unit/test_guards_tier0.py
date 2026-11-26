@@ -395,7 +395,7 @@ def test_production_preset_turns_on_the_default_guards() -> None:
     assert [g.name for g in rag._guards.output] == ["output_leak", "citation_access", "external_links"]
     assert rag._guards.tool_policy is not None
     plain = RAG(CORPUS, offline=True, token_counter="units")._guards  # plain RAG(): only the secure defaults
-    assert [(g.name, g.flag_only) for g in plain.input + plain.output] == [("injection_heuristic", True), ("output_leak", True), ("external_links", False)]
+    assert [(g.name, g.flag_only) for g in plain.input + plain.output] == [("max_question_tokens", False), ("injection_heuristic", True), ("output_leak", True), ("external_links", False)]
     assert RAG(CORPUS, offline=True, token_counter="units", secure_defaults=False)._guards is None
 
 

@@ -9,6 +9,8 @@
   - With access control, streams trail the model by about one word.
   - Agents with `max_steps > 10` stop at 10 tool calls.
   - Turn each off with `secure_defaults={...}`, or all with `secure_defaults=False`.
+- **File limits:** every file is checked before parsing: at most 100 MB (`max_file_bytes`), 5,000 PDF pages (`max_pages`), first bytes matching the extension, and for DOCX/PPTX/XLSX/EPUB an unpacked size of at most 10 x `max_file_bytes` (zip bombs). A file over a limit, renamed, or unparsable raises the new `DocumentLoadError` (file name only, no path). Pass `None` to turn a limit off.
+- **Question limit:** plain `RAG(...)` refuses questions over about 8,000 tokens (`secure_defaults["question_limit"]`, `MaxQuestionTokens(8192)`) before any model call. It leaves no record on normal questions.
 - **Embedding limits:** new indexes split chunks the embedding model would truncate. Indexes built before 2.3 keep their chunks exactly as they were, with a warning and no re-chunking (`oversized_chunks=None`; pass `"warn"`, `"split"` or `"raise"` to choose). An embedding model with an unknown limit warns once.
 - **The LLM cache expires after 24 hours** (`llm_cache_ttl`). Queries with `user=` or `filters=` are not cached (`cache_personalized=False`).
 - **Prompts** wrap retrieved and conversation text in an unguessable `<src-…>` delimiter instead of `<source>`. Custom templates get the data rule appended.

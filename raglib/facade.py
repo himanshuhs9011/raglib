@@ -296,6 +296,8 @@ class RAG:
         llm: Optional[Union[str, BaseLLMClient, Any]] = None,
         allowed_dirs: Optional[Sequence[str]] = None,
         allow_private_urls: bool = False,
+        max_file_bytes: Optional[int] = 100 * 1024 * 1024,
+        max_pages: Optional[int] = 5000,
         llm_temperature: float = 0.0,
         llm_max_tokens: Optional[int] = None,
         conversation_store: Optional[ConversationStore] = None,
@@ -398,6 +400,10 @@ class RAG:
           cost estimate uses the same one. The chunking settings are recorded in the index; opening or
           extending an index with different ones raises an ``IndexSettingsWarning``.
         * ``prices``: a ``PriceTable``; ``result.usage`` then reports ``cost_usd`` per stage.
+        * ``max_file_bytes`` (100 MB) / ``max_pages`` (5000): per-file limits checked before parsing; a
+          zip-based file (DOCX, PPTX, XLSX, EPUB) may unpack to 10 x ``max_file_bytes``. A file over a
+          limit, not what its extension says, or unparsable raises ``DocumentLoadError``. ``None``
+          turns a limit off.
 
         Guardrails (``raglib.guards``; cheapest first, stop at the first block):
 
@@ -517,6 +523,8 @@ class RAG:
             vision_client=self._vision,
             allow_private_urls=allow_private_urls,
             allowed_dirs=allowed_dirs,
+            max_file_bytes=max_file_bytes,
+            max_pages=max_pages,
         )
         self._chunking_strategy = chunking_strategy
         uses_llm_chunking = str(chunking_strategy).strip().lower() in {"llm", "semantic", "llm_semantic"}

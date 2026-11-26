@@ -154,11 +154,11 @@ def test_tool_call_limit_stops_a_looping_agent() -> None:
 
 
 def test_each_protection_can_be_turned_off_and_configured_guards_replace_defaults() -> None:
-    assert _rag(secure_defaults={"injection_flags": False})._guards.input == []
+    assert _rag(secure_defaults={"injection_flags": False, "question_limit": False})._guards.input == []
     assert _rag(secure_defaults={"secret_flags": False, "external_links": False})._guards.output == []
     assert _rag(secure_defaults={"tool_limit": False})._guards.tool_policy is None
     assert _rag(secure_defaults=False)._guards is None
-    blocking = _rag(input_guards=[InjectionHeuristic()])._guards.input
+    blocking = [g for g in _rag(input_guards=[InjectionHeuristic()])._guards.input if g.name == "injection_heuristic"]
     assert len(blocking) == 1 and not blocking[0].flag_only  # yours replaces the flag-only default
     with pytest.raises(ValueError):
         _rag(secure_defaults={"nope": False})

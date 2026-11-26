@@ -60,6 +60,8 @@ rag = RAG(
     source=<<DOCS_REPR>>,                  # files, folders, URLs, raw text, or a list of them
     allowed_dirs=None,                     # e.g. ["./docs"]: refuse file paths outside these folders
     allow_private_urls=False,              # True only for trusted intranet URLs (SSRF protection)
+    max_file_bytes=104857600,              # 100 MB per file, checked before parsing (None = no limit)
+    max_pages=5000,                        # PDF pages per file (None = no limit)
 
     # ---------------------------------------------------------------- chat model + credentials
     llm=<<LLM_REPR>>,                      # "provider" or "provider/model" (chat_llm= is the same option)

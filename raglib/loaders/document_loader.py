@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence, Union
 
+from raglib.loaders.exceptions import DocumentLoadError, InstructionError
 from raglib.loaders.pdf_loader import PDFLoader
 from raglib.loaders.pptx_loader import PPTXLoader
 from raglib.loaders.structured_loaders import (
@@ -25,6 +26,12 @@ from raglib.schemas import Document
 from raglib.vision.base_vision import BaseVisionClient
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB per file
+DEFAULT_MAX_PAGES = 5000  # PDF pages per file
+ZIP_EXPANSION_LIMIT = 10  # a zip-based file may unpack to at most 10 x max_file_bytes
+MAX_ZIP_MEMBERS = 100_000
+_MAGIC = {".pdf": b"%PDF-", ".docx": b"PK\x03\x04", ".pptx": b"PK\x03\x04", ".xlsx": b"PK\x03\x04", ".epub": b"PK\x03\x04"}
 
 SourceInput = Union[str, os.PathLike[str], Document, Sequence[Union[str, os.PathLike[str], Document]], None]
 
@@ -67,14 +74,27 @@ class DocumentLoader:
         epub_loader: Optional[EPUBLoader] = None,
         allow_private_urls: bool = False,
         allowed_dirs: Optional[Sequence[Union[str, os.PathLike]]] = None,
+        max_file_bytes: Optional[int] = DEFAULT_MAX_FILE_BYTES,
+        max_pages: Optional[int] = DEFAULT_MAX_PAGES,
     ):
         """Initialize all concrete loaders used by the dispatcher.
 
         ``allowed_dirs`` restricts file/folder sources to those directories (use it when
         sources come from untrusted users); ``allow_private_urls`` disables the SSRF guard.
+
+        Limits (``None`` turns one off): ``max_file_bytes`` (default 100 MB) per file, checked
+        before parsing; zip-based files (DOCX, PPTX, XLSX, EPUB) may unpack to at most ten times
+        that, checked before unpacking (zip bombs); ``max_pages`` (default 5000) per PDF, checked
+        before text is extracted. A file whose first bytes do not match its extension (a ".pdf"
+        that is not a PDF) is refused. Any of these, or a parser failure, raises ``DocumentLoadError``.
         """
 
         self.allowed_dirs = [os.path.realpath(os.fspath(path)) for path in allowed_dirs] if allowed_dirs else None
+        for name, value in (("max_file_bytes", max_file_bytes), ("max_pages", max_pages)):
+            if value is not None and (not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{name} must be a positive integer or None")
+        self.max_file_bytes = max_file_bytes
+        self.max_pages = max_pages
 
         self.pdf_loader = pdf_loader or PDFLoader(vision_client=vision_client)
         self.word_loader = word_loader or WordLoader()
@@ -86,6 +106,8 @@ class DocumentLoader:
         self.json_loader = json_loader or JSONLoader()
         self.xlsx_loader = xlsx_loader or XLSXLoader()
         self.epub_loader = epub_loader or EPUBLoader()
+        if self.max_pages is not None and getattr(self.pdf_loader, "max_pages", None) is None:
+            self.pdf_loader.max_pages = self.max_pages
 
     def load(self, source: SourceInput) -> List[Document]:
         """Load input source(s) into a list of normalized Document objects."""
@@ -208,9 +230,57 @@ class DocumentLoader:
         return [document for batch in self._iter_folder(folder_path) for document in batch]
 
     def _load_file(self, path: str) -> List[Document]:
-        """Load one file according to its extension."""
+        """Check the file against the limits, then parse it; parser failures raise ``DocumentLoadError``."""
 
         extension = Path(path).suffix.lower()
+        self._check_file(path, extension)
+        try:
+            return self._parse_file(path, extension)
+        except (DocumentLoadError, InstructionError, ImportError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a malformed file must not surface as a parser crash
+            raise DocumentLoadError(f"could not parse {Path(path).name!r} ({type(exc).__name__})") from exc
+
+    def _check_file(self, path: str, extension: str) -> None:
+        """Size, type (first bytes) and unpacked-size checks before any parser sees the file."""
+
+        name = Path(path).name
+        size = os.path.getsize(path)
+        if self.max_file_bytes is not None and size > self.max_file_bytes:
+            raise DocumentLoadError(
+                f"{name!r} is {size:,} bytes, over max_file_bytes={self.max_file_bytes:,} (RAG(max_file_bytes=...))"
+            )
+        expected = _MAGIC.get(extension)
+        if expected is None or size == 0:
+            return
+        with open(path, "rb") as handle:
+            head = handle.read(1024)
+        if extension == ".pdf":
+            if b"%PDF-" not in head:
+                raise DocumentLoadError(f"{name!r} has the extension .pdf but is not a PDF file")
+            return
+        if not head.startswith(expected):
+            raise DocumentLoadError(f"{name!r} has the extension {extension} but is not a {extension[1:].upper()} (zip) file")
+        if self.max_file_bytes is None:
+            return
+        import zipfile
+
+        limit = self.max_file_bytes * ZIP_EXPANSION_LIMIT
+        try:
+            with zipfile.ZipFile(path) as archive:
+                members = archive.infolist()
+        except zipfile.BadZipFile as exc:
+            raise DocumentLoadError(f"{name!r} is not a valid {extension[1:].upper()} file") from exc
+        unpacked = sum(member.file_size for member in members)
+        if unpacked > limit or len(members) > MAX_ZIP_MEMBERS:
+            raise DocumentLoadError(
+                f"{name!r} unpacks to {unpacked:,} bytes in {len(members):,} parts, over the limit "
+                f"({limit:,} bytes = {ZIP_EXPANSION_LIMIT} x max_file_bytes, {MAX_ZIP_MEMBERS:,} parts): possibly a zip bomb"
+            )
+
+    def _parse_file(self, path: str, extension: str) -> List[Document]:
+        """Load one file according to its extension."""
+
         if extension == ".pdf":
             return self.pdf_loader.load(path)
         if extension == ".docx":

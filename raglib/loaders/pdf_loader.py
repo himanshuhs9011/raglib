@@ -38,6 +38,13 @@ class PDFLoader:
         pdf = fitz.open(path)
 
         try:
+            limit = getattr(self, "max_pages", None)
+            if limit is not None and pdf.page_count > limit:
+                from raglib.loaders.exceptions import DocumentLoadError
+
+                raise DocumentLoadError(
+                    f"{os.path.basename(path)!r} has {pdf.page_count:,} pages, over max_pages={limit:,} (RAG(max_pages=...))"
+                )
             for page_number, page in enumerate(pdf, start=1):
                 page_text = page.get_text("text").strip()
                 if page_text:

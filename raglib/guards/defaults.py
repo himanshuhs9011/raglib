@@ -8,6 +8,9 @@
 * ``injection_flags`` - ``InjectionHeuristic(flag_only=True)`` on the question.
 * ``secret_flags`` - ``OutputLeakGuard(check_pii=False, flag_only=True)``: API keys, tokens and
   private keys in the answer.
+* ``question_limit`` - ``MaxQuestionTokens(8192)``: refuses a question longer than about 8,000 tokens
+  (a pasted document or an attempt to run up the bill) before any model call. Normal questions are
+  far below it; ``preset="production"`` uses a tighter limit.
 * ``external_links`` - ``ExternalLinkGuard()``: removes images, HTML tags and links in the answer that
   point anywhere the retrieved sources did not (a prompt injection could otherwise make a chat UI
   send retrieved text to an attacker's server). Unlike the others it changes such answers; links
@@ -35,6 +38,7 @@ from raglib.guards.rules import (
     CitationAccessGuard,
     ExternalLinkGuard,
     InjectionHeuristic,
+    MaxQuestionTokens,
     OutputLeakGuard,
     ToolPolicy,
     resolve_guards,
@@ -42,7 +46,8 @@ from raglib.guards.rules import (
 
 logger = logging.getLogger("raglib.guards")
 
-SECURE_DEFAULTS = ("citation_access", "tool_limit", "injection_flags", "secret_flags", "external_links")
+SECURE_DEFAULTS = ("citation_access", "tool_limit", "injection_flags", "secret_flags", "external_links", "question_limit")
+DEFAULT_MAX_QUESTION_TOKENS = 8192
 DEFAULT_MAX_TOOL_CALLS = 10
 GUARD_TIP_ENV = "RAGLIB_GUARD_TIP"
 GUARDRAILS_DOCS_URL = "https://github.com/himanshuhs9011/raglib#guardrails"
@@ -83,6 +88,10 @@ def with_secure_defaults(
     inputs = resolve_guards(input_guards, "input")
     retrievals = resolve_guards(retrieval_guards, "retrieval")
     outputs = resolve_guards(output_guards, "output")
+    if options.get("question_limit") and not _has(inputs, MaxQuestionTokens):
+        limit = MaxQuestionTokens(DEFAULT_MAX_QUESTION_TOKENS)
+        limit.quiet = True  # no record unless it refuses
+        inputs.append(limit)
     if options.get("injection_flags") and not _has(inputs, InjectionHeuristic):
         inputs.append(InjectionHeuristic(flag_only=True))
     if options.get("secret_flags") and not _has(outputs, OutputLeakGuard):
