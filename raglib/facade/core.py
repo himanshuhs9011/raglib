@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-from raglib.access import ACCESS_TAG_KEYS, AccessControl, UserContext, merge_filters
+from raglib.access import ACCESS_TAG_KEYS, AccessControl, UserContext
 from raglib.cache import AnswerCache, cache_bypass
 from raglib.components.decision import DecisionEngine
 from raglib.components.deduplicator import Deduplicator
@@ -53,6 +53,7 @@ from raglib.embedding.embedding_factory import EmbeddingFactory
 from raglib.facade.chunking import ChunkingMixin
 from raglib.facade.extras import ExtrasMixin, _accepts_keyword, _env_flag, _LocalSearchProvider
 from raglib.facade.graph import GraphMixin
+from raglib.facade.permissions import _UNTAGGED_SIGNATURE, PermissionsMixin
 from raglib.facade.persistence import PersistenceMixin
 from raglib.guards import (
     GuardConfig,
@@ -153,7 +154,7 @@ ORCHESTRATORS: Dict[str, str] = {
 }
 
 
-class RAG(PersistenceMixin, GraphMixin, ChunkingMixin, ExtrasMixin):
+class RAG(PersistenceMixin, GraphMixin, ChunkingMixin, ExtrasMixin, PermissionsMixin):
     """Single entry point for raglib.
 
     Minimal::
@@ -1116,43 +1117,6 @@ class RAG(PersistenceMixin, GraphMixin, ChunkingMixin, ExtrasMixin):
             self._after_guards(result, scope)
         return result, question, mapping
 
-    @property
-    def access_control(self) -> Optional[AccessControl]:
-        """The access-control policy (``None`` when access control is off)."""
-
-        return self._access
-
-    def permission_filter(self, user: Union[UserContext, Mapping[str, Any], None] = None) -> Optional[MetadataFilter]:
-        """The metadata filter access control applies for ``user`` (``None`` when it is off)."""
-
-        if self._access is None:
-            return None
-        return self._access.filter_for(UserContext.coerce(user))
-
-    def _scope(
-        self,
-        filters: Optional[MetadataFilter],
-        user: Union[UserContext, Mapping[str, Any], None],
-        session_id: Optional[str],
-    ) -> Tuple[Optional[MetadataFilter], Optional[str]]:
-        """Merge the permission filter into ``filters`` and namespace the memory session by user."""
-
-        context = UserContext.coerce(user)
-        if self._access is None:
-            if context is not None:
-                raise ValueError("user=... needs access_control (RAG(..., access_control=True))")
-            return filters, session_id
-        acl = self._access.filter_for(context)
-        # Memory is per user: two users never read each other's history, even with the same (or no)
-        # session_id. Without a user_id the owner is the permission scope itself.
-        signature = hashlib.sha256(json.dumps(acl, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-        if context is not None and context.user_id:
-            # User plus their current permissions: a demoted user starts a new history instead of
-            # reading answers that quote documents above their new level.
-            owner = f"user:{context.user_id}|acl:{signature}"
-        else:
-            owner = "acl:" + signature
-        return merge_filters(acl, filters), f"{owner}::{session_id or 'default'}"
 
     def chat(self, session_id: str = "interactive") -> None:
         """Open an interactive terminal Q&A loop with conversation memory."""
@@ -1231,23 +1195,6 @@ class RAG(PersistenceMixin, GraphMixin, ChunkingMixin, ExtrasMixin):
         )
         return stats["chunks_indexed"]
 
-
-    def _private_document(self, document: Document) -> bool:
-        """True for a document with any access restriction: a level above the lowest, or a department
-        or role restriction (web results have no access tags)."""
-
-        if self._access is None:
-            return False
-        metadata = document.metadata
-        level = metadata.get("access_level")
-        restricted_level = level is not None and level != self._access.levels[0]
-        return bool(restricted_level or metadata.get("department") or metadata.get("allowed_roles"))
-
-
-    def _tag(self, document: Document) -> Document:
-        """Apply access-control tags to a chunk or section (no-op without access control)."""
-
-        return replace(document, metadata=self._access.tag(document.metadata)) if self._access is not None else document
 
     def _document_fingerprint(self, document: Document) -> str:
         """Content + chunking settings + oversized-chunk policy + access tags: equal means re-adding
@@ -1922,8 +1869,5 @@ def _stamp_version(chunks: List[Document], version: str) -> None:
 
     for chunk in chunks:
         chunk.metadata["document_version"] = version
-
-
-_UNTAGGED_SIGNATURE = AccessControl.signature({})
 
 
