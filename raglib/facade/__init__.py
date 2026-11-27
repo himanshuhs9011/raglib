@@ -7,12 +7,12 @@ ingestion, permissions, guards, querying, providers, extras). Import from here:
 
 from __future__ import annotations
 
+from raglib.facade.chunking import unwrap_embedding
 from raglib.facade.core import (
     OPENROUTER_FREE_RPM,
     ORCHESTRATORS,
     RAG,
     RAG_TYPE_ALIASES,
-    unwrap_embedding,
 )
 from raglib.facade.graph import GRAPH_GLOBAL_OPTIONS, GRAPH_INDEXER_OPTIONS, GRAPH_LOCAL_OPTIONS
 
