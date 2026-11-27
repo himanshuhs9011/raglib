@@ -8,15 +8,13 @@ ingestion, permissions, guards, querying, providers, extras). Import from here:
 from __future__ import annotations
 
 from raglib.facade.core import (
-    GRAPH_GLOBAL_OPTIONS,
-    GRAPH_INDEXER_OPTIONS,
-    GRAPH_LOCAL_OPTIONS,
     OPENROUTER_FREE_RPM,
     ORCHESTRATORS,
     RAG,
     RAG_TYPE_ALIASES,
     unwrap_embedding,
 )
+from raglib.facade.graph import GRAPH_GLOBAL_OPTIONS, GRAPH_INDEXER_OPTIONS, GRAPH_LOCAL_OPTIONS
 
 RAG.__module__ = "raglib.facade"  # the public name, wherever the class body lives
 
